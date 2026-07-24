@@ -303,6 +303,7 @@ markers = [
     "unit: Unit tests (fast, no API calls)",
     "integration: Integration tests (requires running services)",
     "clinical: Clinical validation tests (slow, requires ANTHROPIC_API_KEY — run nightly)",
+    "postgres: Real-Postgres integration tests (requires POSTGRES_TEST_URL — catches SQLite-masked bugs like B2/B3)",
     "slow: Slow running tests",
 ]
 filterwarnings = [

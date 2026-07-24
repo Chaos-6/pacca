@@ -242,3 +242,43 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: make test-clinical
+
+  test-postgres:
+    name: Postgres integration (SQLite-masked bugs — B2/B3)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: t
+          POSTGRES_PASSWORD: t
+          POSTGRES_DB: t
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U t"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # The test fixture runs `alembic upgrade head` against POSTGRES_TEST_URL,
+      # so the schema is migration-built (production-shaped), not create_all.
+      # No ANTHROPIC_API_KEY needed — the LLM/RAG are patched; this job verifies
+      # persistence + referential integrity, which SQLite structurally cannot.
+      - name: Run Postgres integration tests
+        env:
+          POSTGRES_TEST_URL: postgresql+asyncpg://t:t@localhost:5432/t
+        run: pytest tests/integration -m postgres -v

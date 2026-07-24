@@ -18,7 +18,7 @@
 #   make install
 # =============================================================================
 
-.PHONY: install test test-cov test-all test-clinical lint typecheck clean help \
+.PHONY: install test test-cov test-all test-clinical test-postgres lint typecheck clean help \
         sme-author sme-author-test sme-author-status sme-author-help \
         sme-author-web sme-author-web-build sme-author-web-e2e
 
@@ -63,6 +63,21 @@ test-clinical:
 		exit 1; \
 	fi
 	pytest tests/clinical/ -m clinical -v
+
+test-postgres:
+	@echo "Real-Postgres integration tests (catches SQLite-masked bugs like B2/B3)..."
+	@echo "Starting throwaway Postgres 16 on :5499..."
+	@docker rm -f pacca-test-pg >/dev/null 2>&1 || true
+	@docker run -d --rm --name pacca-test-pg \
+		-e POSTGRES_USER=t -e POSTGRES_PASSWORD=t -e POSTGRES_DB=t \
+		-p 5499:5432 postgres:16-alpine >/dev/null
+	@until docker exec pacca-test-pg pg_isready -U t >/dev/null 2>&1; do sleep 1; done
+	@POSTGRES_TEST_URL="postgresql+asyncpg://t:t@localhost:5499/t" \
+		pytest tests/integration -m postgres -v; \
+		status=$$?; \
+		echo "Tearing down throwaway Postgres..."; \
+		docker stop pacca-test-pg >/dev/null 2>&1 || true; \
+		exit $$status
 
 # ── Code quality ──────────────────────────────────────────────────────────────
 
