@@ -3,6 +3,7 @@
 #
 # Usage:
 #   make install      Install package + dev dependencies into current environment
+#   make db-upgrade   Apply Alembic migrations (schema single-source-of-truth, C5)
 #   make test         Run the fast unit test suite (no API calls, ~10 seconds)
 #   make test-cov     Run unit tests with HTML coverage report
 #   make test-all     Run everything except clinical (requires API key)
@@ -18,7 +19,7 @@
 #   make install
 # =============================================================================
 
-.PHONY: install test test-cov test-all test-clinical test-postgres lint typecheck clean help \
+.PHONY: install db-upgrade test test-cov test-all test-clinical test-postgres lint typecheck clean help \
         sme-author sme-author-test sme-author-status sme-author-help \
         sme-author-web sme-author-web-build sme-author-web-e2e
 
@@ -29,6 +30,17 @@ install:
 	@echo "Verifying critical packages..."
 	pip install uuid7 pytest-asyncio pytest-cov --quiet
 	@echo "Install complete. Run 'make test' to verify."
+
+# ── Database ──────────────────────────────────────────────────────────────────
+# Alembic migrations are the single source of truth for the schema (C5) — the
+# app no longer builds tables at startup. Containers apply this automatically
+# via docker-entrypoint.sh; running uvicorn directly (outside Docker) requires
+# running this once (and again after pulling new migrations).
+
+db-upgrade:
+	@echo "Applying Alembic migrations (alembic upgrade head)..."
+	alembic upgrade head
+	@echo "Schema up to date."
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
@@ -102,6 +114,7 @@ clean:
 help:
 	@echo "Available commands:"
 	@echo "  make install            Install package + dev dependencies"
+	@echo "  make db-upgrade         Apply Alembic migrations (schema single-source-of-truth)"
 	@echo "  make test               Fast unit tests (no API calls)"
 	@echo "  make test-cov           Unit tests + HTML coverage report"
 	@echo "  make test-all           All fast tests"

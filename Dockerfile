@@ -51,6 +51,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY src/ ./src/
 COPY pyproject.toml README.md ./
 
+# Copy Alembic config (script_location = src/pacca/db/migrations, read from
+# CWD) and the entrypoint that applies migrations before the app starts (C5 —
+# Alembic is the single schema source; the app no longer runs create_all).
+COPY alembic.ini ./
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+
 # Install the package itself
 RUN pip install --no-cache-dir -e .
 
@@ -72,6 +78,9 @@ EXPOSE 8000
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health/live || exit 1
+
+# Entrypoint runs `alembic upgrade head`, then execs the CMD below.
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
 # Run the application
 CMD ["uvicorn", "pacca.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

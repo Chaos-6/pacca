@@ -5,10 +5,11 @@ Application startup, middleware configuration, and core auth endpoints.
 
 Architecture notes:
   - All database operations use the async session from db/session.py.
-    The `users` table is created via that same async engine at startup
-    (SQLAlchemy Base.metadata.create_all), so it lands in the configured
-    database (Postgres in compose, SQLite in dev). All route handlers are
-    fully async.
+    Schema (including the `users` table — migration 004) is built by Alembic
+    migrations (C5 — the single schema source), applied before the app starts:
+    docker-entrypoint.sh runs `alembic upgrade head` in containers; run
+    `make db-upgrade` once for local dev outside Docker. The app itself no
+    longer calls `create_all` at runtime. All route handlers are fully async.
 
   - JWT authentication uses SECRET_KEY loaded from the environment.
     The application validates SECRET_KEY at startup and refuses to start
@@ -32,7 +33,7 @@ from ..config.settings import get_settings
 from ..config.tracing import configure_tracing
 
 # Production async database session — all route handlers use this
-from ..db.session import AsyncSession, get_engine, get_session, init_database
+from ..db.session import AsyncSession, get_session, init_database
 
 # Auth helpers — SECRET_KEY, ALGORITHM, and token expiry come from environment
 from .auth import (
@@ -44,10 +45,6 @@ from .auth import (
     verify_password,
     verify_token,
 )
-
-# Declarative Base for the auth `users` table. The table is created via the
-# async engine at startup (see lifespan); all runtime ops use the async session.
-from .database import Base
 
 # Middleware
 from .middleware import SecurityHeadersMiddleware
@@ -70,7 +67,8 @@ async def lifespan(app: FastAPI):
     Startup sequence:
       1. Validate SECRET_KEY (fail fast if misconfigured)
       2. Configure OpenTelemetry tracing
-      3. Initialize database tables via the async engine (PACCA data + auth users)
+      3. Verify the database engine (schema itself is Alembic-managed — see
+         module docstring; the app does not create tables at runtime)
 
     Teaching note: failing fast on misconfiguration is a production discipline.
     Better to crash at startup with a clear error than to serve requests with
@@ -95,19 +93,12 @@ async def lifespan(app: FastAPI):
         enabled=settings.otel_enabled,
     )
 
-    # ── 3. Database initialization ────────────────────────────────────────────
-    # Initialize the PACCA data tables via the async engine
-    # (authorization_requests, authorization_decisions, audit_logs, etc.)
+    # ── 3. Database ────────────────────────────────────────────────────────────
+    # Verify the async engine (PACCA data + auth `users` share one database).
+    # Schema itself is Alembic-managed (C5) — `alembic upgrade head` runs
+    # before the app starts (docker-entrypoint.sh in containers, `make
+    # db-upgrade` for local dev). The app no longer builds schema at runtime.
     await init_database()
-
-    # Create the auth `users` table in the SAME async database the /register and
-    # /login handlers query via get_session(). It previously lived on a hardcoded
-    # sync SQLite engine, so under Postgres it never existed there and auth 500'd
-    # with: relation "users" does not exist. Creating it through the async engine
-    # makes it land in the configured DB (Postgres in compose, SQLite in dev).
-    # (User is registered on Base via the `from .models import User` import above.)
-    async with get_engine().begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
     yield  # Server is running
 
@@ -203,10 +194,10 @@ async def sme_draft_stream(websocket: "WebSocket", session_id: str) -> None:
 #
 # Teaching note — why these routes are here, not in a dedicated route module:
 #   These are the only routes that touch the User table (defined in
-#   api/models.py on api/database.py's Base). Its table is created via the
-#   async engine at startup — the same engine these handlers query — so there
-#   is no separate sync session to mix in. A future consolidation could move
-#   User onto db/models.py's Base alongside the other PACCA tables.
+#   api/models.py on api/database.py's Base, migration 004). It is queried via
+#   the same async engine/session as every other route — no separate sync
+#   session to mix in. A future consolidation could move User onto
+#   db/models.py's Base alongside the other PACCA tables.
 # =============================================================================
 
 

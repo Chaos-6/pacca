@@ -12,10 +12,18 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+# Import models to ensure they're registered with Base.metadata.
+#
+# PACCA has TWO SQLAlchemy declarative Bases (see CLAUDE.md "Where things
+# live"): the domain Base (pacca.db.models.Base — authorization_requests,
+# audit_logs, etc.) and the auth Base (pacca.api.database.Base — users).
+# Alembic needs metadata from both to see every table; importing
+# pacca.api.models.user registers User on the auth Base before we read its
+# metadata below.
+import pacca.api.models.user  # noqa: F401 — registers User on _AuthBase.metadata
+from pacca.api.database import Base as _AuthBase
 from pacca.config import get_settings
-
-# Import models to ensure they're registered with Base.metadata
-from pacca.db.models import Base
+from pacca.db.models import Base as _DomainBase
 
 # Alembic Config object
 config = context.config
@@ -24,8 +32,10 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Set target metadata for autogenerate support
-target_metadata = Base.metadata
+# Set target metadata for autogenerate support. Alembic accepts a list of
+# MetaData objects (combines them for diffing) — this is what makes `users`
+# (previously invisible — it lived only on _AuthBase) visible to autogenerate.
+target_metadata = [_DomainBase.metadata, _AuthBase.metadata]
 
 
 def get_url() -> str:
