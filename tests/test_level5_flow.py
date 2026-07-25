@@ -14,10 +14,14 @@ takes `db_path` directly, so the test uses the supported seam.
 
 import os
 import shutil
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from jose import jwt
 
+from pacca.api.auth import ALGORITHM, SECRET_KEY
 from pacca.api.main import app
 
 # Import the module where the global 'rag_engine' lives so we can overwrite it
@@ -28,6 +32,12 @@ pytestmark = pytest.mark.clinical
 
 # We create a specific test database path
 TEST_DB_PATH = os.path.join(os.getcwd(), "test_pacca_db")
+
+# authorization_requests.request_id is UNIQUE and the SQLite file outlives the
+# run, so fixed ids ("test_1") collide on the second execution. The learning-loop
+# test also submits the *same clinical case* twice, which is the point — only the
+# request id has to differ.
+RUN = uuid.uuid4().hex[:8]
 
 
 @pytest.fixture(scope="module")
@@ -76,13 +86,30 @@ def inject_rag(test_rag, monkeypatch):
         test_rag._precedents.delete(ids=existing)
 
 
-client = TestClient(app)
+@pytest.fixture(scope="module")
+def client():
+    """
+    Context-managed so the app lifespan runs. A bare `TestClient(app)` never
+    enters it, so `init_database()` never ran and the first audit write failed
+    with "no such table: audit_logs".
+    """
+    with TestClient(app) as test_client:
+        yield test_client
 
 
-def test_happy_path_lung_cancer():
+def auth_headers() -> dict[str, str]:
+    """
+    Both routers under test are mounted with `dependencies=[Depends(verify_token)]`,
+    so every request here needs a Bearer token. Mirrors tests/unit/api/conftest.py.
+    """
+    payload = {"sub": "test-user", "exp": datetime.now(UTC) + timedelta(minutes=30)}
+    return {"Authorization": f"Bearer {jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)}"}
+
+
+def test_happy_path_lung_cancer(client):
     """Level 3 Test: Auto-Approval based on Rules"""
     payload = {
-        "request_id": "test_1",
+        "request_id": f"test_1_{RUN}",
         "patient_id": "p1",
         "provider_npi": "123",
         "clinical_case": {
@@ -100,17 +127,17 @@ def test_happy_path_lung_cancer():
             ],
         },
     }
-    response = client.post("/api/v1/authorizations/", json=payload)
+    response = client.post("/api/v1/authorizations/", json=payload, headers=auth_headers())
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "AUTO_APPROVED"
 
 
-def test_learning_loop_spine():
+def test_learning_loop_spine(client):
     """Level 4 Test: Fail -> Teach -> Succeed"""
     # 1. Submit WEAK Case (Should Fail/Review)
     case_payload = {
-        "request_id": "test_spine",
+        "request_id": f"test_spine_{RUN}",
         "patient_id": "p2",
         "provider_npi": "123",
         "clinical_case": {
@@ -129,7 +156,7 @@ def test_learning_loop_spine():
         },
     }
 
-    resp1 = client.post("/api/v1/authorizations/", json=case_payload)
+    resp1 = client.post("/api/v1/authorizations/", json=case_payload, headers=auth_headers())
     assert resp1.json()["status"] == "IN_REVIEW"
 
     # 2. Teach the System (Override)
@@ -138,10 +165,16 @@ def test_learning_loop_spine():
         "decision": "AUTO_APPROVED",
         "rationale": "Override: Patient actually had severe motor weakness not documented in initial NLP.",
     }
-    client.post("/api/v1/authorizations/feedback", json=feedback)
+    client.post("/api/v1/authorizations/feedback", json=feedback, headers=auth_headers())
 
-    # 3. Submit SAME Case Again (Should Pass via Memory)
-    resp2 = client.post("/api/v1/authorizations/", json=case_payload)
+    # 3. Submit SAME Case Again (Should Pass via Memory).
+    # Same clinical content, new request id — the id is a submission identifier,
+    # not part of the case.
+    resp2 = client.post(
+        "/api/v1/authorizations/",
+        json={**case_payload, "request_id": f"test_spine_{RUN}_retry"},
+        headers=auth_headers(),
+    )
     data = resp2.json()
     assert data["status"] == "AUTO_APPROVED"
 
@@ -151,14 +184,14 @@ def test_learning_loop_spine():
     )
 
 
-def test_dark_factory_evolution():
+def test_dark_factory_evolution(client):
     """Level 5 Test: Policy Rewriting"""
     # Trigger optimization
-    resp = client.post("/api/v1/admin/optimize_policies")
+    resp = client.post("/api/v1/admin/optimize_policies", headers=auth_headers())
     data = resp.json()
 
-    if data["status"] == "optimized":
-        assert "weakness" in data["change"].lower()
-    else:
-        assert data["status"] == "proposed"
-        assert "weakness" in data["proposal"]["proposed_text"].lower()
+    # The route stores a PENDING proposal and deploys nothing; it has returned
+    # "proposal_pending" with a `proposed_text_preview` since iter-6. The old
+    # "optimized"/"proposed" branches asserted a contract that no longer exists.
+    assert data["status"] == "proposal_pending"
+    assert "weakness" in data["proposed_text_preview"].lower()
