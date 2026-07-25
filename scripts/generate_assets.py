@@ -223,8 +223,8 @@ def trust_chain() -> None:
             "P-4 · Minimum-necessary scope guard",
             "Did it stay inside what it declared?",
             [
-                "enforce_scope() wraps every DB write and RAG query. An unknown action,",
-                "a cross-case identifier, or a non-allowed collection is denied.",
+                "enforce_scope() wraps every DB write and RAG access — query AND",
+                "precedent write. Unknown action / cross-case id / non-allowed collection → denied.",
             ],
             "EscalationReason.SCOPE_VIOLATION",
             "HIPAA minimum-necessary, expressed in code",
@@ -518,8 +518,8 @@ ITERS = [
         "Generalize the model to adults; first deny-class memory",
         "ADULT_COMPLEX reuses iter-5's score model byte-for-byte; first deny-class H2 entry; PROMPT_REGISTRY → v2.6.",
         ["escalation_branch", "long_term_memory", "evaluation_harness", "instrumentation"],
-        "PENDING",
-        "",
+        "KEEP",
+        "×4",
     ),
     (
         7,
@@ -557,6 +557,33 @@ ITERS = [
         "KEEP",
         "×1",
     ),
+    (
+        11,
+        "2026-07-23",
+        "Server-side decision_id; legible integrity failures",
+        "decision_id was model-generated into a unique column (B6) — now minted server-side, out of the tool schema; DB writes roll back so the real error surfaces.",
+        ["tool_implementation"],
+        "KEEP",
+        "×2",
+    ),
+    (
+        12,
+        "2026-07-23",
+        "Deferrable audit FK — fixes a Postgres-only FK violation",
+        "audit_logs.request_id FK becomes DEFERRABLE INITIALLY DEFERRED (B3), so the pre-flight audit rows commit before the parent without reordering. Verified on real Postgres 16.",
+        ["audit_schema"],
+        "KEEP",
+        "×1",
+    ),
+    (
+        13,
+        "2026-07-24",
+        "Wire + govern the institutional-memory precedent collection",
+        "Deterministic precedent id + upsert; the scope guard governs the two REAL RAG collections; the /feedback write is now intent-scoped, guarded, and audited-before-write.",
+        ["tool_implementation", "middleware"],
+        "KEEP",
+        "×3",
+    ),
 ]
 
 
@@ -569,7 +596,7 @@ def harness_timeline() -> None:
         W,
         H,
         "PACCA Harness — Iteration Ledger",
-        "harness-iter-0 → harness-iter-10 · every behavioral change is a one-file diff with a falsifiable prediction;",
+        "harness-iter-0 → harness-iter-13 · every behavioral change is a one-file diff with a falsifiable prediction;",
     )
     s += text(
         37,
@@ -621,7 +648,7 @@ def harness_timeline() -> None:
     s += text(
         36,
         fy,
-        "11 iterations · 25 changes · 0 rollbacks   |   H2 memory: 4 entries · escalation tree: "
+        "14 iterations · 31 changes · 0 rollbacks   |   H2 memory: 4 entries · escalation tree: "
         "7 pre-flight gates + 2 runtime short-circuits · golden gate: 20 · dataset: 105 cases",
         size=10.5,
         fill=BLUE,
@@ -715,21 +742,17 @@ def sme_authoring_static() -> None:
     write("sme_authoring_static.svg", s)
 
 
-# ── Figure 5 · Architecture v2.5 (text refresh of the v2.4 asset) ────────────
-def architecture_v25() -> None:
-    src = (ASSETS / "architecture_v2.4.svg").read_text(encoding="utf-8")
+# ── Figure 5 · Architecture v2.6 (incremental text refresh of the v2.5 asset) ─
+def architecture_v26() -> None:
+    src = (ASSETS / "architecture_v2.5.svg").read_text(encoding="utf-8")
     subs = [
-        (">v2.4<", ">v2.5<"),
-        ("103 synthetic cases", "105 synthetic cases"),
-        ("GC-001 … GC-103", "GC-001 … GC-105"),
-        ("103-case extended dataset", "105-case extended dataset"),
-        ("iter-0 … iter-6 · 21 changes", "iter-0 … iter-10 · 25 changes"),
-        # NB: deliberately NOT relabelling the pre-flight box with the P-4/P-5
-        # guards — those fire post-agent, not pre-flight. See escalation_tree.svg.
-        (
-            "pre-write start/complete pairs per agent · success=False on failure · append-only change log",
-            "intent.declared first · pre-write start/complete pairs · scope guard + evidence grounding",
-        ),
+        (">v2.5<", ">v2.6<"),
+        ("iter-0 … iter-10 · 25 changes", "iter-0 … iter-13 · 31 changes"),
+        # ChromaDB's two collections are guidelines + case_precedents; "H2 memory"
+        # (the long_term_memory.md prompt files) is a distinct mechanism. iter-13
+        # also brought both collections under the P-4 scope guard.
+        ("guidelines + H2 memory", "guidelines + precedents"),
+        ("(dual-collection RAG)", "(dual-collection · scope-guarded)"),
     ]
     out = src
     for a, b in subs:
@@ -737,8 +760,8 @@ def architecture_v25() -> None:
             print(f"  !! architecture: pattern not found, skipped: {a[:52]}")
             continue
         out = out.replace(a, b)
-    (ASSETS / "architecture_v2.5.svg").write_text(out, encoding="utf-8")
-    print("  wrote docs/assets/architecture_v2.5.svg")
+    (ASSETS / "architecture_v2.6.svg").write_text(out, encoding="utf-8")
+    print("  wrote docs/assets/architecture_v2.6.svg")
 
 
 def _iter_number(path: Path) -> int:
@@ -765,8 +788,8 @@ def verify_facts() -> None:
     )
     assert iters == len(ITERS), f"manifest count {iters} != ITERS table {len(ITERS)}"
     print(f"  fact-check: {iters} iterations, {changes} changes, {rollbacks} rollbacks")
-    if (iters, changes, rollbacks) != (11, 25, 0):
-        print("  !! figures hardcode '11 iterations · 25 changes · 0 rollbacks' — update them")
+    if (iters, changes, rollbacks) != (14, 31, 0):
+        print("  !! figures hardcode '14 iterations · 31 changes · 0 rollbacks' — update them")
 
 
 if __name__ == "__main__":
@@ -776,5 +799,5 @@ if __name__ == "__main__":
     escalation_tree()
     harness_timeline()
     sme_authoring_static()
-    architecture_v25()
+    architecture_v26()
     print("done.")
