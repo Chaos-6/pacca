@@ -30,7 +30,7 @@ unit suite on every commit.
 """
 
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -325,63 +325,110 @@ class TestRAGPipelineIntegration:
 
     def test_guideline_retriever_attempts_rag_pipeline(self):
         """
-        GuidelineRetriever.query() must attempt to use RAGPipeline.
+        GuidelineRetriever.query() must route through RAGPipeline.
 
-        We verify this by patching _get_pipeline() to return a mock
-        and confirming the pipeline's retrieve method is called.
+        The pipeline handle now lives on the instance (self._pipeline) rather
+        than a module singleton, so the mock is attached there.
         """
         from pacca.integrations import vector_store as vs_module
 
         mock_pipeline = MagicMock()
-        mock_pipeline.retrieve_relevant_guidelines = AsyncMock(
-            return_value="NCCN: Pembrolizumab recommended for PD-L1 >= 50%."
+        mock_pipeline.retrieve_relevant_guidelines_sync.return_value = (
+            "NCCN: Pembrolizumab recommended for PD-L1 >= 50%."
         )
 
-        with patch.object(vs_module, "_get_pipeline", return_value=mock_pipeline):
-            # Reset the singleton so our mock is used
-            vs_module._rag_pipeline = mock_pipeline
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        # Patch the chromadb client to avoid filesystem access
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = mock_pipeline
 
-            retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
-            # Patch the chromadb client to avoid filesystem access
-            retriever._client = MagicMock()
-            retriever._embedding_fn = MagicMock()
-            retriever._guidelines = MagicMock()
-            retriever._precedents = MagicMock()
-            retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        result = retriever.query("Guidelines for C34.1 and J9271")
 
-            # The call should go through RAGPipeline
-            result = retriever.query("Guidelines for C34.1 and J9271")
+        # The pipeline was actually invoked — not silently skipped. The old
+        # assertion allowed `len(result) > 0`, which the fallback also satisfies,
+        # so it passed for months while the pipeline never ran at all.
+        mock_pipeline.retrieve_relevant_guidelines_sync.assert_called_once()
+        assert "Pembrolizumab" in result
+        # The direct-ChromaDB fallback must NOT have been used.
+        retriever._guidelines.query.assert_not_called()
 
-        # RAGPipeline was used (result contains its return value)
-        assert "Pembrolizumab" in result or len(result) > 0
+    def test_query_parses_diagnosis_and_procedure_from_route_query(self):
+        """The route's 'Guidelines for {dx} and {cpt}' string is split into codes."""
+        from pacca.integrations import vector_store as vs_module
 
-    def test_guideline_retriever_falls_back_gracefully(self):
+        mock_pipeline = MagicMock()
+        mock_pipeline.retrieve_relevant_guidelines_sync.return_value = "guidelines"
+
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = mock_pipeline
+
+        retriever.query("Guidelines for C34.1 and J9271")
+
+        kwargs = mock_pipeline.retrieve_relevant_guidelines_sync.call_args.kwargs
+        assert kwargs["diagnosis_code"] == "C34.1"
+        assert kwargs["treatment_code"] == "J9271"
+        # No fabricated "general" category — it filtered out every document and
+        # forced a wasted unfiltered retry on every single query.
+        assert kwargs.get("treatment_category") is None
+
+    def test_guideline_retriever_falls_back_when_pipeline_unavailable(self):
         """
-        When RAGPipeline is unavailable, GuidelineRetriever falls back
-        to direct ChromaDB queries without raising an exception.
+        When RAGPipeline is unavailable, query() degrades to direct ChromaDB
+        queries without raising.
         """
         from pacca.integrations import vector_store as vs_module
 
-        # Simulate pipeline unavailable
-        vs_module._rag_pipeline = None
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._guidelines.query.return_value = {
+            "documents": [["NCCN guideline text"]],
+            "metadatas": [[{"source": "NCCN"}]],
+        }
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+        }
+        retriever._pipeline = None
 
-        with patch.object(vs_module, "_get_pipeline", return_value=None):
-            retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
-            retriever._client = MagicMock()
-            retriever._embedding_fn = MagicMock()
-            retriever._guidelines = MagicMock()
-            retriever._guidelines.query.return_value = {
-                "documents": [["NCCN guideline text"]],
-                "metadatas": [[{"source": "NCCN"}]],
-            }
-            retriever._precedents = MagicMock()
-            retriever._precedents.query.return_value = {
-                "documents": [[]],
-                "metadatas": [[]],
-            }
+        assert retriever.pipeline_available is False
 
-            # Should not raise even without RAGPipeline
-            result = retriever._query_direct("Guidelines for C34.1 and J9271")
+        result = retriever.query("Guidelines for C34.1 and J9271")
+
+        assert "OFFICIAL GUIDELINES" in result
+        assert "NCCN guideline text" in result
+
+    def test_guideline_retriever_falls_back_when_pipeline_raises(self):
+        """A pipeline error must degrade to the direct path, not surface to the caller."""
+        from pacca.integrations import vector_store as vs_module
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.retrieve_relevant_guidelines_sync.side_effect = RuntimeError("chroma down")
+
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._guidelines.query.return_value = {
+            "documents": [["NCCN guideline text"]],
+            "metadatas": [[{"source": "NCCN"}]],
+        }
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = mock_pipeline
+
+        result = retriever.query("Guidelines for C34.1 and J9271")
 
         assert "OFFICIAL GUIDELINES" in result
         assert "NCCN guideline text" in result
