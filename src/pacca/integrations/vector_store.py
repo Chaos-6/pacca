@@ -55,6 +55,15 @@ from pacca.config import get_logger
 
 logger = get_logger(__name__)
 
+# The two real ChromaDB collections this retriever reads (SSOT). The scope
+# guard's allowed-collections model (models/intent.py) mirrors these; a drift
+# test asserts they stay in sync. Previously the intent named a phantom
+# "clinical_guidelines" that was never queried, leaving both real collections —
+# including institutional-memory precedents — ungoverned (#2).
+GUIDELINE_COLLECTION = "nccn_guidelines"
+PRECEDENT_COLLECTION = "case_precedents"
+RAG_COLLECTIONS = [GUIDELINE_COLLECTION, PRECEDENT_COLLECTION]
+
 
 def _precedent_id(case_summary: str) -> str:
     """
@@ -136,13 +145,13 @@ class GuidelineRetriever:
 
         # Collection 1: Official guidelines (NCCN, CMS, AHA, etc.)
         self._guidelines = self._client.get_or_create_collection(
-            name="nccn_guidelines",
+            name=GUIDELINE_COLLECTION,
             embedding_function=self._embedding_fn,
         )
 
         # Collection 2: Institutional memory (human override precedents)
         self._precedents = self._client.get_or_create_collection(
-            name="case_precedents",
+            name=PRECEDENT_COLLECTION,
             embedding_function=self._embedding_fn,
         )
 

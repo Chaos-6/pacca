@@ -25,9 +25,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 # ── Declared scope constants (SSOT until a capability source exists) ──────────
-# `clinical_guidelines` is the single ChromaDB collection PACCA queries today
-# (dual-collection RAG is roadmap — see CLAUDE.md Limitations).
-PRIOR_AUTH_ALLOWED_COLLECTIONS: list[str] = ["clinical_guidelines"]
+# The two real ChromaDB collections the retriever reads on a prior-auth run:
+# nccn_guidelines (authoritative) and case_precedents (institutional memory /
+# Medical Director overrides). Literals to keep the models layer from importing
+# integrations; a drift test asserts they equal vector_store's RAG_COLLECTIONS.
+# Previously this named a phantom "clinical_guidelines" that was never queried,
+# so the real collections were ungoverned (#2).
+PRIOR_AUTH_ALLOWED_COLLECTIONS: list[str] = ["nccn_guidelines", "case_precedents"]
 # Abstract capabilities a prior-auth run legitimately exercises. The submit flow
 # CREATES a request and persists its decision, so the DB actions are writes
 # (P-4 wires + guards these): db.write_request (persist the incoming request)

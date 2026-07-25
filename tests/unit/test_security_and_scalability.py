@@ -422,12 +422,17 @@ class TestRAGPipelineIntegration:
             outcome="AUTO_APPROVED",
         )
 
-        retriever._precedents.add.assert_called_once()
-        call_args = retriever._precedents.add.call_args
+        # chg-14: upsert (not add) with a deterministic content id, so the same
+        # override is idempotent instead of colliding/duplicating.
+        retriever._precedents.upsert.assert_called_once()
+        call_args = retriever._precedents.upsert.call_args
         # The document should contain the scenario details
         documents = call_args.kwargs.get("documents", call_args.args[0] if call_args.args else [])
         doc_text = str(documents)
         assert "foot drop" in doc_text or "AUTO_APPROVED" in doc_text
+        # Deterministic content id (not a per-process hash).
+        ids = call_args.kwargs.get("ids", [])
+        assert ids and ids[0].startswith("prec_")
 
 
 # =============================================================================

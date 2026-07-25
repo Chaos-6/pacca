@@ -45,7 +45,7 @@ from ...db.repository import AuditRepository, AuthorizationRepository, DecisionR
 from ...db.session import get_session
 
 # The RAG engine that retrieves relevant guidelines from ChromaDB
-from ...integrations.vector_store import GuidelineRetriever
+from ...integrations.vector_store import RAG_COLLECTIONS, GuidelineRetriever
 
 # Our domain models (Pydantic schemas for request/response shapes)
 from ...models.authorization import AuthorizationDecision, AuthorizationRequest
@@ -197,19 +197,20 @@ async def submit_authorization(
         query = f"Guidelines for {case.primary_diagnosis_code} and {case.procedure_code}"
 
         # ── SCOPE GUARD: RAG query (P-4 / chg-8) ─────────────────────────────
-        # Minimum-necessary check against the run's declared IntentRecord. In the
-        # current single-collection flow this always ALLOWS (the route targets the
-        # one allowed collection `clinical_guidelines`) — its enforcement value is
-        # defensive (it would fail-closed if a future change queried a non-allowed
-        # collection). The deny-capable sites are the identifier-checked DB writes
-        # above and below.
-        await enforce_scope(
-            intent,
-            "rag.query",
-            audit=audit,
-            mode=get_settings().scope_guard_mode,
-            collection_name="clinical_guidelines",
-        )
+        # Minimum-necessary check against the run's declared IntentRecord. The
+        # retriever reads BOTH real collections (guidelines + institutional-memory
+        # precedents), so guard each — a query to any collection outside the run's
+        # declared scope fail-closes to human review. This replaced a phantom
+        # `clinical_guidelines` check that named a collection never queried and so
+        # governed nothing (#2).
+        for _collection in RAG_COLLECTIONS:
+            await enforce_scope(
+                intent,
+                "rag.query",
+                audit=audit,
+                mode=get_settings().scope_guard_mode,
+                collection_name=_collection,
+            )
         context_text = rag_engine.query(query)
 
         # ── ORCHESTRATOR: Run the AI decision pipeline ────────────────────────
