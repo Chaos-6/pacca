@@ -743,25 +743,12 @@ def sme_authoring_static() -> None:
 
 
 # ── Figure 5 · Architecture v2.6 (incremental text refresh of the v2.5 asset) ─
-def architecture_v26() -> None:
-    src = (ASSETS / "architecture_v2.5.svg").read_text(encoding="utf-8")
-    subs = [
-        (">v2.5<", ">v2.6<"),
-        ("iter-0 … iter-10 · 25 changes", "iter-0 … iter-13 · 31 changes"),
-        # ChromaDB's two collections are guidelines + case_precedents; "H2 memory"
-        # (the long_term_memory.md prompt files) is a distinct mechanism. iter-13
-        # also brought both collections under the P-4 scope guard.
-        ("guidelines + H2 memory", "guidelines + precedents"),
-        ("(dual-collection RAG)", "(dual-collection · scope-guarded)"),
-    ]
-    out = src
-    for a, b in subs:
-        if a not in out:
-            print(f"  !! architecture: pattern not found, skipped: {a[:52]}")
-            continue
-        out = out.replace(a, b)
-    (ASSETS / "architecture_v2.6.svg").write_text(out, encoding="utf-8")
-    print("  wrote docs/assets/architecture_v2.6.svg")
+# NOTE: docs/assets/architecture_v2.6.svg is a STATIC, hand-maintained asset
+# (like docs/images/decision-hero.png) — it is not built here. Earlier versions
+# were derived by find/replace on a hand-authored architecture_v2.5.svg template;
+# that template has been removed and v2.6 is now the committed source of truth.
+# Edit the SVG directly when the architecture changes; keep its "iter-0 … iter-N ·
+# M changes" caption in sync with verify_facts() below.
 
 
 def _iter_number(path: Path) -> int:
@@ -799,5 +786,4 @@ if __name__ == "__main__":
     escalation_tree()
     harness_timeline()
     sme_authoring_static()
-    architecture_v26()
     print("done.")
