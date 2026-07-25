@@ -2,8 +2,6 @@
 Pytest shared configuration and fixtures for the PACCA test suite.
 
 This conftest provides:
-  - collect_ignore: excludes pre-Level 5 test files that test model/route
-    APIs replaced during upgrade_to_level5.sh
   - Environment setup so tests run without a real API key or OTel collector
   - Common fixtures shared across test modules
 
@@ -18,18 +16,16 @@ import os
 import pytest
 
 # =============================================================================
-# Exclude pre-Level 5 test files from collection.
-#
-# These files test the v1 domain model layer (PatientDemographics, Diagnosis,
-# TreatmentCategory, etc.) and v1 route structure that was replaced during
-# the Level 5 sprint. They are preserved for reference but cannot run against
-# the current v2.2 codebase without significant rework.
+# Collection scope
 # =============================================================================
 
-collect_ignore = [
-    "tests/test_level5_flow.py",  # Uses 'src.pacca' import path (pre-package)
-    "tests/unit/test_api.py",  # Tests v1 route structure with old fixtures
-]
+# collect_ignore paths resolve relative to THIS file's directory, so the former
+# "tests/..." prefixes matched nothing and both files were collected anyway. That
+# is how test_level5_flow.py came to contribute 3 collection errors to every run
+# while appearing to be excluded. Both entries are now unnecessary:
+# test_level5_flow.py is fixed and marked `clinical`, and unit/test_api.py is a
+# stub containing no tests. Nothing is excluded from collection.
+collect_ignore: list[str] = []
 
 
 # =============================================================================

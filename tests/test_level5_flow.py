@@ -1,14 +1,30 @@
-import contextlib
+"""
+Level 3-5 end-to-end flow: rule-based approval, the learning loop, policy evolution.
+
+Marked `clinical` because every test here POSTs to the real submit/admin routes,
+which call Claude. `-m "not clinical"` (the deterministic suite and CI) deselects
+the module; it runs alongside the other billable gates.
+
+This file previously subclassed GuidelineRetriever to redirect its ChromaDB path,
+reimplementing __init__ with public attribute names (`self.guidelines`,
+`self.client`) that the real class never had. Every method it inherited then
+raised AttributeError on `self._guidelines`. The subclass is gone: the retriever
+takes `db_path` directly, so the test uses the supported seam.
+"""
+
 import os
 import shutil
 
 import pytest
 from fastapi.testclient import TestClient
-from src.pacca.api.main import app
 
-# Import the modules where the global 'rag_engine' lives so we can overwrite it
-from src.pacca.api.routes import admin, authorizations
-from src.pacca.integrations.vector_store import GuidelineRetriever
+from pacca.api.main import app
+
+# Import the module where the global 'rag_engine' lives so we can overwrite it
+from pacca.api.routes import authorizations
+from pacca.integrations.vector_store import GuidelineRetriever
+
+pytestmark = pytest.mark.clinical
 
 # We create a specific test database path
 TEST_DB_PATH = os.path.join(os.getcwd(), "test_pacca_db")
@@ -16,43 +32,11 @@ TEST_DB_PATH = os.path.join(os.getcwd(), "test_pacca_db")
 
 @pytest.fixture(scope="module")
 def test_rag():
-    """
-    Creates a single RAG engine for the entire test session
-    pointed at a temporary directory.
-    """
-    # 1. Setup: Create clean DB
+    """A single RAG engine for the module, pointed at a throwaway directory."""
     if os.path.exists(TEST_DB_PATH):
         shutil.rmtree(TEST_DB_PATH)
 
-    # Initialize the Retriever with the custom path
-    # We need to hack the init slightly or just rely on the fact
-    # that we can swap the client.
-    # Actually, simpler: We monkeypatch the class to use our path.
-
-    # Let's just create it and manually swap the client if needed,
-    # BUT since your code hardcodes "./pacca_db", we need to be clever.
-    # The cleanest way without changing source code is to change the CWD
-    # or just Mock the class.
-
-    # Let's PATCH the global instances in the route files.
-    # But first we need an instance that uses the test path.
-
-    # Since 'GuidelineRetriever' hardcodes the path, we will subclass it for tests.
-    class TestRetriever(GuidelineRetriever):
-        def __init__(self):
-            import chromadb
-            from chromadb.utils import embedding_functions
-
-            self.client = chromadb.PersistentClient(path=TEST_DB_PATH)
-            self.embedding_fn = embedding_functions.DefaultEmbeddingFunction()
-            self.guidelines = self.client.get_or_create_collection(
-                name="nccn_guidelines", embedding_function=self.embedding_fn
-            )
-            self.precedents = self.client.get_or_create_collection(
-                name="case_precedents", embedding_function=self.embedding_fn
-            )
-
-    rag = TestRetriever()
+    rag = GuidelineRetriever(db_path=TEST_DB_PATH)
 
     # Seed it immediately
     rag.add_guideline(
@@ -76,22 +60,20 @@ def test_rag():
 
 
 @pytest.fixture(autouse=True)
-def inject_rag(test_rag):
+def inject_rag(test_rag, monkeypatch):
     """
-    This fixture runs before EVERY test.
-    It overwrites the 'rag_engine' variable in your API routes
-    with our safe 'test_rag' instance.
-    """
-    authorizations.rag_engine = test_rag
-    admin.rag_engine = test_rag
+    Point the route's module-level rag_engine at the throwaway store.
 
-    # IMPORTANT: Clear the 'Memory' collection between tests
-    # so learning tests don't pollute each other.
-    with contextlib.suppress(Exception):
-        test_rag.client.delete_collection("case_precedents")
-    test_rag.precedents = test_rag.client.get_or_create_collection(
-        name="case_precedents", embedding_function=test_rag.embedding_fn
-    )
+    Precedents are emptied between tests so the learning-loop test cannot be
+    satisfied by a precedent an earlier test wrote. Rows are deleted rather than
+    the collection dropped: dropping it would leave the retriever (and the
+    pipeline built over it) holding a handle to a deleted collection.
+    """
+    monkeypatch.setattr(authorizations, "rag_engine", test_rag)
+
+    existing = test_rag._precedents.get(include=[])["ids"]
+    if existing:
+        test_rag._precedents.delete(ids=existing)
 
 
 client = TestClient(app)
