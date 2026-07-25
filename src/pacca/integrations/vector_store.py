@@ -1,47 +1,36 @@
 """
 GuidelineRetriever — production RAG interface for PACCA.
 
-This module provides the primary interface for clinical guideline
-retrieval. It wraps RAGPipeline (the richer, production-grade
-implementation) while maintaining backward-compatible method names
-so all existing routes and agents continue to work without changes.
+This module provides the primary interface for clinical guideline retrieval.
+It wraps RAGPipeline (the richer implementation in `pacca.rag.pipeline`) while
+maintaining backward-compatible method names so existing routes and agents
+continue to work without changes. This is the Adapter pattern: GuidelineRetriever
+is the stable contract; RAGPipeline is the implementation behind it.
 
 Architecture history (important context for reviewers):
-  The original implementation in this file was a direct ChromaDB
-  wrapper — functional but without chunking, metadata filtering,
-  cosine similarity scoring, or relevance thresholds.
+  The original implementation in this file was a direct ChromaDB wrapper —
+  functional but without chunking, metadata filtering, or relevance scoring.
 
-  rag/pipeline.py was written with all those features but was never
-  wired as the active production path. Routes imported GuidelineRetriever
-  from this file; RAGPipeline sat unused.
+  rag/pipeline.py was written with those features. A v2.2 change claimed to
+  delegate to it, but the delegation never actually ran: `pacca.rag.pipeline`
+  could not be imported (a bad `from uuid7 import uuid7` in models/guidelines.py),
+  the import error was swallowed by a bare `except`, and the pipeline handle was
+  latched to None for the life of the process. Every query silently took the
+  direct-ChromaDB fallback. Worse, the pipeline it tried to build pointed at a
+  `clinical_guidelines` collection that nothing seeds and the scope guard does
+  not govern — so even a successful import would have queried an empty,
+  ungoverned store.
 
-  v2.2 resolution: GuidelineRetriever now delegates to RAGPipeline
-  internally. The public API is unchanged (same method signatures,
-  same return types). The retrieval quality is now backed by the
-  full pipeline with chunking and cosine similarity scoring.
-
-  This is the Adapter design pattern: GuidelineRetriever is the
-  stable interface that the rest of the codebase depends on;
-  RAGPipeline is the implementation that does the actual work.
-
-Teaching note — why not just change the import in routes?
-
-  `routes/authorizations.py` currently imports:
-    from ...integrations.vector_store import GuidelineRetriever
-
-  We could change that import to use RAGPipeline directly. But:
-    1. Other files may import GuidelineRetriever (admin.py, tests)
-    2. Changing imports across multiple files is higher risk than
-       upgrading the implementation behind one stable interface
-    3. The Adapter pattern is the right design: the interface is
-       a contract; changing the implementation behind it is safe
-
-  The single place to change retrieval logic is now this file.
+  Current state: the pipeline is built per retriever instance over that
+  instance's own `nccn_guidelines` collection — same client, same embedding
+  function, same collection the scope guard governs and the seeder writes.
+  Pipeline availability is observable via `pipeline_available`, and the
+  direct-ChromaDB fallback is retained for genuine degradation.
 """
 
-import asyncio
 import hashlib
 import os
+from typing import Any
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -77,57 +66,39 @@ def _precedent_id(case_summary: str) -> str:
     return f"prec_{digest[:16]}"
 
 
-# ── Lazy import of RAGPipeline ────────────────────────────────────────────────
-# We use a lazy import to avoid circular imports and to allow the module
-# to be imported even if rag/pipeline.py has a missing dependency.
-# The pipeline is instantiated on first use.
-_rag_pipeline = None
-
-
-def _get_pipeline():
+def _build_pipeline(collection: Any) -> Any:
     """
-    Get or create the RAGPipeline singleton.
+    Build a RAGPipeline over an already-open guidelines collection.
 
-    Uses the same ChromaDB path as the original implementation for
-    backward compatibility — existing data in pacca_db is preserved.
+    The import is local so that `pacca.rag.pipeline` (which pulls in ChromaDB
+    and the guideline models) is only loaded when a retriever is constructed.
+
+    Passing the caller's collection — rather than letting the pipeline open its
+    own — is what keeps retrieval pointed at the one governed `nccn_guidelines`
+    collection, using the retriever's embedding function and db path.
     """
-    global _rag_pipeline
-    if _rag_pipeline is None:
-        try:
-            from pacca.rag.pipeline import GuidelineVectorStore, RAGPipeline
+    from pacca.rag.pipeline import GuidelineVectorStore, RAGPipeline
 
-            db_path = os.path.join(os.getcwd(), "pacca_db")
-            vector_store = GuidelineVectorStore(
-                collection_name="clinical_guidelines",
-                persist_directory=db_path,
-            )
-            _rag_pipeline = RAGPipeline(vector_store=vector_store)
-            logger.info("rag_pipeline_initialized", db_path=db_path)
-        except Exception as e:
-            logger.warning(
-                "rag_pipeline_init_failed",
-                error=str(e),
-                fallback="direct_chromadb",
-            )
-            _rag_pipeline = None
-    return _rag_pipeline
+    vector_store = GuidelineVectorStore(collection=collection)
+    return RAGPipeline(vector_store=vector_store)
 
 
 class GuidelineRetriever:
     """
     Primary interface for clinical guideline retrieval.
 
-    Delegates to RAGPipeline for production-quality retrieval:
-      - Text chunking (1000 chars with 200-char overlap)
-      - Cosine similarity scoring
-      - Metadata filtering by specialty / treatment category
-      - Fallback retry without category filter if no results found
+    Delegates to RAGPipeline for retrieval over the guidelines collection:
+      - Text chunking (1000 chars with 200-char overlap) on ingest
+      - Distance-to-similarity scoring matched to the collection's space
+      - Optional metadata filtering by specialty / treatment category
+      - Retry without the category filter when it excludes everything
 
-    Falls back gracefully to direct ChromaDB queries if RAGPipeline
-    is unavailable (e.g., missing dependencies in development).
+    Falls back to direct ChromaDB queries if RAGPipeline is unavailable.
+    That fallback is a genuine degradation path, not the normal path:
+    `pipeline_available` reports which one is in force.
 
     The dual-collection design is preserved:
-      nccn_guidelines  — authoritative clinical guidelines
+      nccn_guidelines  — authoritative clinical guidelines (via RAGPipeline)
       case_precedents  — human override decisions (institutional memory)
     """
 
@@ -143,17 +114,56 @@ class GuidelineRetriever:
         self._client = chromadb.PersistentClient(path=db_path)
         self._embedding_fn = embedding_function or embedding_functions.DefaultEmbeddingFunction()
 
+        # Cosine is the appropriate space for sentence-embedding similarity, and
+        # it is what the retrieval docs have always claimed. ChromaDB applies this
+        # only when creating a collection — an existing store keeps the space it
+        # was built with (l2), with no error and no migration. Scoring reads the
+        # collection's actual space (see rag.pipeline.similarity_from_distance),
+        # so both old and new stores score correctly.
+        _COSINE = {"hnsw:space": "cosine"}
+
         # Collection 1: Official guidelines (NCCN, CMS, AHA, etc.)
         self._guidelines = self._client.get_or_create_collection(
             name=GUIDELINE_COLLECTION,
             embedding_function=self._embedding_fn,
+            metadata=_COSINE,
         )
 
         # Collection 2: Institutional memory (human override precedents)
         self._precedents = self._client.get_or_create_collection(
             name=PRECEDENT_COLLECTION,
             embedding_function=self._embedding_fn,
+            metadata=_COSINE,
         )
+
+        # Built per instance (not as a module singleton) so a retriever pointed
+        # at a temp db_path gets a pipeline over *that* store. A failure here is
+        # logged at error level and degrades to _query_direct; it is not silent.
+        try:
+            self._pipeline = _build_pipeline(self._guidelines)
+            logger.info(
+                "rag_pipeline_initialized",
+                db_path=db_path,
+                collection=GUIDELINE_COLLECTION,
+            )
+        except Exception as e:
+            self._pipeline = None
+            logger.error(
+                "rag_pipeline_init_failed",
+                error=str(e),
+                fallback="direct_chromadb",
+            )
+
+    @property
+    def pipeline_available(self) -> bool:
+        """
+        Whether the RAGPipeline path is in force for this retriever.
+
+        False means every query is silently degrading to the direct-ChromaDB
+        fallback — the exact condition that went unnoticed before, so it is
+        exposed rather than left to log archaeology.
+        """
+        return self._pipeline is not None
 
     def guideline_count(self) -> int:
         """Number of official guidelines in the store. 0 means unseeded (B4)."""
@@ -229,8 +239,9 @@ class GuidelineRetriever:
         """
         Retrieve relevant guidelines and precedents for a clinical query.
 
-        Attempts to use RAGPipeline (with chunking and cosine scoring).
-        Falls back to direct ChromaDB queries if the pipeline is unavailable.
+        Uses RAGPipeline for the guidelines collection, then appends
+        institutional-memory precedents. Falls back to direct ChromaDB queries
+        if the pipeline is unavailable or errors.
 
         Args:
             clinical_query: Natural language query built from the case details
@@ -239,40 +250,29 @@ class GuidelineRetriever:
             Formatted string with official guidelines and relevant precedents,
             ready to be injected into agent prompts as context.
         """
-        pipeline = _get_pipeline()
-
-        if pipeline is not None:
-            # Use the full RAGPipeline for production-quality retrieval.
-            # RAGPipeline.retrieve_relevant_guidelines() is async, but
-            # GuidelineRetriever.query() is called from sync contexts.
-            # We use asyncio.run() here as a bridge — this is acceptable
-            # because query() is only called from route handlers that
-            # are themselves async (the event loop is already running).
-            # In a full async refactor, query() would be async and
-            # awaited directly. That is the production next step.
+        if self._pipeline is not None:
             try:
-                # Parse the query to extract diagnosis/treatment components
+                # Parse the query to extract diagnosis/treatment components.
                 # The query format from routes is:
                 # "Guidelines for {diagnosis_code} and {procedure_code}"
                 parts = clinical_query.replace("Guidelines for ", "").split(" and ")
                 diagnosis_code = parts[0].strip() if parts else ""
                 procedure_code = parts[1].strip() if len(parts) > 1 else ""
 
-                loop = asyncio.new_event_loop()
-                try:
-                    guidelines_text = loop.run_until_complete(
-                        pipeline.retrieve_relevant_guidelines(
-                            diagnosis_code=diagnosis_code,
-                            diagnosis_description=diagnosis_code,
-                            treatment_code=procedure_code,
-                            treatment_description=procedure_code,
-                            treatment_category="general",
-                            clinical_context=clinical_query,
-                            n_results=5,
-                        )
-                    )
-                finally:
-                    loop.close()
+                # Called synchronously: ChromaDB is a sync library, so the
+                # pipeline's sync entry point is used directly rather than
+                # spinning up a throwaway event loop inside the running one.
+                # No treatment_category is passed — the route's query string
+                # carries no category, and inventing one ("general") only
+                # produced a filter that matched nothing plus a wasted retry.
+                guidelines_text = self._pipeline.retrieve_relevant_guidelines_sync(
+                    diagnosis_code=diagnosis_code,
+                    diagnosis_description=diagnosis_code,
+                    treatment_code=procedure_code,
+                    treatment_description=procedure_code,
+                    clinical_context=clinical_query,
+                    n_results=5,
+                )
 
                 # Append precedents from the institutional memory collection
                 precedents_text = self._query_precedents(clinical_query)
@@ -286,7 +286,7 @@ class GuidelineRetriever:
                 return guidelines_text
 
             except Exception as e:
-                logger.warning(
+                logger.error(
                     "rag_pipeline_query_failed",
                     error=str(e),
                     fallback="direct_chromadb",
