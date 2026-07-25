@@ -38,7 +38,7 @@ Here is the result — a real decision, produced by the running system on a synt
 
 PACCA is a **pre-production portfolio project**. It is **not HIPAA-validated**, has **no Business Associate Agreements** in place, and **must not be used with real patient data**. Every clinical case here is synthetic, and a pre-commit guard actively blocks patient-data-shaped strings from being committed.
 
-The *engineering* is production-grade. The *deployment* is not. Treat this as a reference architecture, not a turnkey product. What would close the gap is written down honestly in [`docs/PACCA_PRD_v2.5_Consolidated.md` §16](docs/PACCA_PRD_v2.5_Consolidated.md) and [`docs/HIPAA_COMPLIANCE.md`](docs/HIPAA_COMPLIANCE.md).
+The *engineering* is production-grade. The *deployment* is not. Treat this as a reference architecture, not a turnkey product. What would close the gap is written down honestly in [`docs/PACCA_PRD_v2.6_Consolidated.md` §16](docs/PACCA_PRD_v2.6_Consolidated.md) and [`docs/HIPAA_COMPLIANCE.md`](docs/HIPAA_COMPLIANCE.md).
 
 ---
 
@@ -60,7 +60,7 @@ A $50–100B annual administrative burden in the U.S. — and fundamentally a *r
 Five agents, each with one job, coordinated by an orchestrator that holds the safety logic.
 
 <p align="center">
-  <img src="docs/assets/architecture_v2.5.svg" alt="PACCA system architecture: a React frontend and FastAPI backend feed a multi-agent orchestrator with a pre-flight risk gate, Tier-1 Decision Support and Tier-2 Medical Director agents, dual-collection ChromaDB retrieval, PostgreSQL persistence, and a HIPAA audit trail." width="880">
+  <img src="docs/assets/architecture_v2.6.svg" alt="PACCA system architecture: a React frontend and FastAPI backend feed a multi-agent orchestrator with a pre-flight risk gate, Tier-1 Decision Support and Tier-2 Medical Director agents, dual-collection ChromaDB retrieval, PostgreSQL persistence, and a HIPAA audit trail." width="880">
 </p>
 
 1. **Evidence Aggregation** — turns scattered clinical notes into one coherent narrative
@@ -95,15 +95,25 @@ Audit records are written in **start/complete pairs, flushed before the state ch
 
 ---
 
+## It learns from its Medical Directors — under the same governance
+
+When a Medical Director overrides a decision, PACCA embeds that override into a second vector collection (`case_precedents`). The next semantically-similar case retrieves it alongside the official guidelines, and the agent is instructed to weigh it. No retraining — institutional memory as retrieval.
+
+The loop is **proven end-to-end**: an identical case that the guidelines alone send to **human review** becomes an **auto-approval** once a matching Medical Director precedent exists, with the agent's rationale explicitly citing the precedent. And critically, that learning write is held to the **same governance as everything else** — it declares a scoped intent, the minimum-necessary guard confirms it may only touch the precedent collection, and the event is audited before the write lands. Institutional memory that can't quietly become an ungoverned side channel.
+
+The two collections are kept apart on purpose — authoritative guidelines (`nccn_guidelines`) and institutional precedent (`case_precedents`) carry different trust levels, and both are now inside the scope guard's declared-collection model.
+
+---
+
 ## Built as an experiment log, not a pile of commits
 
 Every change to how an agent reasons ships as a **one-file diff with a written, falsifiable prediction**. The next evaluation round checks that prediction and records a verdict: keep, improve, or roll back. Nothing survives because it felt better.
 
 <p align="center">
-  <img src="docs/assets/harness_timeline.svg" alt="PACCA harness iteration ledger: eleven iterations from harness-iter-0 through harness-iter-10, each showing its date, the change made, which constraint surface it touched, and the recorded verdict. Twenty-five changes, zero rollbacks." width="900">
+  <img src="docs/assets/harness_timeline.svg" alt="PACCA harness iteration ledger: fourteen iterations from harness-iter-0 through harness-iter-13, each showing its date, the change made, which constraint surface it touched, and the recorded verdict. Thirty-one changes, zero rollbacks." width="900">
 </p>
 
-**11 iterations · 25 changes · 0 rollbacks.** The method is adapted from Lin et al., *Agentic Harness Engineering* ([arXiv:2604.25850](https://arxiv.org/abs/2604.25850), 2026). Full reasoning, per-change manifests, and the verdict cycle are in **[ENGINEERING.md](docs/ENGINEERING.md)**.
+**14 iterations · 31 changes · 0 rollbacks.** The method is adapted from Lin et al., *Agentic Harness Engineering* ([arXiv:2604.25850](https://arxiv.org/abs/2604.25850), 2026). The July arc alone — server-side `decision_id` (B6), the deferrable audit FK (B3, verified on real Postgres), and governing the institutional-memory precedent collection under the scope guard — is seven iterations, each a one-file diff with a recorded verdict. Full reasoning, per-change manifests, and the verdict cycle are in **[ENGINEERING.md](docs/ENGINEERING.md)**.
 
 > **Governance context.** PACCA is a Class 2/3 enterprise agent inside a [**CRISP-AG**](https://drdavidreed.com/portfolio)-style governance envelope — an artifact-centered framework for enterprise agentic AI governance that sits beneath ISO/IEC 42001 and NIST AI RMF. The harness discipline here is a concrete instance of CRISP-AG's *Orchestration Contract*; the escalation tree and Medical Director gate instantiate *Delegation Authority Scoping* applied to healthcare.
 
@@ -115,11 +125,12 @@ Everything below is measured locally or explicitly labeled a benchmark on synthe
 
 | Metric | Value | How it's known |
 |---|---|---|
-| **Automated tests** | **710** collected (652 unit · 28 clinical · 27 harness · 3 flow) | `pytest tests/ --collect-only` |
+| **Automated tests** | **743** collected (683 unit · 28 clinical · 27 harness · 2 integration · 3 flow) | `pytest tests/ --collect-only` |
 | **Clinical evaluation dataset** | 105 synthetic cases (GC-001–GC-105) across ~20 specialty suites | `tests/clinical/` |
 | **Clinical accuracy gate** | 20-case golden core, LLM-as-judge (1–5 rubric), threshold ≥80% — **20/20 at mean 4.9/5**, zero variance across repeat runs | `make test-clinical` |
 | **Hallucination tolerance** | **Zero.** Two sparse-notes traps (GC-018, GC-019) fail on any invented clinical fact | clinical gate + runtime detector |
-| **Harness iterations** | 11 recorded · 25 changes · 0 rollbacks | `harness/manifests/` |
+| **Harness iterations** | 14 recorded · 31 changes · 0 rollbacks | `harness/manifests/` |
+| **Real-Postgres CI guard** | submit path exercised on Postgres 16 every PR — catches FK/JSONB bugs SQLite masks | `make test-postgres` |
 | **Median decision latency** *(benchmark)* | ~2.1 s | 53-case synthetic run, Sonnet 4.5 |
 | **95th-percentile latency** *(benchmark)* | ~4.3 s | same |
 | **Cost per decision** *(estimated)* | ~$0.04 | token-counted per case |
@@ -198,7 +209,7 @@ I built PACCA to demonstrate end-to-end agentic AI engineering in a high-stakes,
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component responsibilities and request lifecycle |
 | [`docs/HARNESS.md`](docs/HARNESS.md) | The editable harness surfaces and the rules for changing each |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Every behavioral change with its prediction and verdict |
-| [`docs/PACCA_PRD_v2.5_Consolidated.md`](docs/PACCA_PRD_v2.5_Consolidated.md) | Product requirements, including §16 Clinical Validation Strategy |
+| [`docs/PACCA_PRD_v2.6_Consolidated.md`](docs/PACCA_PRD_v2.6_Consolidated.md) | Product requirements, including §16 Clinical Validation Strategy |
 | [`docs/EVALUATION.md`](docs/EVALUATION.md) | Benchmark methodology and the gap list |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | The two-path contribution model |
 
@@ -210,7 +221,7 @@ Security findings should follow [`SECURITY.md`](SECURITY.md) — please don't op
 
 ```
 Reed, D. (2026). PACCA: Prior Authorization & Care Coordination Agent Platform —
-v2.5 Consolidated PRD. github.com/drdgreed/pacca.
+v2.6 Consolidated PRD. github.com/drdgreed/pacca.
 
 Methodology adapted from:
 Lin, J., Liu, S., Pan, C., Lin, L., Dou, S., Huang, X., Yan, H., Han, Z., & Gui, T. (2026).
@@ -230,5 +241,5 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-**PACCA v2.5** — Healthcare Prior Authorization, Iterated Like Engineering
+**PACCA v2.6** — Healthcare Prior Authorization, Iterated Like Engineering
 *github.com/drdgreed/pacca · David Reed, PhD · July 2026*
