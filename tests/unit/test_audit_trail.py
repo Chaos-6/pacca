@@ -259,8 +259,15 @@ class TestAuditTrailWiring:
         guarded = [
             c["details"]["guarded_action"] for c in audit_log_calls if c["action"] == "scope.allow"
         ]
-        # All three guarded sites allowed (no scope.deny), in run order.
-        assert guarded == ["db.write_request", "rag.query", "db.write_decision"]
+        # Guarded sites allowed (no scope.deny), in run order. rag.query is guarded
+        # once per real collection the retriever reads (nccn_guidelines +
+        # case_precedents), so it appears twice (#2).
+        assert guarded == [
+            "db.write_request",
+            "rag.query",
+            "rag.query",
+            "db.write_decision",
+        ]
         assert not [c for c in audit_log_calls if c["action"] == "scope.deny"]
 
     @pytest.mark.asyncio
@@ -363,7 +370,10 @@ class TestAuditTrailWiring:
         assert details["purpose"] == "prior_auth_adjudication"
         assert details["request_id"] == req.request_id
         assert details["subject_ref"] == req.patient_id
-        assert "clinical_guidelines" in details["allowed_collections"]
+        # The real RAG collections are declared (not the old phantom), so
+        # institutional-memory precedents are within the governed scope (#2).
+        assert "nccn_guidelines" in details["allowed_collections"]
+        assert "case_precedents" in details["allowed_collections"]
         assert "audit.append" in details["allowed_actions"]
 
     @pytest.mark.asyncio

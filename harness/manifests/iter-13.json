@@ -1,0 +1,169 @@
+{
+  "iteration": 13,
+  "iteration_tag": "harness-iter-13",
+  "iso_date": "2026-07-24",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-12",
+  "summary": "Wires and governs the case_precedents institutional-memory RAG collection. chg-14: deterministic precedent id + upsert (the B6 unstable-key anti-pattern). chg-15: the scope guard governs the two REAL collections (nccn_guidelines, case_precedents) instead of a phantom 'clinical_guidelines' never queried. chg-16: the /feedback write gets an IntentRecord, a scope-guarded write, and audit-before-write. Loop proven end-to-end: a precedent flipped a case IN_REVIEW -> AUTO_APPROVED.",
+  "changes": [
+    {
+      "id": "chg-14",
+      "type": "improvement",
+      "description": "add_precedent uses a deterministic sha256 content id (_precedent_id) and upsert instead of f\"prec_{abs(hash(case_summary))}\" + add. The same override is now idempotent and a corrected override overwrites in place.",
+      "files": [
+        "src/pacca/integrations/vector_store.py",
+        "tests/unit/test_precedents.py"
+      ],
+      "failure_pattern": "The same Medical Director override produced a different precedent id on every server restart (silent duplicate precedents accumulating), and a same-process repeat collided on ChromaDB .add() and raised.",
+      "root_cause": "The id was f\"prec_{abs(hash(case_summary))}\". Python's hash(str) is per-process randomized (PYTHONHASHSEED), so it is unstable across processes; and .add() rejects a duplicate id rather than updating. Same class as the B6 decision_id bug: a derived/unstable value used as a storage key.",
+      "evidence": [
+        {
+          "source": "abs(hash('x')) across two python -c processes",
+          "note": "Returned 5179595735129669111 then 5777744012722371097 for the identical string, demonstrating the per-process instability."
+        },
+        {
+          "source": "tests/unit/test_precedents.py",
+          "note": "Pre-fix, re-adding the same scenario keeps the stale document (add ignores duplicate ids); the id-determinism test would fail on hash(). Post-fix: idempotent, deterministic content id, update-in-place; 5 tests pass."
+        }
+      ],
+      "predicted_fixes": [
+        "The same override upserts to one stable id across restarts (no duplicate accumulation).",
+        "A corrected override overwrites the prior document in place.",
+        "The id is deterministic and content-keyed."
+      ],
+      "risk_cases": [
+        "Existing precedents written under the old hash-based ids remain in the store with their old ids; they are retrieved by similarity regardless of id, so no data loss. New writes use the stable id.",
+        "A precedent whose scenario text changes gets a new id (a new precedent); intended."
+      ],
+      "constraint_level": "tool_implementation",
+      "why_this_component": "The bug is in how the precedent is stored (id + write mode), a property of the retriever's tool implementation, not the agent's reasoning.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert the chg-14 commit. Restores add() + hash id. No migration; the store's existing entries are unaffected."
+    },
+    {
+      "id": "chg-15",
+      "type": "improvement",
+      "description": "The scope guard's collection model now names the two real ChromaDB collections (nccn_guidelines, case_precedents) via SSOT constants; IntentRecord.allowed_collections lists them; the submit route guards the RAG query against each real collection. Replaces a phantom 'clinical_guidelines' that was never queried.",
+      "files": [
+        "src/pacca/integrations/vector_store.py",
+        "src/pacca/models/intent.py",
+        "src/pacca/api/routes/authorizations.py",
+        "tests/unit/test_rag_collections_governed.py",
+        "tests/unit/test_scope_guard.py",
+        "tests/unit/test_audit_trail.py",
+        "tests/unit/test_security_and_scalability.py"
+      ],
+      "failure_pattern": "The P-4 minimum-necessary guard governed a fiction: IntentRecord declared allowed_collections=['clinical_guidelines'], the submit route's rag.query scope check named 'clinical_guidelines', but the live retriever reads nccn_guidelines and case_precedents. The two real collections \u2014 including institutional-memory precedents \u2014 were entirely ungoverned.",
+      "root_cause": "The intent constant and the route both used a name that no longer matched the retriever's collections after the dual-collection store landed; the guard's collection check was therefore always a no-op.",
+      "evidence": [
+        {
+          "source": "src/pacca/models/intent.py + src/pacca/integrations/vector_store.py",
+          "note": "Pre-fix: PRIOR_AUTH_ALLOWED_COLLECTIONS=['clinical_guidelines']; retriever __init__ creates nccn_guidelines and case_precedents. The route's enforce_scope named clinical_guidelines with a comment admitting its enforcement value was nil."
+        },
+        {
+          "source": "tests/unit/test_rag_collections_governed.py",
+          "note": "New drift test asserts intent.allowed_collections == vector_store.RAG_COLLECTIONS, and that the guard denies an unlisted collection while allowing the two real ones."
+        }
+      ],
+      "predicted_fixes": [
+        "IntentRecord for prior-auth allows exactly the two real collections; the phantom is gone.",
+        "A submit RAG query to any collection outside the declared scope fail-closes.",
+        "case_precedents is now within the governed minimum-necessary scope."
+      ],
+      "risk_cases": [
+        "The submit route now issues two rag.query scope checks (one per collection); audit-trail wiring tests updated to the new order.",
+        "Any external reference to the 'clinical_guidelines' collection name (dead rag/pipeline.py still uses it internally, but that path never runs)."
+      ],
+      "constraint_level": "middleware",
+      "why_this_component": "The scope guard is the P-4 minimum-necessary middleware; the defect and fix live in the collection model it enforces against.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert chg-15. Restores the phantom collection name; the guard reverts to a no-op collection check. No migration."
+    },
+    {
+      "id": "chg-16",
+      "type": "improvement",
+      "description": "The /feedback precedent write is governed like the submit path: a narrow institutional_learning IntentRecord (case_precedents + rag.write_precedent/audit.append only) declared as the first audit event, a scope-guarded write (fail-closed 403), and the learning event audited before the ChromaDB write. Rule 3 of the scope guard now covers any rag.* action.",
+      "files": [
+        "src/pacca/models/intent.py",
+        "src/pacca/agents/scope_guard.py",
+        "src/pacca/api/routes/authorizations.py",
+        "tests/unit/test_feedback_governed.py"
+      ],
+      "failure_pattern": "learn_from_feedback wrote a precedent to the case_precedents RAG collection with no IntentRecord, no scope guard, and add_precedent running BEFORE the audit \u2014 the only RAG mutation outside the P-3/P-4/P-5 governance the submit route enforces.",
+      "root_cause": "The endpoint predated the governance rollout and was never brought under it; the scope guard's collection check also only applied to rag.query, not writes.",
+      "evidence": [
+        {
+          "source": "src/pacca/api/routes/authorizations.py (pre-fix)",
+          "note": "add_precedent at line 356 ran before the sole audit.log at line 368; no IntentRecord, no enforce_scope."
+        },
+        {
+          "source": "tests/unit/test_feedback_governed.py",
+          "note": "Asserts intent.declared is the first event, a scope.allow is recorded for the precedent write, the learning event is audited before add_precedent, and the feedback intent is scoped to case_precedents only (no guideline read, no DB writes)."
+        }
+      ],
+      "predicted_fixes": [
+        "A /feedback call emits intent.declared first, scope-guards the write to case_precedents, and audits the learning event before the write.",
+        "A precedent write to any other collection fail-closes to 403.",
+        "The feedback intent cannot read guidelines or write DB business rows."
+      ],
+      "risk_cases": [
+        "Rule 3 now applies to all rag.* actions; a future rag.* action without a collection_name would be denied (collection_missing) \u2014 intended fail-closed behavior.",
+        "In enforce mode a genuine scope violation now 403s instead of silently writing; never fires in correct operation."
+      ],
+      "constraint_level": "middleware",
+      "why_this_component": "Bringing an ungoverned state-changing endpoint under the P-4 scope guard and the pre-write-audit invariant is a middleware-tier change.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert chg-16. Restores the ungoverned write-then-audit endpoint and the rag.query-only Rule 3. No migration."
+    }
+  ],
+  "verdicts": [
+    {
+      "change_id": "chg-14",
+      "previous_iteration_tag": "harness-iter-12",
+      "outcome": "keep",
+      "verified_fixes": [
+        "5 precedent tests pass: idempotent same-scenario write, distinct scenarios kept, update-in-place, deterministic content id, write->retrieve round-trip.",
+        "End-to-end this session: /feedback -> embed -> retrieve -> decision flipped a case IN_REVIEW -> AUTO_APPROVED with the rationale attributing it to the precedent."
+      ],
+      "missed_fixes": [],
+      "false_predicted_fixes": [],
+      "verified_risks": [],
+      "unforeseen_regressions": [],
+      "notes": "Deterministic suite green; ruff clean."
+    },
+    {
+      "change_id": "chg-15",
+      "previous_iteration_tag": "harness-iter-12",
+      "outcome": "keep",
+      "verified_fixes": [
+        "Drift test asserts intent.allowed_collections == RAG_COLLECTIONS; guard denies an unlisted collection and allows the two real ones.",
+        "Submit route guards the RAG query against each real collection; audit-trail tests updated to the two-collection order."
+      ],
+      "missed_fixes": [],
+      "false_predicted_fixes": [],
+      "verified_risks": [
+        "The two-rag.query-guard change was reflected in test_run_sites_are_scope_guarded without weakening it."
+      ],
+      "unforeseen_regressions": [],
+      "notes": "Full unit suite 681 passed."
+    },
+    {
+      "change_id": "chg-16",
+      "previous_iteration_tag": "harness-iter-12",
+      "outcome": "keep",
+      "verified_fixes": [
+        "test_feedback_governed: intent.declared first, scope.allow recorded for the write, learning event audited before add_precedent, feedback intent scoped to case_precedents only.",
+        "Scope-guard Rule 3 now covers rag.* actions without regressing the existing scope-guard probes."
+      ],
+      "missed_fixes": [],
+      "false_predicted_fixes": [],
+      "verified_risks": [],
+      "unforeseen_regressions": [],
+      "notes": "Full unit suite 681 passed; ruff + PHI-guard clean."
+    }
+  ]
+}

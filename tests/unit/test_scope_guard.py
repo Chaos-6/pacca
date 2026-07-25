@@ -46,9 +46,10 @@ async def test_cross_case_patient_ref_denied():
 
 @pytest.mark.asyncio
 async def test_disallowed_collection_denied():
-    # case_precedents is NOT in the intent's allowed_collections.
+    # An unlisted collection is NOT in the intent's allowed_collections. (The two
+    # real collections — nccn_guidelines, case_precedents — ARE allowed; #2.)
     with pytest.raises(ScopeViolation) as exc:
-        await enforce_scope(_intent(), "rag.query", collection_name="case_precedents")
+        await enforce_scope(_intent(), "rag.query", collection_name="unlisted_collection")
     assert any("collection_not_allowed" in v for v in exc.value.violations)
 
 
@@ -64,7 +65,7 @@ async def test_missing_collection_denied_no_default_bypass():
 
 @pytest.mark.asyncio
 async def test_allowed_rag_query_passes():
-    await enforce_scope(_intent(), "rag.query", collection_name="clinical_guidelines")
+    await enforce_scope(_intent(), "rag.query", collection_name="nccn_guidelines")
 
 
 @pytest.mark.asyncio
@@ -83,7 +84,7 @@ async def test_audit_append_passes():
 @pytest.mark.asyncio
 async def test_warn_mode_does_not_raise():
     # Same out-of-scope call that raises in enforce mode returns quietly in warn.
-    await enforce_scope(_intent(), "rag.query", collection_name="case_precedents", mode="warn")
+    await enforce_scope(_intent(), "rag.query", collection_name="unlisted_collection", mode="warn")
 
 
 # ── Audit event shape: scope.deny logs NAMES, never values ────────────────────
@@ -101,19 +102,21 @@ class _CapturingAudit:
 async def test_scope_deny_audits_names_not_values():
     audit = _CapturingAudit()
     with pytest.raises(ScopeViolation):
-        await enforce_scope(_intent(), "rag.query", audit=audit, collection_name="case_precedents")
+        await enforce_scope(
+            _intent(), "rag.query", audit=audit, collection_name="unlisted_collection"
+        )
     assert len(audit.calls) == 1
     call = audit.calls[0]
     assert call["action"] == "scope.deny"
     assert call["success"] is False
     # request_id/correlation_id come from the run intent (allowed to appear);
-    # the disallowed VALUE 'case_precedents' must NOT leak into the audit details.
-    assert "case_precedents" not in str(call["details"]["violations"])
+    # the disallowed VALUE 'unlisted_collection' must NOT leak into the audit details.
+    assert "unlisted_collection" not in str(call["details"]["violations"])
     assert "collection_not_allowed:collection_name" in call["details"]["violations"]
 
 
 @pytest.mark.asyncio
 async def test_scope_allow_audited():
     audit = _CapturingAudit()
-    await enforce_scope(_intent(), "rag.query", audit=audit, collection_name="clinical_guidelines")
+    await enforce_scope(_intent(), "rag.query", audit=audit, collection_name="nccn_guidelines")
     assert audit.calls[0]["action"] == "scope.allow"

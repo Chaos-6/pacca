@@ -65,8 +65,9 @@ def _evaluate(intent: IntentRecord, action: str, call_args: dict[str, Any]) -> l
         if arg_name in call_args and str(call_args[arg_name]) != str(getattr(intent, intent_field)):
             violations.append(f"identifier_mismatch:{arg_name}")
 
-    # Rule 3 — RAG queries must target an allowed collection; no default bypass.
-    if action == "rag.query":
+    # Rule 3 — any RAG access (read or write) must target an allowed collection;
+    # no default bypass. Applies to rag.query and rag.write_precedent (#3).
+    if action.startswith("rag."):
         collection = call_args.get("collection_name")
         if collection is None:
             violations.append("collection_missing:collection_name")

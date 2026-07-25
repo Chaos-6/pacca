@@ -12,6 +12,7 @@
 
 ## Index
 
+- [iter-13 — chg-14/15/16: wire + govern the case_precedents institutional-memory RAG collection](#iter-13-precedent-rag)
 - [iter-12 — chg-13: deferrable audit FK, fixes Postgres FK violation (B3)](#iter-12-deferrable-audit-fk)
 - [iter-11 — chg-11/chg-12: server-side decision_id + legible integrity failures (B6)](#iter-11-server-side-decision-id)
 - [iter-10 — Runtime evidence-grounding detector (P-5 / T-18) (1 change)](#iter-10-evidence-grounding)
@@ -26,6 +27,36 @@
 - [Correction (2026-05-22) — iter-0 trajectory instrumentation record](#correction-iter0-trajectory)
 - [iter-1 — chg-1: Decision Support and Medical Director prompt extraction (Phase H1)](#chg-1-iter-1)
 - [iter-0 — Baseline Crystallization (seed)](#iter-0-baseline-crystallization)
+
+---
+
+<a name="iter-13-precedent-rag"></a>
+## iter-13 — Wire + govern the case_precedents institutional-memory RAG collection, 3 changes
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-13` |
+| Date | 2026-07-24 |
+| Author | David Reed |
+| Base model | `claude-sonnet-4-5-20250929` |
+| Constraint levels touched | `tool_implementation` (chg-14), `middleware` (chg-15, chg-16) |
+| Behavioral surface modified | YES — precedent storage, the scope-guard collection model, and the /feedback endpoint's governance |
+| Changes | 3 |
+| Verdict | **KEEP** (all three). Full unit suite 681 passed; loop proven end-to-end |
+
+**Context.** The prior-decision precedent loop (`/feedback` → embed → retrieve → the DecisionAgent weighs "PAST MEDICAL DIRECTOR DECISIONS") was already ~80% wired. This iteration closed the gaps and brought it under the P-3/P-4/P-5 governance the submit path already had. **Proven end-to-end this session:** a Medical Director precedent written via `/feedback` flipped the identical case from **IN_REVIEW → AUTO_APPROVED**, with the agent's rationale explicitly attributing the change to the precedent.
+
+### chg-14 — Deterministic precedent id + upsert
+`add_precedent` used `f"prec_{abs(hash(case_summary))}"` + `.add()`. `hash(str)` is per-process randomized, so the same override got a new id on every restart (silent duplicates), and a same-process repeat collided on `.add()`. The B6 unstable-key anti-pattern, in institutional memory. Fixed with a `sha256` content id (`_precedent_id`) + `upsert`.
+
+### chg-15 — Govern the real RAG collections, not a phantom
+`IntentRecord` allowed `["clinical_guidelines"]` — a collection the retriever never queries. The live retriever reads `nccn_guidelines` + `case_precedents`; the submit route's scope check named the phantom, so the P-4 guard governed nothing and precedents were outside the minimum-necessary model. Now `RAG_COLLECTIONS` (SSOT) drives the allow-list, and the route guards the RAG query against each real collection. A drift test asserts the two stay in sync.
+
+### chg-16 — Govern the /feedback precedent write
+The precedent write had no `IntentRecord`, no scope guard, and ran *before* its audit. Now: a narrow `institutional_learning` intent (scoped to `case_precedents` + `rag.write_precedent`/`audit.append` only) declared as the first audit event, a scope-guarded write (fail-closed 403), and the learning event audited before the write. Scope-guard Rule 3 now covers any `rag.*` action, so precedent writes are collection-guarded like reads.
+
+### P-5 policy decision (no code change)
+The e2e clarified the evidence-grounding interaction is **not** a hard conflict: the agent cites the *submission* evidence id (`EV1`), not a precedent, so P-5 already passes. Decision: **precedents are institutional context, not citable evidence** — `cited_evidence_ids` stays submission-scoped and P-5 stays submission-scoped. Threading stable precedent ids into the grounding set is the roadmap "RAG chunk-id grounding" follow-up.
 
 ---
 
