@@ -106,45 +106,99 @@ class TestSecretKeyFromEnvironment:
         )
 
 
+GOOD_KEY = "9f3c1a7be24d05f8c6a1becd730f4821a95d6ec4bb0713fe2a8c5d90416b7fae"
+
+
 class TestValidateSecretKey:
     """
     Verify validate_secret_key() fails fast on bad configuration.
+
+    The length-only version of this check accepted two things it should not have:
+    a 32-char key of a single repeated character, and the 61-char placeholder
+    shipped in .env.example. Both are covered below.
     """
 
     def test_raises_on_empty_key(self):
         """Empty SECRET_KEY must raise RuntimeError at startup."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", ""):
-            with pytest.raises(RuntimeError) as exc_info:
-                validate_secret_key()
-            assert "SECRET_KEY" in str(exc_info.value)
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="", app_env="production")
+        assert "SECRET_KEY" in str(exc_info.value)
 
     def test_raises_on_short_key(self):
         """Keys shorter than 32 characters must raise RuntimeError."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", "tooshort"):
-            with pytest.raises(RuntimeError) as exc_info:
-                validate_secret_key()
-            assert "32" in str(exc_info.value), (
-                "Error message should mention the 32-character minimum."
-            )
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="tooshort", app_env="production")
+        assert "32" in str(exc_info.value), "Error message should mention the 32-character minimum."
 
     def test_passes_on_adequate_key(self):
-        """A 32-character key must pass validation without raising."""
+        """A generated 32-character key must pass validation without raising."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", "x" * 32):
-            # Should not raise
-            validate_secret_key()
+        validate_secret_key(key=GOOD_KEY[:32], app_env="production")
 
     def test_passes_on_long_key(self):
         """Keys longer than 32 characters must also pass."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", "x" * 64):
-            validate_secret_key()
+        validate_secret_key(key=GOOD_KEY, app_env="production")
+
+    def test_raises_on_long_but_low_entropy_key(self):
+        """
+        Length is not entropy. "xxxx...x" is 64 characters and one distinct
+        character; the length-only check accepted it.
+        """
+        from pacca.api.auth import validate_secret_key
+
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="x" * 64, app_env="production")
+        assert "distinct" in str(exc_info.value)
+
+    def test_raises_on_placeholder_key_in_production(self):
+        """
+        The .env.example placeholder is long enough to pass a length check, and
+        it is published in this repository — anyone can forge a token with it.
+        """
+        from pacca.api.auth import validate_secret_key
+
+        placeholder = "REPLACE-THIS-generate-with-python-secrets-module-min-32-chars"
+        assert len(placeholder) >= 32, "guard: this must be long enough to reach the marker check"
+
+        for env in ("production", "staging"):
+            with pytest.raises(RuntimeError) as exc_info:
+                validate_secret_key(key=placeholder, app_env=env)
+            assert "placeholder" in str(exc_info.value).lower()
+
+    def test_placeholder_key_is_allowed_outside_production(self):
+        """
+        Running the suite must not require a real secret, so development/test
+        tolerate a placeholder — the environment picks the strictness, and the
+        permissive case is the explicitly-named one.
+        """
+        from pacca.api.auth import validate_secret_key
+
+        for env in ("development", "test"):
+            validate_secret_key(
+                key="test-secret-key-min-32-chars-for-unit-tests",
+                app_env=env,
+            )
+
+    def test_a_short_key_still_raises_in_development(self):
+        """Relaxing the placeholder rule must not relax the length rule."""
+        from pacca.api.auth import validate_secret_key
+
+        with pytest.raises(RuntimeError):
+            validate_secret_key(key="short", app_env="development")
+
+    def test_defaults_to_the_module_key(self):
+        """Called with no arguments, it validates the env-derived SECRET_KEY."""
+        from pacca.api.auth import validate_secret_key
+
+        with patch("pacca.api.auth.SECRET_KEY", "x" * 64), pytest.raises(RuntimeError):
+            validate_secret_key(app_env="production")
 
     def test_error_message_includes_generation_command(self):
         """
@@ -153,14 +207,61 @@ class TestValidateSecretKey:
         """
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", ""):
-            with pytest.raises(RuntimeError) as exc_info:
-                validate_secret_key()
-            # Error should tell the user how to generate a proper key
-            assert "secrets" in str(exc_info.value).lower() or "token_hex" in str(exc_info.value), (
-                "Error message should include the key generation command: "
-                'python -c "import secrets; print(secrets.token_hex(32))"'
-            )
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="", app_env="production")
+        # Error should tell the user how to generate a proper key
+        assert "secrets" in str(exc_info.value).lower() or "token_hex" in str(exc_info.value), (
+            "Error message should include the key generation command: "
+            'python -c "import secrets; print(secrets.token_hex(32))"'
+        )
+
+
+class TestStartupSecretKeyGate:
+    """
+    The startup gate itself — that validation is reached at all.
+
+    The lifespan previously wrapped the call in `if settings.app_env != "test"`,
+    so a production deployment skipped signing-key validation entirely by setting
+    one environment variable. These tests assert the bypass is gone.
+    """
+
+    def test_lifespan_validates_unconditionally(self):
+        """No app_env value may skip the call."""
+        import ast
+        import inspect
+
+        from pacca.api import main as main_module
+
+        source = inspect.getsource(main_module.lifespan)
+        tree = ast.parse(source.strip())
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "validate_secret_key"
+        ]
+        assert len(calls) == 1, "lifespan must call validate_secret_key exactly once"
+
+        # The call must not sit inside a conditional — that is what made the
+        # APP_ENV=test bypass possible.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                assert not any(call in ast.walk(node) for call in calls), (
+                    "validate_secret_key must not be guarded by a conditional"
+                )
+
+    def test_settings_has_no_secret_key_field(self):
+        """
+        Settings must not carry a second, weakly-defaulted copy of the signing key.
+
+        It previously defaulted to a published 51-char string that no code read —
+        long enough to look valid, and a standing invitation to drift from the
+        real env-only key in pacca.api.auth.
+        """
+        from pacca.config.settings import Settings
+
+        assert "secret_key" not in Settings.model_fields
 
 
 class TestTokenExpiry:

@@ -49,6 +49,23 @@ If your finding involves a working exploit, please include it as a private gist 
 
 Please give us a reasonable opportunity to address an issue before public disclosure. We will credit reporters in release notes unless they prefer to remain anonymous.
 
+## Signing-key configuration
+
+The JWT signing key is read from the `SECRET_KEY` environment variable and from
+nowhere else — there is no default anywhere in the codebase. It is validated in
+the FastAPI startup lifespan, in every environment, before any request is served.
+
+A key is rejected outright if it is missing, shorter than 32 characters, or built
+from fewer than 8 distinct characters. When `APP_ENV` is `production` or
+`staging`, a key containing a known placeholder marker (`REPLACE-THIS`,
+`change-in-production`, `dev-secret-key`, and similar) is also rejected: those
+strings are published in this repository, so a deployment using one has a signing
+key any reader can forge tokens with. In `development` and `test` a placeholder is
+permitted — the test suite must not require a real secret — and is logged at
+warning level rather than accepted silently.
+
+`APP_ENV` selects how strict the check is; it cannot switch the check off.
+
 ## Production deployment
 
 This repository is not certified for processing real PHI. Anyone deploying PACCA in a setting that handles real protected health information is responsible for: a Business Associate Agreement with the LLM provider, a HIPAA-compliant hosting environment, expanded audit logging, end-to-end encryption review, clinical validation by a qualified medical director, and any additional regulatory obligations applicable to the deployment jurisdiction.
