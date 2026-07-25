@@ -19,7 +19,8 @@ harness-engineered, and observability-first. Healthcare domain: PHI handling and
 integrity are non-negotiable, not nice-to-haves.
 
 Stack: Python 3.12 + FastAPI (async), Pydantic v2, PostgreSQL 16 / SQLite (dev),
-ChromaDB (**single** collection today — see Limitations), React 18 + Vite frontend,
+ChromaDB (**dual-collection**: `nccn_guidelines` + `case_precedents`, via the live
+`integrations/vector_store.py` — see the RAG note below), React 18 + Vite frontend,
 OpenTelemetry spans (Langfuse export intended), Claude (`claude-sonnet-4`) with
 tool-use forced for structured output.
 
@@ -83,11 +84,16 @@ every PR is one path or the other, never ambiguous.
   and the RAG query. A cross-case leak fail-closes to human review. In correct operation
   the run always passes its own scope, so it does not deny in normal flow — its value is
   fail-closed defense against a leak/bug. Mode is `settings.scope_guard_mode`.
-- `src/pacca/rag/pipeline.py` — `GuidelineVectorStore`, a **single**-collection ChromaDB
-  store (default `clinical_guidelines`). Dual-collection (`nccn_guidelines` +
-  `case_precedents`) is roadmap. **Note:** `rag/pipeline.py` currently does not import
-  cleanly (a chain of stale references in `models/guidelines.py`); the RAG pipeline is
-  effectively dead code pending a revival pass (see Limitations).
+- `src/pacca/integrations/vector_store.py` — `GuidelineRetriever`, the **live**
+  RAG interface. It is **dual-collection and built**: `nccn_guidelines` (authoritative)
+  and `case_precedents` (institutional memory — Medical Director overrides written by
+  `/feedback`, retrieved on submit under a "PAST MEDICAL DIRECTOR DECISIONS" header the
+  DecisionAgent prompt weighs). Both collections are governed by the P-4 scope guard
+  (iter-13): `RAG_COLLECTIONS` is the SSOT the `IntentRecord` allow-list mirrors.
+- `src/pacca/rag/pipeline.py` — the OLD single-collection `GuidelineVectorStore`
+  (`clinical_guidelines`). **Dead code:** it does not import cleanly (stale references in
+  `models/guidelines.py`) and the live path (`integrations/vector_store.py`) falls back
+  past it. Revival or removal is a tracked follow-up; do not add to it.
 - Span emission lives in `src/pacca/agents/base.py` + `src/pacca/config/tracing.py`
   (one span per agent call). There is **no** `src/pacca/observability/` package.
 - `src/pacca/api/`, `src/pacca/db/`, `src/pacca/models/`, `src/pacca/config/` — standard.
@@ -148,10 +154,18 @@ Use the Makefile targets (they encode the correct markers):
   scope guard (`agents/scope_guard.py`) is the first middleware-*pattern* component — a
   call-site wrapper, not a framework middleware — now wired into the submit route in
   enforce mode (chg-9). A true middleware loader remains roadmap.
-- **Single RAG collection.** The dual-collection design (`nccn_guidelines` /
-  `case_precedents`) is not built; the existing `rag/pipeline.py` does not import cleanly
-  and is effectively dead code (stale `uuid7` / missing-enum references in
-  `models/guidelines.py`). Reviving or removing it is a tracked follow-up.
+- **Dead `rag/pipeline.py`.** The dual-collection RAG is **built and governed** in the
+  live `integrations/vector_store.py` (see Where-things-live). What remains dead is the
+  OLD `rag/pipeline.py` single-collection store — it does not import cleanly (stale
+  `uuid7` / missing-enum references in `models/guidelines.py`) and nothing on the live
+  path depends on it. Reviving or removing it is a tracked follow-up.
+- **Precedent grounding (P-5 policy, iter-13).** Retrieved precedents are institutional
+  *context*, not citable evidence: the DecisionAgent still populates
+  `cited_evidence_ids` from **submission** `EvidenceItem`s only, so the P-5
+  evidence-grounding detector stays submission-scoped. A precedent influences reasoning
+  (and is captured in the rationale + the retrieved-context audit), but is not a
+  grounded-evidence id. Threading stable precedent/chunk ids into the grounding set is
+  the roadmap "RAG chunk-id grounding" follow-up.
 - **Clinical gate in CI, blocking pending David.** As of P-6 `ci.yml` adds
   `validate-manifests` (every PR) and `clinical-gate` (GC-018/019 + accuracy, on
   `chg-`/agent-rag PRs and nightly). They run and can fail, but *blocking merge* on them
