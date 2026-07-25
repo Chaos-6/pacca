@@ -51,6 +51,20 @@ PRIOR_AUTH_EXPECTED_EFFECTS: list[str] = [
 # escalation); 6 leaves headroom without being unbounded.
 PRIOR_AUTH_LIMITS: dict[str, Any] = {"max_agent_calls": 6, "escalation_allowed": True}
 
+# ── Institutional-learning (/feedback) scope ──────────────────────────────────
+# A human-override precedent write touches ONLY the case_precedents collection
+# and writes no SQL business rows — a deliberately narrower scope than a
+# prior-auth run. This is what brings the previously-ungoverned precedent write
+# under the same minimum-necessary guard (#3).
+FEEDBACK_ALLOWED_COLLECTIONS: list[str] = ["case_precedents"]
+FEEDBACK_ALLOWED_ACTIONS: list[str] = ["rag.write_precedent", "audit.append"]
+FEEDBACK_EXPECTED_EFFECTS: list[str] = [
+    "one case_precedents entry (upserted)",
+    "audit entries",
+    "zero external calls",
+]
+FEEDBACK_LIMITS: dict[str, Any] = {"max_agent_calls": 0, "escalation_allowed": False}
+
 
 class IntentRecord(BaseModel):
     """The declared intent for a single prior-authorization run.
@@ -61,7 +75,9 @@ class IntentRecord(BaseModel):
 
     correlation_id: str
     request_id: str
-    purpose: Literal["prior_auth_adjudication"] = "prior_auth_adjudication"
+    purpose: Literal["prior_auth_adjudication", "institutional_learning"] = (
+        "prior_auth_adjudication"
+    )
     subject_ref: str  # the case's patient/member opaque reference (no PHI)
     allowed_collections: list[str] = Field(
         default_factory=lambda: list(PRIOR_AUTH_ALLOWED_COLLECTIONS)
@@ -80,4 +96,24 @@ class IntentRecord(BaseModel):
             correlation_id=correlation_id,
             request_id=request_id,
             subject_ref=subject_ref,
+        )
+
+    @classmethod
+    def for_feedback(
+        cls, *, correlation_id: str, request_id: str, subject_ref: str
+    ) -> IntentRecord:
+        """Build an institutional-learning intent for the /feedback precedent write.
+
+        Narrower than a prior-auth run: it may only write to case_precedents and
+        append audit — no guideline read, no DB business writes (#3).
+        """
+        return cls(
+            correlation_id=correlation_id,
+            request_id=request_id,
+            subject_ref=subject_ref,
+            purpose="institutional_learning",
+            allowed_collections=list(FEEDBACK_ALLOWED_COLLECTIONS),
+            allowed_actions=list(FEEDBACK_ALLOWED_ACTIONS),
+            expected_effects=list(FEEDBACK_EXPECTED_EFFECTS),
+            limits=dict(FEEDBACK_LIMITS),
         )

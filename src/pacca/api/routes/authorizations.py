@@ -45,7 +45,11 @@ from ...db.repository import AuditRepository, AuthorizationRepository, DecisionR
 from ...db.session import get_session
 
 # The RAG engine that retrieves relevant guidelines from ChromaDB
-from ...integrations.vector_store import RAG_COLLECTIONS, GuidelineRetriever
+from ...integrations.vector_store import (
+    PRECEDENT_COLLECTION,
+    RAG_COLLECTIONS,
+    GuidelineRetriever,
+)
 
 # Our domain models (Pydantic schemas for request/response shapes)
 from ...models.authorization import AuthorizationDecision, AuthorizationRequest
@@ -351,23 +355,48 @@ async def learn_from_feedback(
     """
     audit = AuditRepository(session)
     correlation_id = str(uuid4())
+    request_id = f"FB-{uuid4().hex[:12]}"
 
-    # Store the precedent in ChromaDB (the vector database)
-    rag_engine.add_precedent(
-        case_summary=feedback.case_summary,
-        rationale=feedback.rationale,
-        outcome=feedback.decision,
+    # ── GOVERNANCE (#3): a precedent write is a state change and is governed like
+    # the submit path — a narrow institutional-learning IntentRecord declared as
+    # the FIRST audit event, a scope-guarded write (case_precedents only), and the
+    # learning event audited BEFORE the ChromaDB write (pre-write-audit).
+    intent = IntentRecord.for_feedback(
+        correlation_id=correlation_id,
+        request_id=request_id,
+        subject_ref="institutional_learning",
+    )
+    await audit.log(
+        action="intent.declared",
+        actor="feedback",
+        actor_type="system",
+        request_id=request_id,
+        correlation_id=correlation_id,
+        details=intent.model_dump(mode="json"),
     )
 
-    # ── AUDIT RECORD: Log the learning event ─────────────────────────────────
-    # This is important for two reasons:
-    # 1. HIPAA: human overrides of AI decisions must be recorded
-    # 2. Model governance: you need to know what was taught to the system
-    #    and when, so you can audit or roll back institutional learning
+    try:
+        await enforce_scope(
+            intent,
+            "rag.write_precedent",
+            audit=audit,
+            mode=get_settings().scope_guard_mode,
+            collection_name=PRECEDENT_COLLECTION,
+        )
+    except ScopeViolation as sv:
+        # Fail-closed: a precedent write outside the declared scope is refused and
+        # audited. Never fires in correct operation (case_precedents is always the
+        # feedback scope); it is defense against a leak/bug.
+        raise HTTPException(
+            status_code=403, detail="precedent write outside declared scope"
+        ) from sv
+
+    # Pre-write audit: record the learning event before the state change.
     await audit.log(
         action="precedent_learned",
         actor="human_reviewer",
         actor_type="user",
+        request_id=request_id,
         correlation_id=correlation_id,
         input_summary=f"Case: {feedback.case_summary[:100]}",
         output_summary=f"Outcome stored: {feedback.decision}",
@@ -375,6 +404,12 @@ async def learn_from_feedback(
             "outcome": feedback.decision,
             "rationale_length": len(feedback.rationale),
         },
+    )
+
+    rag_engine.add_precedent(
+        case_summary=feedback.case_summary,
+        rationale=feedback.rationale,
+        outcome=feedback.decision,
     )
 
     return {"status": "learned"}
