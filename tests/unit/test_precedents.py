@@ -77,3 +77,22 @@ def test_precedent_id_is_deterministic_and_content_keyed() -> None:
     assert _precedent_id(" scenario A ") == _precedent_id("scenario A")  # trimmed
     assert _precedent_id("scenario A") != _precedent_id("scenario B")
     assert _precedent_id("scenario A").startswith("prec_")
+
+
+def test_precedent_round_trip_surfaces_in_agent_context(tmp_path: object) -> None:
+    """Write -> retrieve: a stored override surfaces under the exact header the
+    DecisionAgent prompt keys on ("PAST MEDICAL DIRECTOR DECISIONS"). This is the
+    read half of the institutional-memory loop the e2e proved end-to-end
+    (IN_REVIEW -> AUTO_APPROVED); pinning it hermetically guards against a
+    regression that would silently stop precedents reaching the agent.
+    """
+    r = _retriever(tmp_path)
+    r.add_precedent(
+        case_summary="manual laborer, acute lumbar pain <6 weeks, no red flags",
+        rationale="occupational-necessity exception approved by the Medical Director",
+        outcome="AUTO_APPROVED",
+    )
+    context = r.query("construction worker acute lumbar pain MRI")
+    assert "PAST MEDICAL DIRECTOR DECISIONS" in context
+    assert "occupational-necessity exception" in context
+    assert "AUTO_APPROVED" in context
