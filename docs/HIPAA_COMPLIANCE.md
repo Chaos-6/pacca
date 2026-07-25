@@ -137,15 +137,30 @@ All routes touching clinical data require a JWT Bearer token. The token is issue
 # auth.py
 SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 
-def validate_secret_key() -> None:
-    """Called at startup — refuses to serve if key is missing or weak."""
-    if not SECRET_KEY:
-        raise RuntimeError("SECRET_KEY environment variable is not set.")
-    if len(SECRET_KEY) < 32:
-        raise RuntimeError(f"SECRET_KEY is only {len(SECRET_KEY)} chars. Minimum 32 required.")
+def validate_secret_key(key: str | None = None, app_env: str | None = None) -> None:
+    """Called at startup, in every environment — refuses to serve on a weak key."""
+    ...
+    if not key:                                  raise RuntimeError(...)
+    if len(key) < MIN_SECRET_KEY_LENGTH:         raise RuntimeError(...)
+    if len(set(key)) < MIN_SECRET_KEY_DISTINCT_CHARS:  raise RuntimeError(...)
+    marker = _placeholder_marker(key)
+    if marker is None:                           return
+    if app_env in STRICT_ENVIRONMENTS:           raise RuntimeError(...)
+    _warn_placeholder(marker, app_env)
 ```
 
-The application **refuses to start** if `SECRET_KEY` is missing or shorter than 32 characters. This is fail-fast security: a misconfigured deployment fails loudly at startup rather than serving requests with a predictable or empty signing key.
+The application **refuses to start** if `SECRET_KEY` is missing, shorter than 32
+characters, or built from fewer than 8 distinct characters — a 32-character run of
+`"a"` clears the length bar while carrying almost no entropy. In `production` and
+`staging` a key containing a published placeholder marker (`REPLACE-THIS`,
+`dev-secret-key`, and similar) is rejected too; in `development` and `test` it is
+permitted and logged at warning level, so the test suite does not require a real
+secret.
+
+The check runs in **every** environment. It previously ran only when
+`app_env != "test"`, which meant a production deployment could skip signing-key
+validation entirely by setting `APP_ENV=test`. `APP_ENV` now selects the strictness,
+never whether the check happens.
 
 ### Password Storage
 
