@@ -56,7 +56,15 @@ jobs:
         continue-on-error: true  # Type errors are warnings for now
 
   # ---------------------------------------------------------------------------
-  # Unit Tests
+  # Deterministic tests — the WHOLE non-billable suite.
+  #
+  # This job previously ran only `pytest tests/unit`, so tests/harness and
+  # tests/integration were never executed in CI and tests/test_level5_flow.py's
+  # collection errors stayed invisible: the badge could be green while
+  # `make test-all` was red locally. The scope here now matches `make test-all`
+  # exactly (`pytest tests/ -m "not clinical"`), which is what makes that
+  # divergence impossible. Live-LLM tests carry the `clinical` marker and are
+  # deselected here — they run in the separate, opt-in clinical-gate job.
   # ---------------------------------------------------------------------------
   test:
     name: Tests
@@ -76,13 +84,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Run tests
+      # Same scope as `make test-all`. No -x: a full failure list is more useful
+      # than the first one, and the job fails either way.
+      - name: Run the full non-clinical test suite (make test-all)
         env:
           ANTHROPIC_API_KEY: "sk-ant-test-placeholder"
           APP_ENV: "development"
           DEBUG: "true"
         run: |
-          pytest tests/unit -v --tb=short -x
+          pytest tests/ -m "not clinical" --tb=short
 
       - name: Run tests with coverage
         env:
@@ -90,7 +100,7 @@ jobs:
           APP_ENV: "development"
           DEBUG: "true"
         run: |
-          pytest tests/unit --cov=pacca --cov-report=xml --cov-report=term-missing
+          pytest tests/ -m "not clinical" --cov=pacca --cov-report=xml --cov-report=term-missing
         continue-on-error: true
 
       - name: Upload coverage to Codecov
