@@ -40,6 +40,7 @@ Teaching note — why not just change the import in routes?
 """
 
 import asyncio
+import hashlib
 import os
 
 import chromadb
@@ -53,6 +54,19 @@ from chromadb.utils import embedding_functions
 from pacca.config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _precedent_id(case_summary: str) -> str:
+    """
+    Deterministic content id for a precedent (stable across processes).
+
+    Keyed on the case scenario so the same override maps to the same id every
+    time — enabling idempotent upserts — unlike the old per-process-randomized
+    hash(). Two precedents differ iff their scenarios differ.
+    """
+    digest = hashlib.sha256(case_summary.strip().encode("utf-8")).hexdigest()
+    return f"prec_{digest[:16]}"
+
 
 # ── Lazy import of RAGPipeline ────────────────────────────────────────────────
 # We use a lazy import to avoid circular imports and to allow the module
@@ -189,10 +203,16 @@ class GuidelineRetriever:
             outcome:      The correct outcome (e.g., "AUTO_APPROVED")
         """
         document = f"SCENARIO: {case_summary}\nOUTCOME: {outcome}\nREASON: {rationale}"
-        self._precedents.add(
+        # upsert (not add) with a deterministic content id: the same scenario is
+        # idempotent and a corrected override overwrites in place. The old
+        # f"prec_{abs(hash(case_summary))}" used Python's per-process-randomized
+        # hash(), so the same override got a new id on every restart (silent
+        # duplicates) and a same-process repeat collided on add() — the B6
+        # unstable-key anti-pattern applied to institutional memory.
+        self._precedents.upsert(
             documents=[document],
             metadatas=[{"type": "human_override", "outcome": outcome}],
-            ids=[f"prec_{abs(hash(case_summary))}"],
+            ids=[_precedent_id(case_summary)],
         )
         logger.info("precedent_added", outcome=outcome)
 
