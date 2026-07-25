@@ -2,10 +2,12 @@
 ## Agentic AI System Specification for Clinical Prior Authorization
 
 **System:** PACCA — Prior Authorization & Care Coordination Agent Platform
-**Version:** 2.2.0
+**Version:** 2.3.0
 **Author:** David Reed, PhD, MBA, PMP | Executive Fellow, Wharton
-**Date:** April 2026
+**Date:** July 2026
 **Repository:** github.com/drdgreed/pacca
+
+**Revision history:** v2.3 is a methodological-currency update, not a structural revision. It self-classifies this document's rigor tier against Piskala's (arXiv:2602.00180, Jan 2026) three-tier spec-driven-development taxonomy, published after v2.2, and updates the GitHub Spec-Kit provenance note to reflect the ecosystem's current maturity. No contract, invariant, or governance content changed.
 
 ---
 
@@ -13,10 +15,12 @@
 
 This document applies specification-driven design (SDD) as it has emerged in the context of agentic AI systems. Unlike traditional IEEE 830/29148 specifications written for deterministic software, agentic AI systems introduce novel specification challenges: agents exhibit probabilistic behavior, can deviate from intended behavior over time (behavioral drift), and interact through emergent multi-agent dynamics. A specification framework adequate for agentic systems must address not only what the system shall do, but also what the agents must not do, what invariants must hold across agent interactions, and how the system governs its own evolution.
 
+**Self-classification against Piskala's SDD rigor tiers.** Piskala ("Spec-Driven Development: From Code to Contract in the Age of AI Coding Assistants," arXiv:2602.00180, January 2026) defines three rigor tiers: *spec-first* (specs guide development but drift from code over time), *spec-anchored* (specs continuously validate and gate code), and *spec-as-source* (specs generate code directly). Part II's Agent Behavioral Contracts sit in the **spec-anchored** tier: PRE/POST/INVARIANT and GIVEN/WHEN/THEN clauses are written before implementation and act as validation gates — enforced by §C7.2's drift-detection CI gate and the P7 compositionality proofs — that catch contract drift a conventional unit-test suite would miss. (This document's "specification-driven *design*" was coined independently of Piskala's "spec-driven *development*"; the taxonomy still applies.) Against Piskala's general-purpose framework, PACCA's contribution is narrower: multi-agent, clinical-domain contracts with an explicit drift-detection and rollback protocol (C7, C8).
+
 This document synthesizes four complementary traditions, each applied where it adds the most clarity:
 
 **Part I — Intent and Stakeholder Specification**
-Drawn from GitHub's Spec-Kit methodology (September 2024) and the SPARC framework (Specification, Pseudocode, Architecture, Refinement, Completion). Captures *why* the system exists, *who* interacts with it, and *what* success looks like before any implementation detail. Specifications at this level are user-journey-oriented and written to be readable by non-engineers.
+Drawn from GitHub's Spec-Kit methodology (initially released September 2024; now at v0.11.0 as of June 2026, with 30+ agent integrations, 111k+ GitHub stars, and a 70+-extension community ecosystem that now includes quality gates for security and drift detection — external validation that the spec-first approach has scaled well beyond a single-project experiment) and the SPARC framework (Specification, Pseudocode, Architecture, Refinement, Completion). Captures *why* the system exists, *who* interacts with it, and *what* success looks like before any implementation detail. Specifications at this level are user-journey-oriented and written to be readable by non-engineers.
 
 **Part II — Agent Behavioral Contracts**
 Drawn from Agent Behavioral Contracts (ABC) research (arXiv 2602.22302, February 2026) and Design-by-Contract theory (Bertrand Meyer). Defines each agent's *preconditions*, *postconditions*, *invariants*, and *resource bounds* using plain-English contracts with pseudo-formal structure. These contracts are specification-first: they define expected behavior before deployment, not inferred from execution traces after the fact.
