@@ -77,16 +77,14 @@ async def lifespan(app: FastAPI):
     a broken security configuration and discover it during an audit.
     """
     # ── 1. Security validation ────────────────────────────────────────────────
-    # This raises RuntimeError if SECRET_KEY is missing or too short.
-    # In development, this means you MUST have SECRET_KEY set in your .env file.
-    # In production, this catches deployment misconfiguration before any
-    # requests are served.
-    #
-    # Note: we skip validation if SECRET_KEY is the test sentinel value,
-    # allowing unit tests to run without a real key.
+    # Raises RuntimeError if SECRET_KEY is missing, short, low-entropy, or (in
+    # production/staging) a shipped placeholder. This runs in every environment:
+    # the previous `if settings.app_env != "test"` guard meant a production
+    # deployment could skip signing-key validation entirely by setting
+    # APP_ENV=test. The environment now selects strictness, not whether the
+    # check happens — see auth.validate_secret_key.
     settings = get_settings()
-    if settings.app_env != "test":
-        validate_secret_key()
+    validate_secret_key(app_env=settings.app_env)
 
     # ── 2. OpenTelemetry ──────────────────────────────────────────────────────
     configure_tracing(

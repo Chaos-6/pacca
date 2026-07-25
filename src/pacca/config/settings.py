@@ -96,10 +96,13 @@ class Settings(BaseSettings):
     # ==========================================================================
     # Security
     # ==========================================================================
-    secret_key: SecretStr = Field(
-        default=SecretStr("dev-secret-key-change-in-production-min-32-characters"),
-        description="Secret key for JWT and session encryption",
-    )
+    # There is deliberately no `secret_key` field here. It used to exist with a
+    # default of "dev-secret-key-change-in-production-min-32-characters" — long
+    # enough to satisfy a length check, published in this repo, and read by no
+    # code path. Its only effect was to make the config appear to hold a usable
+    # signing key while the real one lives in `pacca.api.auth.SECRET_KEY`
+    # (environment-only, no default), validated at startup by
+    # `auth.validate_secret_key`. One source, one gate.
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default=["http://localhost:3000", "http://localhost:5173"],
         description="Allowed CORS origins",
