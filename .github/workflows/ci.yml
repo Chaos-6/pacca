@@ -38,7 +38,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff mypy
+          # Pinned to match .pre-commit-config.yaml exactly. Unpinned installs
+          # here previously pulled a newer ruff (0.16.0) that enforced new rules
+          # tree-wide and broke lint on every PR while pre-commit (older, pinned)
+          # stayed green — the divergence the pre-commit comment warns about.
+          # Bump both together when upgrading.
+          pip install ruff==0.15.12 mypy==1.13.0
 
       - name: Run Ruff linter
         run: ruff check src/ tests/
