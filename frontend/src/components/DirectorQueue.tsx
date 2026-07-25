@@ -1,106 +1,105 @@
 /**
  * DirectorQueue — Medical Director review queue.
  *
- * Reskinned in PR-UI-4 to the Editorial-Clinical aesthetic. Each
- * escalated case renders as a .sme-card-emphasis with a mustard top
- * border (signals "in review"). The two clinical actions
- * (override-and-approve vs confirm-denial) use .sme-button-approve
- * and .sme-button-deny.
+ * Reskinned in PR-UI-4 to the Editorial-Clinical aesthetic. Each escalated
+ * case renders as a .sme-card-emphasis with a mustard top border (signals
+ * "in review"). Override-and-approve uses .sme-button-approve.
  *
- * PHI scrub: the previous synthetic patient string included a titled
- * full name + a date-of-birth phrasing — the exact patterns CLAUDE.md
- * forbids in committed source even for demo data. Replaced with the
- * SME-authoring convention: opaque IDs + age representation (no name,
- * no DOB). See git history for the pre-scrub content.
+ * PHI: the payload is opaque id + age only. The backend's ReviewQueueItem
+ * carries no name and no date of birth, so none can reach this component.
  *
- * Bug fix: hardcoded `http://127.0.0.1:8000` URL replaced with
- * relative `/api/v1/...` (works through Vite proxy + nginx).
+ * What changed, and why it matters
+ * --------------------------------
+ * This component used to render a hardcoded one-element `DEMO_QUEUE`. It
+ * showed the same synthetic case whether the system had escalated nothing or
+ * a hundred cases. It now reads `GET /api/v1/authorizations/review-queue`
+ * through the typed client in `src/api/authorizations.ts`. An empty queue is
+ * a real answer and is rendered as one, never padded with sample data.
  *
- * Also fixes the last pre-existing tsc warning: unused `React`
- * import removed (React 18 + new JSX transform doesn't need it).
+ * Two other pieces of theatre are gone:
+ *
+ *   - "Confirm denial" called no endpoint. It filtered the row out of local
+ *     state and nothing else, so it looked like a disposition and was not
+ *     one. It is removed rather than relabelled — the server has no way to
+ *     record that decision (see `resolution_supported`).
+ *   - The override rationale was a canned paragraph about a "manual labourer
+ *     and primary earner". That text was written for one demo case and would
+ *     have been attached, as clinical justification, to whatever real case
+ *     the button happened to be under. The director now types it.
+ *
+ * Overriding still has a real effect: /feedback writes a precedent into the
+ * case_precedents collection, which the DecisionAgent weighs on later runs.
+ * It does not resolve the case, so the case stays in the list.
  */
 
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { authorizationsApi, type ReviewQueueItem } from '../api/authorizations';
 import { MonoChip } from './MonoChip';
 import { StatusInk } from './StatusInk';
 import { PageHeader } from '../sme-authoring/components/PageHeader';
 
-interface DirectorCase {
-  id: string;
-  patient: string;
-  diagnosis: string;
-  procedure: string;
-  clinical_notes: string;
-  ai_status: string;
-  ai_rationale: string;
-}
-
-// Synthetic demo case. NO real PHI. Patient identifier is opaque +
-// age-only (no DOB, no full name). Per CLAUDE.md HIPAA rules.
-const DEMO_QUEUE: DirectorCase[] = [
-  {
-    id: 'REQ-8842',
-    patient: 'Patient DEMO-8842 · 47yo',
-    diagnosis: 'M54.5 (Low back pain)',
-    procedure: '72148 (MRI Lumbar Spine)',
-    clinical_notes:
-      'Acute lower back pain that started 2 weeks ago after lifting a heavy box. No numbness or weakness. Imaging requested.',
-    ai_status: 'IN_REVIEW',
-    ai_rationale:
-      'Frontline agent confidence 0.82. Guidelines require 6 weeks of conservative therapy (PT, NSAIDs) for routine back pain without red flags; patient has had pain for only 2 weeks.',
-  },
-];
+type Banner = { tone: 'approved' | 'denied' | 'info'; message: string };
 
 export function DirectorQueue() {
-  const [queue, setQueue] = useState<DirectorCase[]>(DEMO_QUEUE);
-  const [status, setStatus] = useState<{
-    tone: 'approved' | 'denied' | 'info';
-    message: string;
-  } | null>(null);
+  const [queue, setQueue] = useState<ReviewQueueItem[]>([]);
+  const [resolutionSupported, setResolutionSupported] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [status, setStatus] = useState<Banner | null>(null);
   const [pending, setPending] = useState<string | null>(null);
+  const [rationales, setRationales] = useState<Record<string, string>>({});
 
-  const handleOverride = async (caseItem: DirectorCase) => {
-    setPending(caseItem.id);
-    setStatus({ tone: 'info', message: 'Injecting human override into vector store…' });
-
-    const humanRationale =
-      'Medical Director override: patient is a manual laborer and primary earner. Delaying imaging risks long-term structural damage that could prevent return to work. Approved as exception.';
-
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
     try {
-      const response = await fetch('/api/v1/authorizations/feedback', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${localStorage.getItem('token') ?? ''}`,
-        },
-        body: JSON.stringify({
-          case_summary: caseItem.clinical_notes,
-          decision: 'APPROVED',
-          rationale: humanRationale,
-        }),
-      });
-      if (response.ok) {
-        setStatus({
-          tone: 'approved',
-          message: 'Precedent recorded. The agent will reference this decision for future cases.',
-        });
-        setQueue((q) => q.filter((c) => c.id !== caseItem.id));
-      } else {
-        setStatus({ tone: 'denied', message: `Failed to submit override (HTTP ${response.status}).` });
-      }
-    } catch {
+      const response = await authorizationsApi.reviewQueue();
+      setQueue(response.items);
+      setResolutionSupported(response.resolution_supported);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'Failed to load the review queue.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const handleOverride = async (caseItem: ReviewQueueItem) => {
+    const rationale = (rationales[caseItem.request_id] ?? '').trim();
+    if (!rationale) {
       setStatus({
         tone: 'denied',
-        message: 'Connection error. Is the backend running on port 8000?',
+        message: 'Enter the clinical rationale for the override before submitting.',
+      });
+      return;
+    }
+
+    setPending(caseItem.request_id);
+    setStatus({ tone: 'info', message: 'Recording the override as a precedent…' });
+
+    try {
+      await authorizationsApi.submitFeedback({
+        case_summary: caseItem.clinical_notes,
+        decision: 'APPROVED',
+        rationale,
+      });
+      setStatus({
+        tone: 'approved',
+        message: resolutionSupported
+          ? 'Precedent recorded. The agent will reference this decision for future cases.'
+          : 'Precedent recorded — the agent will reference it for future cases. The case stays in the queue: no endpoint records a disposition yet.',
+      });
+    } catch (error) {
+      setStatus({
+        tone: 'denied',
+        message: error instanceof Error ? error.message : 'Failed to submit the override.',
       });
     } finally {
       setPending(null);
     }
-  };
-
-  const handleConfirmDenial = (caseItem: DirectorCase) => {
-    setQueue((q) => q.filter((c) => c.id !== caseItem.id));
-    setStatus({ tone: 'denied', message: `${caseItem.id} denial confirmed.` });
   };
 
   return (
@@ -108,8 +107,20 @@ export function DirectorQueue() {
       <PageHeader
         label="Director"
         title="Medical Director queue"
-        hint="Review complex cases the agent escalated. Override-and-approve teaches the AI; confirm-denial leaves the AI's decision intact."
+        hint="Cases the agent escalated for human review. Recording an override teaches the AI by writing a precedent it consults on later cases."
       />
+
+      {!loading && !loadError && !resolutionSupported && (
+        <div
+          className="sme-card"
+          style={{ borderLeft: '4px solid var(--sme-review)', marginBottom: '2rem' }}
+        >
+          <StatusInk outcome="review">
+            Case resolution is not implemented. An override is recorded as a precedent, but no
+            disposition is stored against the case, so it remains listed here after review.
+          </StatusInk>
+        </div>
+      )}
 
       {status && (
         <div
@@ -131,14 +142,26 @@ export function DirectorQueue() {
         </div>
       )}
 
-      {queue.length === 0 ? (
-        <div className="sme-empty">
-          Queue empty. No cases pending Medical Director review.
+      {loading ? (
+        <div className="sme-empty">Loading the review queue…</div>
+      ) : loadError ? (
+        <div
+          className="sme-card"
+          style={{ borderLeft: '4px solid var(--sme-deny)', marginBottom: '2rem' }}
+        >
+          <StatusInk outcome="denied">{loadError}</StatusInk>
+          <div style={{ marginTop: '1rem' }}>
+            <button type="button" className="sme-button" onClick={() => void load()}>
+              Retry
+            </button>
+          </div>
         </div>
+      ) : queue.length === 0 ? (
+        <div className="sme-empty">Queue empty. No cases pending Medical Director review.</div>
       ) : (
         queue.map((caseItem) => (
           <article
-            key={caseItem.id}
+            key={caseItem.request_id}
             className="sme-card-emphasis"
             style={{
               borderTopColor: 'var(--sme-review)',
@@ -166,10 +189,10 @@ export function DirectorQueue() {
                     marginTop: '0.25rem',
                   }}
                 >
-                  {caseItem.patient}
+                  {caseItem.patient_ref}
                 </div>
                 <MonoChip size="sm" tone="muted">
-                  {caseItem.id}
+                  {caseItem.request_id}
                 </MonoChip>
               </div>
               <StatusInk
@@ -196,11 +219,11 @@ export function DirectorQueue() {
             >
               <div>
                 <div className="sme-label">Diagnosis</div>
-                <p style={{ marginTop: '0.25rem', marginBottom: 0 }}>{caseItem.diagnosis}</p>
+                <p style={{ marginTop: '0.25rem', marginBottom: 0 }}>{caseItem.diagnosis_code}</p>
               </div>
               <div>
                 <div className="sme-label">Requested procedure</div>
-                <p style={{ marginTop: '0.25rem', marginBottom: 0 }}>{caseItem.procedure}</p>
+                <p style={{ marginTop: '0.25rem', marginBottom: 0 }}>{caseItem.procedure_code}</p>
               </div>
             </div>
 
@@ -224,7 +247,9 @@ export function DirectorQueue() {
                 marginBottom: '2rem',
               }}
             >
-              <div className="sme-label sme-status-review">Agent escalation rationale</div>
+              <div className="sme-label sme-status-review">
+                Agent escalation rationale · confidence {caseItem.confidence_score.toFixed(2)}
+              </div>
               <p
                 style={{
                   marginTop: '0.25rem',
@@ -235,6 +260,26 @@ export function DirectorQueue() {
               >
                 {caseItem.ai_rationale}
               </p>
+            </div>
+
+            <div style={{ marginBottom: '1.5rem' }}>
+              <label className="sme-label" htmlFor={`rationale-${caseItem.request_id}`}>
+                Override rationale
+              </label>
+              <textarea
+                id={`rationale-${caseItem.request_id}`}
+                className="sme-input"
+                rows={3}
+                style={{ width: '100%', marginTop: '0.25rem' }}
+                placeholder="Clinical justification for approving against the agent's assessment."
+                value={rationales[caseItem.request_id] ?? ''}
+                onChange={(event) =>
+                  setRationales((current) => ({
+                    ...current,
+                    [caseItem.request_id]: event.target.value,
+                  }))
+                }
+              />
             </div>
 
             <div
@@ -249,25 +294,13 @@ export function DirectorQueue() {
                 type="button"
                 className="sme-button sme-button-approve"
                 onClick={() => void handleOverride(caseItem)}
-                disabled={pending === caseItem.id}
+                disabled={pending === caseItem.request_id}
                 style={{
-                  opacity: pending === caseItem.id ? 0.6 : 1,
-                  cursor: pending === caseItem.id ? 'not-allowed' : 'pointer',
+                  opacity: pending === caseItem.request_id ? 0.6 : 1,
+                  cursor: pending === caseItem.request_id ? 'not-allowed' : 'pointer',
                 }}
               >
-                {pending === caseItem.id ? 'Submitting…' : 'Override · teach AI'}
-              </button>
-              <button
-                type="button"
-                className="sme-button sme-button-deny"
-                onClick={() => handleConfirmDenial(caseItem)}
-                disabled={pending === caseItem.id}
-                style={{
-                  opacity: pending === caseItem.id ? 0.6 : 1,
-                  cursor: pending === caseItem.id ? 'not-allowed' : 'pointer',
-                }}
-              >
-                Confirm denial
+                {pending === caseItem.request_id ? 'Submitting…' : 'Override · teach AI'}
               </button>
             </div>
           </article>
