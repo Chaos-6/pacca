@@ -12,6 +12,7 @@
 
 ## Index
 
+- [iter-14 — chg-17/18: make the RAG retrieval path real (import-chain repair + collection/filter/scoring fixes)](#iter-14-rag-real)
 - [iter-13 — chg-14/15/16: wire + govern the case_precedents institutional-memory RAG collection](#iter-13-precedent-rag)
 - [iter-12 — chg-13: deferrable audit FK, fixes Postgres FK violation (B3)](#iter-12-deferrable-audit-fk)
 - [iter-11 — chg-11/chg-12: server-side decision_id + legible integrity failures (B6)](#iter-11-server-side-decision-id)
@@ -27,6 +28,124 @@
 - [Correction (2026-05-22) — iter-0 trajectory instrumentation record](#correction-iter0-trajectory)
 - [iter-1 — chg-1: Decision Support and Medical Director prompt extraction (Phase H1)](#chg-1-iter-1)
 - [iter-0 — Baseline Crystallization (seed)](#iter-0-baseline-crystallization)
+
+---
+
+<a name="iter-14-rag-real"></a>
+## iter-14 — Make the RAG retrieval path real, 2 changes
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-14` |
+| Date | 2026-07-25 |
+| Author | David Reed |
+| Base model (manifest) | `claude-sonnet-4-5-20250929` |
+| Base model (this evaluation) | `claude-sonnet-4-6` — **substituted**, see Limitations |
+| Constraint levels touched | `tool_implementation` (chg-17, chg-18) |
+| Behavioral surface modified | YES — what guideline context the DecisionAgent sees |
+| Changes | 2 |
+| Verdict | **KEEP** (both) |
+
+**Description.** chg-17 repairs the import chain that made `pacca.rag.pipeline` unimportable
+(`uuid7` → `uuid_extensions`, the missing `ClinicalSpecialty` / `TreatmentCategory` enums,
+absent re-exports), so the production pipeline runs instead of a bare-`except` fallback nobody
+could observe. chg-18 removes the phantom ungoverned `clinical_guidelines` collection (the
+retriever now injects the governed one), replaces `$contains` metadata filters that silently
+matched nothing with per-value boolean flags, and derives similarity from the collection's real
+distance space. Full manifest: [`harness/manifests/iter-14.json`](../harness/manifests/iter-14.json).
+
+### Verdict (recorded 2026-07-25, at branch HEAD of `fix/audit-p0-p1-corrections`)
+
+| Field | Value |
+|-------|-------|
+| Outcome | **keep** (chg-17 and chg-18) |
+| Live clinical gate | **PASS** — `pytest tests/ -m clinical`, 7 passed / 1 failed, 807.80s |
+| Golden-set accuracy | **87.2% (34/39)** against the 80% CI threshold |
+| Hallucinations | **0** — `test_zero_hallucinations_on_sparse_cases` PASSED; GC-018/019 clean |
+| Judge-failed cases | GC-022, GC-026, GC-027, GC-029, GC-075 (all score 2; correct outcome, weak reasoning on 022/029) |
+| Deterministic suite | 774 passed, 2 skipped, 8 deselected (`pytest tests/ -m "not clinical"`) |
+| Lint / manifests | `ruff check src/ tests/` clean; `validate_manifest --all` 15/15 valid |
+| Precision on predicted_fixes | **3/3 chg-17, 3/3 chg-18** — verified below |
+| Recall on risk_cases | no predicted risk case was observed to fire |
+
+**Predicted fixes — verified.** The pipeline is demonstrably live, not merely importable.
+A seeded retrieval logs `rag_pipeline_initialized collection=nccn_guidelines` and returns
+chunk-scored context (`Relevance Score: 0.61` for the matching lung-screening guideline vs
+`0.19` for an unrelated spine guideline), confirming chunk scoring, the governed single
+collection, and a real distance space. `pipeline_available` reports `True`. Under the
+pre-repair tree the same call logs `rag_pipeline_init_failed … fallback=direct_chromadb`.
+
+**A predicted risk that did *not* materialise.** chg-18 warned that the precedent path could
+be affected. It was not: a `/feedback` precedent is still retrieved and rendered to the agent
+under the `PAST MEDICAL DIRECTOR DECISIONS (PRECEDENTS)` header, verified directly.
+
+### The one red test, and why it is not attributed to this iteration
+
+`tests/test_level5_flow.py::test_learning_loop_spine` fails: after a Medical Director override
+is taught via `/feedback`, the identical weak spine case returns **IN_REVIEW**, not
+**AUTO_APPROVED**. [iter-13](#iter-13-precedent-rag) recorded that flip as proven end-to-end,
+so this is a genuine behavioural difference against the recorded baseline.
+
+It is **not** caused by chg-17/chg-18. A controlled A/B holding the model constant at
+`claude-sonnet-4-6` was run against the pre-repair tree (`5c27714`, the base of this branch)
+and this one:
+
+| Tree | RAG path | Outcome | Confidence |
+|------|----------|---------|-----------|
+| `5c27714` (pre-repair) | `fallback=direct_chromadb` | IN_REVIEW | 0.32 |
+| branch HEAD (repaired) | `rag_pipeline` | IN_REVIEW | 0.87 |
+
+Both escalate. The repaired path escalates *better*: its rationale explicitly weighs the
+retrieved precedent and declines to generalise it, where the fallback's rationale never
+addresses the precedent at all. The remaining delta against iter-13 tracks the **model
+substitution**, not the retrieval repair.
+
+The agent's stated reason is worth recording verbatim in substance: the precedent was an
+override justified by *severe motor weakness*, and no such finding is documented in the
+resubmitted case, so it treats the precedent as a case-specific correction rather than a
+generalisable approval pattern. That is the P-5 evidence-grounding invariant
+([iter-10](#iter-10-evidence-grounding)) behaving as designed — approving here would mean
+approving on evidence absent from the submission. **The assertion was therefore left failing
+rather than relaxed.** Whether the Level-4 demo expectation or the P-5 invariant is the
+correct contract is a clinical-policy decision for a human reviewer, not a test edit; it is
+logged here as the open question this iteration surfaced.
+
+### What the marker fix exposed (non-behavioral, test-only)
+
+`6b6288d` made the clinical gate select by marker rather than by directory, which put
+`tests/test_level5_flow.py` into `make test-clinical` for the first time. The module had
+never executed in any target, and it carried three latent defects that had nothing to do with
+the RAG repair — each pre-dating this branch. Repaired in this commit, no manifest entry
+(test-only, no agent surface):
+
+1. **No authentication.** Both routers are mounted with `dependencies=[Depends(verify_token)]`
+   (since `9073dc7`, iter-6); every request 401'd. Now sends a Bearer token, mirroring
+   `tests/unit/api/conftest.py`.
+2. **No database.** A module-level `TestClient(app)` never enters the lifespan, so
+   `init_database()` never ran and the first audit write failed with
+   `no such table: audit_logs`. The client is now a context-managed fixture.
+3. **Stale response contract.** `test_dark_factory_evolution` asserted
+   `status == "optimized" | "proposed"` with a `proposal.proposed_text` field. The route has
+   returned `proposal_pending` with `proposed_text_preview` since iter-6. Assertions updated
+   to the contract the route actually serves.
+   Additionally, `request_id` is `UNIQUE` and the SQLite file outlives the run, so the fixed
+   ids collided on re-execution; ids are now unique per run.
+
+### Limitations of this evaluation
+
+- **Model substitution.** The manifest's base model `claude-sonnet-4-5-20250929` is refused by
+  the available API gateway (`403 model not allowed`). The suite was run with
+  `DEFAULT_MODEL=claude-sonnet-4-6`, a supported override (`agents/base.py`). All numbers above
+  are therefore *not* directly comparable to iterations measured on `sonnet-4-5`, and the
+  learning-loop delta is most likely attributable to this substitution. Re-running the gate on
+  `claude-sonnet-4-5-20250929` is required before treating 87.2% as a like-for-like successor
+  to the iter-13 figure.
+- **Judge non-determinism.** Single run; no tolerance band applied. The five score-2 cases are
+  reasoning-quality failures with correct outcomes in 022/029 and genuinely wrong escalations in
+  026/027/075 — the latter three are escalate-instead-of-deny errors and are the most useful
+  signal in this run for a future iteration.
+- **Scores are not comparable across chg-18** by the manifest's own risk note: the chunk-overlap
+  guard changed chunk boundaries.
 
 ---
 
