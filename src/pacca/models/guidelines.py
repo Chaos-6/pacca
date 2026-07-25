@@ -5,11 +5,16 @@ These models represent clinical guidelines and their criteria
 used for evidence-based decision support via RAG.
 """
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from uuid7 import uuid7
+
+# The `uuid7` distribution installs its module as `uuid_extensions`, not `uuid7`.
+# `from uuid7 import uuid7` raised ModuleNotFoundError at import time, which made
+# this module — and everything downstream of it, including pacca.rag.pipeline —
+# permanently unimportable. The rest of the codebase already imports it correctly.
+from uuid_extensions import uuid7
 
 from pacca.models.enums import ClinicalSpecialty, TreatmentCategory
 
@@ -138,8 +143,8 @@ class ClinicalGuideline(BaseModel):
     warnings: list[str] = Field(default_factory=list, description="Clinical warnings")
 
     # Metadata
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     tags: list[str] = Field(default_factory=list, description="Search tags")
 
     @property

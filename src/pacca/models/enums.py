@@ -58,6 +58,37 @@ class ReviewTier(StrEnum):
     HUMAN = "HUMAN"
 
 
+class ClinicalSpecialty(StrEnum):
+    """
+    Clinical specialty a guideline applies to.
+
+    Scope note: the members below are the specialties actually covered by the
+    guideline corpus in `pacca.rag.sample_guidelines`. Add a member when a
+    guideline that needs it is added — an unused member is an unverified claim
+    about coverage.
+    """
+
+    CARDIOLOGY = "cardiology"
+    NEUROLOGY = "neurology"
+    ONCOLOGY = "oncology"
+    ORTHOPEDICS = "orthopedics"
+    PULMONOLOGY = "pulmonology"
+    RADIOLOGY = "radiology"
+    RHEUMATOLOGY = "rheumatology"
+
+
+class TreatmentCategory(StrEnum):
+    """
+    Category of a requested treatment, used as a RAG metadata filter.
+
+    Same scope note as ClinicalSpecialty: only categories represented in the
+    guideline corpus are listed.
+    """
+
+    IMAGING = "imaging"
+    MEDICATION = "medication"
+
+
 class EscalationReason(StrEnum):
     """
     Structured reasons why a case was escalated.

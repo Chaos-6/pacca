@@ -21,11 +21,20 @@ from pacca.models.clinical import (
 )
 from pacca.models.enums import (
     AuthorizationStatus,
+    ClinicalSpecialty,
     ComplexityLevel,
     EscalationReason,
     EvidenceSourceType,
     ReviewTier,
+    TreatmentCategory,
     UrgencyLevel,
+)
+from pacca.models.guidelines import (
+    ClinicalGuideline,
+    GuidelineChunk,
+    GuidelineCriterion,
+    GuidelineSearchResult,
+    StepTherapyRequirement,
 )
 from pacca.models.triage import (
     ClassificationOutput,
@@ -39,11 +48,18 @@ __all__ = [
     "AuthorizationStatus",
     "ClassificationOutput",
     "ClinicalCase",
+    "ClinicalGuideline",
+    "ClinicalSpecialty",
     "ComplexityLevel",
     "EscalationReason",
     "EvidenceItem",
     "EvidenceOutput",
     "EvidenceSourceType",
+    "GuidelineChunk",
+    "GuidelineCriterion",
+    "GuidelineSearchResult",
     "ReviewTier",
+    "StepTherapyRequirement",
+    "TreatmentCategory",
     "UrgencyLevel",
 ]
