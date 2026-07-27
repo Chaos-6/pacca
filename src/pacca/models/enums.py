@@ -100,9 +100,10 @@ class EscalationReason(StrEnum):
       - New reasons require a code change + review, not an accidental typo
 
     PRD SS5.4 specified the original 7 triggers; the set has since grown as
-    governance layers were added (e.g. ADULT_COMPLEX, and the P-4/P-5 safety
-    reasons SCOPE_VIOLATION and UNGROUNDED_EVIDENCE). Each member maps to a
-    branch or a deterministic safety short-circuit in orchestrator.py.
+    governance layers were added (e.g. ADULT_COMPLEX, and the safety reasons
+    SCOPE_VIOLATION, UNGROUNDED_EVIDENCE, and RAG_DEGRADED). Each member maps
+    to a branch or a deterministic safety short-circuit in orchestrator.py
+    or the submit route.
     """
 
     # ── Confidence-based escalation (original 3 branches) ────────────────────
@@ -187,4 +188,18 @@ class EscalationReason(StrEnum):
     submission. The decision may be relying on fabricated or misattributed
     evidence, so it is routed to human review regardless of confidence — the
     production-path equivalent of the GC-018/019 anti-hallucination gate.
+    """
+
+    RAG_DEGRADED = "rag_degraded"
+    """
+    ``GuidelineRetriever.query()`` (chg-19) reported a degraded
+    ``RetrievalOutcome`` — the governed RAGPipeline was unavailable or raised,
+    and retrieval fell back to the legacy direct-ChromaDB path. Every
+    degradation is audited (``action="rag.degraded"``) regardless of this
+    setting; this reason fires only when ``settings.rag_degraded_escalates``
+    is True, routing the case to human review rather than letting the
+    DecisionAgent reason over unverified fallback context. Defaults to warn
+    mode (audited, not routed) per the same warn -> enforce rollout precedent
+    as the P-4 scope guard (chg-8 -> chg-9); promote once degradation rates
+    in production are known (chg-20).
     """
