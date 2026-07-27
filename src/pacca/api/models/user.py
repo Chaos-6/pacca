@@ -22,3 +22,7 @@ class User(Base):  # type: ignore[misc]
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
+    # RBAC (see api/rbac.py). server_default backfills existing rows to the
+    # least-privileged role on migrate (migration 006) — must match that
+    # migration's add_column call EXACTLY or the migration-drift CI job fails.
+    role = Column(String(30), nullable=False, server_default="clinician")
