@@ -367,7 +367,20 @@ class BaseAgent(ABC):
                 model=self.config.model,
                 max_tokens=self.config.max_tokens,
                 temperature=self.config.temperature,
-                system=self.system_prompt,
+                # system_prompt is a fixed per-agent-type prompt (loaded from a
+                # static file/constant per subclass — see decision.py,
+                # evidence_agent.py, etc.), not built fresh with per-request
+                # data. Marking it as the cache_control breakpoint caches the
+                # tool definition too, since render order is tools -> system
+                # -> messages. Per-case data lives entirely in `messages`
+                # (user_input below), which stays uncached and varies per call.
+                system=[
+                    {
+                        "type": "text",
+                        "text": self.system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 messages=[{"role": "user", "content": user_input}],
                 tools=[tool_def],
                 tool_choice={"type": "tool", "name": "submit_result"},
