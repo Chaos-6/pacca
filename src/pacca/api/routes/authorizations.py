@@ -309,7 +309,11 @@ async def submit_authorization(
                 mode=get_settings().scope_guard_mode,
                 collection_name=_collection,
             )
-        context_text = rag_engine.query(query)
+        # query() now returns a RetrievalOutcome rather than a bare str
+        # (chg-19) — the caller (here) reads `.text` for the prompt context.
+        # Whether the retrieval degraded is not yet acted on; that lands in
+        # chg-20.
+        context_text = rag_engine.query(query).text
 
         # ── ORCHESTRATOR: Run the AI decision pipeline ────────────────────────
         # DecisionContext bundles the case + retrieved guidelines together.
