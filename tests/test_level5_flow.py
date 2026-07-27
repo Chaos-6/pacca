@@ -120,6 +120,35 @@ def client():
     try:
         DomainBase.metadata.create_all(sync_engine)
         AuthBase.metadata.create_all(sync_engine)
+
+        # RBAC (see pacca.api.rbac): the router-wide guards on both routers
+        # under test (clinician on /authorizations/*, admin on /admin/*) now
+        # do a real `users` table lookup, not just a JWT signature check —
+        # and this module's tests exercise /feedback (medical_director floor)
+        # and /admin/optimize_policies (admin floor) too. "test-user" (the
+        # identity `auth_headers` signs a token for) needs the highest rank
+        # to clear every floor exercised here. Upserted, not inserted blindly
+        # — this fixture runs against the persistent dev DB file, so a second
+        # run of this module must not violate the username unique index.
+        users_table = AuthBase.metadata.tables["users"]
+        with sync_engine.begin() as conn:
+            existing = conn.execute(
+                users_table.select().where(users_table.c.username == "test-user")
+            ).first()
+            if existing is None:
+                conn.execute(
+                    users_table.insert().values(
+                        username="test-user",
+                        hashed_password="unused-hash-for-clinical-test-fixture",
+                        role="admin",
+                    )
+                )
+            elif existing.role != "admin":
+                conn.execute(
+                    users_table.update()
+                    .where(users_table.c.username == "test-user")
+                    .values(role="admin")
+                )
     finally:
         sync_engine.dispose()
 
@@ -129,8 +158,11 @@ def client():
 
 def auth_headers() -> dict[str, str]:
     """
-    Both routers under test are mounted with `dependencies=[Depends(verify_token)]`,
-    so every request here needs a Bearer token. Mirrors tests/unit/api/conftest.py.
+    Both routers under test are mounted with a `require_min_role` router-wide
+    dependency (RBAC — see pacca.api.rbac), so every request here needs a
+    Bearer token for an account the `client` fixture seeds as `admin` (the
+    superset role for every floor this module's tests exercise). Mirrors
+    tests/unit/api/conftest.py.
     """
     payload = {"sub": "test-user", "exp": datetime.now(UTC) + timedelta(minutes=30)}
     return {"Authorization": f"Bearer {jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)}"}

@@ -20,14 +20,15 @@ from unittest.mock import patch
 import pytest
 from jose import jwt
 from starlette.testclient import WebSocketTestSession  # noqa: F401 — type hint
+from starlette.websockets import WebSocketDisconnect
 
 from pacca.agents.sme_authoring.models import CaseDraftResponse
 from pacca.api.auth import ALGORITHM, SECRET_KEY
 
 if TYPE_CHECKING:
-    from fastapi.testclient import TestClient
+    from collections.abc import Callable
 
-    pass
+    from fastapi.testclient import TestClient
 
 
 def _make_token(sub: str = "test-user") -> str:
@@ -99,6 +100,9 @@ class TestAuthProtocol:
             event = ws.receive_json()
             assert event["type"] == "error"
             assert "auth" in event["message"].lower()
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4401
 
     def test_invalid_token_closes_4401(
         self,
@@ -111,6 +115,82 @@ class TestAuthProtocol:
             event = ws.receive_json()
             assert event["type"] == "error"
             assert "invalid" in event["message"].lower() or "jwt" in event["message"].lower()
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4401
+
+
+# =============================================================================
+# RBAC role gate (design spec §5.4 item 12) — clinician token below the
+# medical_director floor closes 4403; distinguishable from the 4401s above.
+# =============================================================================
+
+
+class TestRoleGate:
+    def test_clinician_token_closes_4403(
+        self,
+        client: TestClient,
+        session_id: str,
+        seed_user: Callable[[str, str], None],
+    ) -> None:
+        """A valid, authenticated token below medical_director is 4403, not 4401."""
+        seed_user("ws-clinician", "clinician")
+        url = f"/api/v1/sme-authoring/sessions/{session_id}/draft-stream"
+        with client.websocket_connect(url) as ws:
+            ws.send_json({"type": "auth", "token": _make_token(sub="ws-clinician")})
+            event = ws.receive_json()
+            assert event["type"] == "error"
+            assert "insufficient role" in event["message"].lower()
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4403
+
+    def test_medical_director_token_is_admitted(
+        self,
+        client: TestClient,
+        session_id: str,
+        seed_user: Callable[[str, str], None],
+    ) -> None:
+        """The boundary role (medical_director exactly) passes the gate."""
+        seed_user("ws-medical-director", "medical_director")
+        url = f"/api/v1/sme-authoring/sessions/{session_id}/draft-stream"
+
+        async def _mock_run(self, request):
+            return _valid_draft().model_copy(update={"case_id": request.allocated_case_id})
+
+        with (
+            patch(
+                "pacca.api.websockets.draft_stream.SMECaseAuthoringAgent.run",
+                new=_mock_run,
+            ),
+            patch(
+                "pacca.api.websockets.draft_stream.next_id",
+                return_value="GC-201",
+            ),
+            client.websocket_connect(url) as ws,
+        ):
+            ws.send_json({"type": "auth", "token": _make_token(sub="ws-medical-director")})
+            event = ws.receive_json()
+            # Getting to a `done`/heartbeat event at all (not an "error" event
+            # for insufficient role) proves the gate admitted this role.
+            assert event["type"] == "done"
+
+    def test_nonexistent_account_closes_4401_not_4403(
+        self,
+        client: TestClient,
+        session_id: str,
+    ) -> None:
+        """A syntactically valid token for a deleted/never-existed account is
+        401-shaped (4401), not 403-shaped — there is no account to authorize,
+        so this is an authentication failure, not an authorization one."""
+        url = f"/api/v1/sme-authoring/sessions/{session_id}/draft-stream"
+        with client.websocket_connect(url) as ws:
+            ws.send_json({"type": "auth", "token": _make_token(sub="never-registered")})
+            event = ws.receive_json()
+            assert event["type"] == "error"
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4401
 
 
 # =============================================================================
