@@ -447,13 +447,17 @@ class TestRAGPipelineIntegration:
         retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
         retriever._pipeline = mock_pipeline
 
-        result = retriever.query("Guidelines for C34.1 and J9271")
+        outcome = retriever.query("Guidelines for C34.1 and J9271")
 
         # The pipeline was actually invoked — not silently skipped. The old
         # assertion allowed `len(result) > 0`, which the fallback also satisfies,
         # so it passed for months while the pipeline never ran at all.
         mock_pipeline.retrieve_relevant_guidelines_sync.assert_called_once()
-        assert "Pembrolizumab" in result
+        assert "Pembrolizumab" in outcome.text
+        # RetrievalOutcome (chg-19): the healthy pipeline path is not degraded.
+        assert outcome.mode == "pipeline"
+        assert outcome.degraded is False
+        assert outcome.reason is None
         # The direct-ChromaDB fallback must NOT have been used.
         retriever._guidelines.query.assert_not_called()
 
@@ -502,13 +506,21 @@ class TestRAGPipelineIntegration:
             "metadatas": [[]],
         }
         retriever._pipeline = None
+        # __new__ bypasses __init__, so this attribute (normally set in the
+        # construction try/except) must be set explicitly on the bare instance.
+        retriever._pipeline_build_error_type = None
 
         assert retriever.pipeline_available is False
 
-        result = retriever.query("Guidelines for C34.1 and J9271")
+        outcome = retriever.query("Guidelines for C34.1 and J9271")
 
-        assert "OFFICIAL GUIDELINES" in result
-        assert "NCCN guideline text" in result
+        assert "OFFICIAL GUIDELINES" in outcome.text
+        assert "NCCN guideline text" in outcome.text
+        # RetrievalOutcome (chg-19): pipeline was never built -> degraded, with
+        # a non-exception reason since there was no exception to type-name.
+        assert outcome.mode == "direct_fallback"
+        assert outcome.degraded is True
+        assert outcome.reason == "pipeline_unavailable"
 
     def test_guideline_retriever_falls_back_when_pipeline_raises(self):
         """A pipeline error must degrade to the direct path, not surface to the caller."""
@@ -529,10 +541,72 @@ class TestRAGPipelineIntegration:
         retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
         retriever._pipeline = mock_pipeline
 
-        result = retriever.query("Guidelines for C34.1 and J9271")
+        outcome = retriever.query("Guidelines for C34.1 and J9271")
 
-        assert "OFFICIAL GUIDELINES" in result
-        assert "NCCN guideline text" in result
+        assert "OFFICIAL GUIDELINES" in outcome.text
+        assert "NCCN guideline text" in outcome.text
+        # RetrievalOutcome (chg-19): a raising pipeline degrades to the direct
+        # path, and the exception TYPE (not its message) is surfaced as reason.
+        assert outcome.mode == "direct_fallback"
+        assert outcome.degraded is True
+        assert outcome.reason == "RuntimeError"
+
+    def test_guideline_retriever_reason_never_carries_raw_exception_text(self):
+        """
+        `reason` is written verbatim into an audit record (chg-20), so it must
+        never carry the raw exception message — only the exception's TYPE name.
+        A message can legitimately contain clinical free text (e.g. a query
+        string echoed into a chromadb error), which must never reach an audit
+        record undigested.
+        """
+        from pacca.integrations import vector_store as vs_module
+
+        phi_like = "patient John Doe, MRN 000-11-2222, diagnosis C34.1"
+        mock_pipeline = MagicMock()
+        mock_pipeline.retrieve_relevant_guidelines_sync.side_effect = RuntimeError(phi_like)
+
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._guidelines.query.return_value = {
+            "documents": [["NCCN text"]],
+            "metadatas": [[{}]],
+        }
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = mock_pipeline
+
+        outcome = retriever.query("Guidelines for C34.1 and J9271")
+
+        assert outcome.reason == "RuntimeError"
+        assert phi_like not in (outcome.reason or "")
+
+    def test_guideline_retriever_reports_empty_mode_when_fallback_finds_nothing(self):
+        """
+        When the pipeline is unavailable AND the direct fallback finds nothing
+        in either collection, query() must report mode="empty" rather than
+        "direct_fallback" — the caller is about to reason over zero retrieved
+        context, not just degraded-but-real context. Must not crash.
+        """
+        from pacca.integrations import vector_store as vs_module
+
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._guidelines.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = None
+        retriever._pipeline_build_error_type = None
+
+        outcome = retriever.query("Guidelines for Z99.9 and 00000")
+
+        assert outcome.mode == "empty"
+        assert outcome.degraded is True
+        assert outcome.reason == "pipeline_unavailable"
+        assert "OFFICIAL GUIDELINES" in outcome.text
 
     def test_add_guideline_upserts_to_collection(self):
         """add_guideline() must call upsert on the guidelines collection."""

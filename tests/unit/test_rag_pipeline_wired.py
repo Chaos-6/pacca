@@ -203,11 +203,14 @@ def test_query_uses_pipeline_output_not_the_fallback(
         metadata={"source": "CMS", "guideline_name": "CMS Lumbar Spine MRI"},
     )
 
-    result = retriever.query("Guidelines for M54.5 and 72148")
+    outcome = retriever.query("Guidelines for M54.5 and 72148")
 
-    assert "Relevance Score" in result
-    assert "6 weeks" in result
-    assert "OFFICIAL GUIDELINES:" not in result, "fell back to the direct path"
+    assert "Relevance Score" in outcome.text
+    assert "6 weeks" in outcome.text
+    assert "OFFICIAL GUIDELINES:" not in outcome.text, "fell back to the direct path"
+    # RetrievalOutcome (chg-19): the real pipeline path is not degraded.
+    assert outcome.mode == "pipeline"
+    assert outcome.degraded is False
 
 
 def test_query_still_appends_precedents_alongside_pipeline_results(
@@ -225,19 +228,30 @@ def test_query_still_appends_precedents_alongside_pipeline_results(
         outcome="AUTO_APPROVED",
     )
 
-    result = retriever.query("Guidelines for M54.5 and 72148")
+    outcome = retriever.query("Guidelines for M54.5 and 72148")
 
-    assert "Relevance Score" in result, "guidelines did not come from the pipeline"
-    assert "PAST MEDICAL DIRECTOR DECISIONS (PRECEDENTS)" in result
-    assert "foot drop" in result
+    assert "Relevance Score" in outcome.text, "guidelines did not come from the pipeline"
+    assert "PAST MEDICAL DIRECTOR DECISIONS (PRECEDENTS)" in outcome.text
+    assert "foot drop" in outcome.text
+    assert outcome.mode == "pipeline"
+    assert outcome.degraded is False
 
 
 def test_query_on_empty_store_reports_no_guidelines(
     retriever: GuidelineRetriever,
 ) -> None:
-    """An unseeded store must not raise, and must say so rather than inventing text."""
-    result = retriever.query("Guidelines for M54.5 and 72148")
-    assert "No specific guidelines found" in result
+    """
+    An unseeded store must not raise, and must say so rather than inventing text.
+
+    This is the pipeline legitimately reporting "nothing matched" — not a
+    degradation. The pipeline ran successfully, so mode stays "pipeline" and
+    degraded stays False; "empty"/degraded is reserved for when the pipeline
+    itself is unavailable or errors (see test_security_and_scalability.py).
+    """
+    outcome = retriever.query("Guidelines for M54.5 and 72148")
+    assert "No specific guidelines found" in outcome.text
+    assert outcome.mode == "pipeline"
+    assert outcome.degraded is False
 
 
 # =============================================================================

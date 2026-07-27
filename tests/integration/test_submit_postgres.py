@@ -36,6 +36,8 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from pacca.integrations.vector_store import RetrievalOutcome
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
@@ -137,7 +139,9 @@ async def test_submit_commits_with_zero_orphaned_audit_rows(pg_session: AsyncSes
         ),
         patch(
             "pacca.api.routes.authorizations.rag_engine.query",
-            return_value="Mock guideline content",
+            return_value=RetrievalOutcome(
+                text="Mock guideline content", mode="pipeline", degraded=False, reason=None
+            ),
         ),
     ):
         # get_session commits on exit; we call the handler directly, so we own

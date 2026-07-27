@@ -65,7 +65,7 @@ def test_re_adding_updates_in_place(tmp_path: object) -> None:
         case_summary="same scenario", rationale="corrected take", outcome="AUTO_APPROVED"
     )
     assert r.precedent_count() == 1
-    ctx = r.query("same scenario")
+    ctx = r.query("same scenario").text
     assert "corrected take" in ctx and "first take" not in ctx
 
 
@@ -92,7 +92,7 @@ def test_precedent_round_trip_surfaces_in_agent_context(tmp_path: object) -> Non
         rationale="occupational-necessity exception approved by the Medical Director",
         outcome="AUTO_APPROVED",
     )
-    context = r.query("construction worker acute lumbar pain MRI")
+    context = r.query("construction worker acute lumbar pain MRI").text
     assert "PAST MEDICAL DIRECTOR DECISIONS" in context
     assert "occupational-necessity exception" in context
     assert "AUTO_APPROVED" in context

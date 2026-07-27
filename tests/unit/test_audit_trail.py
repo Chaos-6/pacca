@@ -28,9 +28,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pacca.integrations.vector_store import RetrievalOutcome
 from pacca.models.authorization import AuthorizationDecision
 from pacca.models.clinical import ClinicalCase, EvidenceItem
 from pacca.models.enums import AuthorizationStatus, EvidenceSourceType, ReviewTier
+
+
+def _healthy_outcome(text: str) -> RetrievalOutcome:
+    """A non-degraded RetrievalOutcome (chg-19) — the mock fill-in for
+    rag_engine.query() in tests that are not exercising RAG degradation."""
+    return RetrievalOutcome(text=text, mode="pipeline", degraded=False, reason=None)
+
 
 # ── Test fixtures — reusable test data ──────────────────────────────────────
 
@@ -147,7 +155,7 @@ class TestAuditTrailWiring:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="Mock guideline content",
+                return_value=_healthy_outcome("Mock guideline content"),
             ),
             patch(
                 "pacca.db.repository.AuditRepository.log",
@@ -198,7 +206,7 @@ class TestAuditTrailWiring:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="Mock guideline",
+                return_value=_healthy_outcome("Mock guideline"),
             ),
             patch(
                 "pacca.db.repository.AuditRepository.log",
@@ -243,7 +251,7 @@ class TestAuditTrailWiring:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="Mock guideline",
+                return_value=_healthy_outcome("Mock guideline"),
             ),
             patch(
                 "pacca.db.repository.AuditRepository.log",
@@ -302,7 +310,7 @@ class TestAuditTrailWiring:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="Mock guideline",
+                return_value=_healthy_outcome("Mock guideline"),
             ),
             patch(
                 "pacca.db.repository.AuditRepository.log",
@@ -347,7 +355,7 @@ class TestAuditTrailWiring:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="Mock guideline",
+                return_value=_healthy_outcome("Mock guideline"),
             ),
             patch(
                 "pacca.db.repository.AuditRepository.log",
@@ -401,7 +409,7 @@ class TestAuditTrailWiring:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="Mock guideline",
+                return_value=_healthy_outcome("Mock guideline"),
             ),
             patch(
                 "pacca.db.repository.AuditRepository.log",
@@ -450,7 +458,7 @@ class TestAuditTrailWiring:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="Mock guideline",
+                return_value=_healthy_outcome("Mock guideline"),
             ),
             patch(
                 "pacca.db.repository.AuditRepository.log",
