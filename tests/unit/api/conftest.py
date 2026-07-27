@@ -62,6 +62,21 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClie
     singletons in `pacca.db.session` are reset so the new URL actually takes
     effect (they are lazily created once and cached for the process
     otherwise).
+
+    VALIDATOR-FLAGGED LIMITATION (left as-is, deliberately): seeding
+    TEST_USERNAME as `admin` — the MAXIMALLY PERMISSIVE principal — means
+    every test in this package that uses `client`/`auth_headers` runs as an
+    administrator. A dropped or too-low RBAC guard on any of these routes
+    would NOT be caught by this suite; it would still return 200. That gap
+    is covered structurally instead by the route-enumeration detector in
+    tests/unit/test_rbac_adversarial.py (`test_c8_every_non_public_http_route_
+    resolves_an_rbac_dependency`, proven capable of failing by
+    `test_c8_negative_control_detector_can_actually_fail`) and by
+    tests/unit/test_rbac.py's own boundary-role tests, which use principals
+    AT or BELOW the floor being tested rather than the maximal one. Re-seeding
+    this fixture at a lower role was considered and rejected: it would
+    cascade 403s through many pre-existing, non-RBAC-focused tests in this
+    package for a property already covered elsewhere at lower risk.
     """
     db_path = tmp_path / "rbac_test.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")

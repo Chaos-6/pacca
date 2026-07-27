@@ -13,6 +13,7 @@ tests a guard uses a principal at or below the boundary being probed.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -153,20 +154,73 @@ def _resolves_get_current_user(route: Any) -> bool:
     return seen
 
 
-def test_c8_every_non_public_http_route_resolves_an_rbac_dependency() -> None:
-    """CHARTER C8: no HTTP route may be reachable without an RBAC floor."""
+def _find_unguarded_routes(routes: list[Any], public_paths: set[str]) -> tuple[int, list[str]]:
+    """
+    The C8 detection algorithm, extracted so it can be run against a
+    throwaway app too (see test_c8_negative_control_detector_can_actually_fail
+    below) — identical logic to what this function replaced inline in
+    test_c8_every_non_public_http_route_resolves_an_rbac_dependency, not a
+    weakened or narrowed version of it.
+
+    Returns (non-public routes checked, description of each unguarded one).
+    """
     unguarded: list[str] = []
     checked = 0
-    for r in app.routes:
+    for r in routes:
         if not isinstance(r, APIRoute):
             continue
-        if r.path in PUBLIC_BY_DESIGN:
+        if r.path in public_paths:
             continue
         checked += 1
         if not _resolved_min_roles(r) or not _resolves_get_current_user(r):
             unguarded.append(f"{sorted(r.methods)} {r.path}")
+    return checked, unguarded
+
+
+def test_c8_every_non_public_http_route_resolves_an_rbac_dependency() -> None:
+    """CHARTER C8: no HTTP route may be reachable without an RBAC floor."""
+    checked, unguarded = _find_unguarded_routes(app.routes, PUBLIC_BY_DESIGN)
     assert checked >= 25, f"enumeration collapsed — only {checked} routes checked"
     assert not unguarded, f"UNGUARDED non-public routes: {unguarded}"
+
+
+def test_c8_negative_control_detector_can_actually_fail() -> None:
+    """
+    VALIDATOR-FLAGGED GAP, CLOSED: the route-enumeration detector above had
+    never been proven capable of going red — "zero unguarded routes" rested
+    on a detector nobody had seen fail. This builds a throwaway FastAPI app
+    with one properly-guarded route and one DELIBERATELY unguarded route (no
+    Depends at all — the exact shape of a dropped guard) and runs the SAME
+    `_find_unguarded_routes` logic used against the real app, proving it
+    correctly flags the unguarded route and clears the guarded one.
+    """
+    from fastapi import Depends, FastAPI
+
+    from pacca.api.rbac import Role, require_min_role
+
+    # Bound once, not called inline inside the Depends(...) default below —
+    # matches the module-level singleton pattern used in the real routers
+    # (ruff B008: a nested function call in a parameter default).
+    _require_clinician = require_min_role(Role.CLINICIAN)
+
+    throwaway = FastAPI()
+
+    @throwaway.get("/guarded")
+    async def _guarded_endpoint(_user: Any = Depends(_require_clinician)) -> dict[str, str]:
+        return {"ok": "true"}
+
+    @throwaway.get("/lost-guard")
+    async def _unguarded_endpoint() -> dict[str, str]:
+        return {"ok": "true"}
+
+    checked, unguarded = _find_unguarded_routes(throwaway.routes, public_paths=set())
+
+    assert checked == 2, f"expected both throwaway routes to be checked, got {checked}"
+    assert len(unguarded) == 1, f"expected exactly one flagged route, got: {unguarded}"
+    assert "/lost-guard" in unguarded[0], f"detector flagged the wrong route: {unguarded}"
+    assert not any(entry.split(" ", 1)[1] == "/guarded" for entry in unguarded), (
+        f"detector false-flagged the properly-guarded route: {unguarded}"
+    )
 
 
 def test_c8_route_min_roles_match_design_spec_section_2() -> None:
@@ -558,21 +612,24 @@ def test_d12_failed_role_change_writes_no_audit_record(adv_client: TestClient) -
     assert _sql("SELECT COUNT(*) FROM audit_logs WHERE action='user.role_changed'")[0][0] == 0
 
 
-def test_finding_cli_create_admin_silently_resets_an_existing_users_password(
+def test_finding_cli_create_admin_no_longer_resets_an_existing_users_password(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """VALIDATOR FINDING (undocumented deviation from design spec §3.3).
+    """VALIDATOR FINDING, FIXED (was: undocumented deviation from design spec §3.3).
 
     §3.3 specifies only "Creates the user if absent; promotes to `admin` if
-    present." It does not authorise a password rotation. In fact
-    `_create_or_promote_admin` calls
+    present." It did not authorise a password rotation, but
+    `_create_or_promote_admin` used to call
     `_assign_str(existing, "hashed_password", hashed)` unconditionally, so
-    promoting an existing user ALSO overwrites their credential with the
-    value the operator typed — the target's own password stops working and
-    the operator now knows their new one. The `--help` text does not warn.
+    promoting an existing user ALSO overwrote their credential with the
+    value the operator typed — the target's own password stopped working
+    and the operator learned their new one.
 
-    This test pins the CURRENT behaviour so the deviation is visible and any
-    future fix is a deliberate, reviewed change rather than a silent one.
+    This test originally PINNED that behaviour (asserted the bug). Per its
+    own comment ("if this now passes, the finding was fixed and this test
+    should be inverted"), the assertions are now inverted: promotion must
+    leave Alice's own password working and must NOT apply the password the
+    operator typed for someone else's account.
     """
     from click.testing import CliRunner
     from sqlalchemy import create_engine as _ce
@@ -588,6 +645,9 @@ def test_finding_cli_create_admin_silently_resets_an_existing_users_password(
 
     engine = _ce(f"sqlite:///{db_path}")
     AuthBase.metadata.create_all(engine)
+    # DomainBase too: create-admin now writes a user.role_changed audit
+    # record (FIX 3), which needs the audit_logs table to exist.
+    DomainBase.metadata.create_all(engine)
     with engine.begin() as conn:
         conn.execute(
             user_module.User.__table__.insert().values(
@@ -603,6 +663,7 @@ def test_finding_cli_create_admin_silently_resets_an_existing_users_password(
         ["create-admin", "--username", "alice", "--password", "operator-typed-this"],
     )
     assert result.exit_code == 0, result.output
+    assert "Password NOT changed" in result.output, result.output
 
     engine = _ce(f"sqlite:///{db_path}")
     with engine.connect() as conn:
@@ -615,27 +676,36 @@ def test_finding_cli_create_admin_silently_resets_an_existing_users_password(
     assert row is not None
     assert row.role == "admin"
 
-    # The deviation, asserted explicitly:
-    assert verify_password("alice-original-pw", row.hashed_password) is False, (
-        "expected the documented behaviour (password untouched) — if this now "
-        "passes, the finding was fixed and this test should be inverted"
+    # The fix, asserted explicitly:
+    assert verify_password("alice-original-pw", row.hashed_password) is True, (
+        "alice's original password must still work — promotion must never "
+        "touch an existing user's credential"
     )
-    assert verify_password("operator-typed-this", row.hashed_password) is True
+    assert verify_password("operator-typed-this", row.hashed_password) is False, (
+        "the password the operator typed must NOT have been applied to alice's account"
+    )
 
     db_session_module._engine = None
     db_session_module._session_factory = None
     get_settings.cache_clear()
 
 
-def test_finding_cli_admin_grant_writes_no_audit_record(
+def test_finding_cli_admin_grant_now_writes_an_audit_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """VALIDATOR FINDING: the CLI privilege grant is unaudited.
+    """VALIDATOR FINDING, FIXED: the CLI privilege grant used to be unaudited.
 
     `PATCH /admin/users/{u}/role` writes a `user.role_changed` audit record.
     `pacca create-admin` — which mints the highest privilege in the system —
-    writes none. Design spec §3.3 did not require one, so this is an
-    observation about the control's completeness, not a spec violation.
+    used to write none. Design spec §3.3 did not require one, so this was
+    an observation about the control's completeness, not a spec violation —
+    but for a system whose CLAUDE.md calls audit integrity non-negotiable,
+    the one privilege-granting path with no trail was not defensible.
+
+    Now asserts the fix: exactly one `user.role_changed` record, actor
+    identifying the out-of-band CLI grant (prefixed `cli:`, never a bare
+    username — distinguishable from an in-app admin actor at a glance), and
+    details recording the grant came via CLI bootstrap.
     """
     from click.testing import CliRunner
     from sqlalchemy import create_engine as _ce
@@ -658,9 +728,22 @@ def test_finding_cli_admin_grant_writes_no_audit_record(
     )
     assert result.exit_code == 0, result.output
     assert _sql("SELECT role FROM users WHERE username='bootstrap'")[0][0] == "admin"
-    assert _sql("SELECT COUNT(*) FROM audit_logs")[0][0] == 0, (
-        "if this now fails, the CLI grant became audited and the finding was fixed"
+
+    rows = _sql(
+        "SELECT actor, actor_type, details FROM audit_logs WHERE action='user.role_changed'"
     )
+    assert len(rows) == 1, (
+        f"expected exactly one user.role_changed record for the CLI grant, got {rows}"
+    )
+    actor, actor_type, details_raw = rows[0]
+    assert actor.startswith("cli:"), f"actor must identify the CLI grant, got {actor!r}"
+    assert actor_type == "user"
+    # Raw SQL via `_sql()` bypasses the JSON type decorator that applies at
+    # the ORM layer, so `details` comes back as its stored JSON string.
+    details = json.loads(details_raw) if isinstance(details_raw, str) else details_raw
+    assert details["target"] == "bootstrap"
+    assert details["to"] == "admin"
+    assert details["via"] == "cli_bootstrap"
 
     db_session_module._engine = None
     db_session_module._session_factory = None
