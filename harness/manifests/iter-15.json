@@ -90,12 +90,21 @@
         {
           "source": "Adversarial Validator, pre-merge (MEDIUM)",
           "note": "First draft's enforce-mode escalation path returned AuthorizationDecision(status=IN_REVIEW) without calling DecisionRepository.create — GET /review-queue reads persisted IN_REVIEW rows, so the escalated case would never have appeared there: a human review nobody could see. Fixed by persisting before return, mirroring the normal-flow decision write further down this function. NOTE: the pre-existing ScopeViolation handler (same file, ~line 460) has the identical non-persistence defect (confirmed by the Validator) and was deliberately NOT touched here — it is shipped behavior from chg-9/iter-9 and needs its own manifest entry and falsifiable prediction in a future iteration, not a scope-creep fix bundled into chg-20."
+        },
+        {
+          "source": "Adversarial Validator, pre-merge round 2 (MEDIUM)",
+          "note": "The new escalation persist added above was itself the only ungoverned db.write_decision-class call site: the normal-flow persist is preceded by enforce_scope(intent, 'db.write_decision', ...), the escalation persist was not. Practical exposure was near zero (the write uses request.request_id, the exact value the guard checks), but the P-4 guard's value is the invariant that every governed write is wrapped. Fixed by adding the identical enforce_scope call before the escalation persist, same shape/mode as the existing one -- this is now the guard's third db.write_decision-class site (CLAUDE.md's component inventory updated to match, four sites total)."
+        },
+        {
+          "source": "src/pacca/models/enums.py (RAG_DEGRADED docstring) + src/pacca/config/settings.py (rag_degraded_escalates docstring)",
+          "note": "Both docstrings pre-dated the precedents_degraded axis and still described degradation as only 'the pipeline was unavailable or raised, and retrieval fell back' -- code-contradicts-doc per CLAUDE.md's doc-drift rule. Both updated to describe the two independent axes (guideline-mode fallback vs. precedents-only failure with no fallback)."
         }
       ],
       "predicted_fixes": [
         "Every RAG degradation in production now leaves an audit record (action='rag.degraded') regardless of the escalation flag, closing the 'no trace of what context the agent actually saw' gap. The audit details also carry the precedents axis (precedents_degraded/precedents_reason), so a reader can tell which axis of retrieval failed.",
         "Operators can flip rag_degraded_escalates to True at runtime via PATCH /admin/config (ConfigPatchRequest), once they have data on how often degradation fires, with no env change or process restart.",
-        "An escalated RAG-degraded case is persisted and therefore visible on GET /review-queue, not silently dropped."
+        "An escalated RAG-degraded case is persisted and therefore visible on GET /review-queue, not silently dropped.",
+        "The RAG-degraded escalation persist is now scope-guarded like every other db.write_decision call, so a future refactor of this block inherits the P-4 invariant instead of quietly bypassing it."
       ],
       "risk_cases": [
         "If degradation fires far more often than expected (e.g. a flaky embedding function), warn mode means many decisions proceed on fallback context before anyone notices — mitigated by the audit record being written every time, so the rate is observable without needing enforce mode on.",
