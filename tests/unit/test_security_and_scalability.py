@@ -608,6 +608,45 @@ class TestRAGPipelineIntegration:
         assert outcome.reason == "pipeline_unavailable"
         assert "OFFICIAL GUIDELINES" in outcome.text
 
+    def test_precedents_failure_is_visible_even_when_pipeline_is_healthy(self):
+        """
+        Validator finding (HIGH): before this, a raised exception in
+        _query_precedents was swallowed identically to "no precedents
+        matched" -- a total institutional-memory outage on an otherwise
+        healthy pipeline call reported mode="pipeline", degraded=False, with
+        no way to tell it apart from a case with genuinely no precedents.
+
+        Precedents are what /feedback exists to build and what the
+        DecisionAgent prompt explicitly weighs, so losing all of them
+        silently is the same failure class chg-19 closed for guidelines,
+        one layer up.
+        """
+        from pacca.integrations import vector_store as vs_module
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.retrieve_relevant_guidelines_sync.return_value = "NCCN: guidance text."
+
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.side_effect = RuntimeError("chroma precedents down")
+        retriever._pipeline = mock_pipeline
+
+        outcome = retriever.query("Guidelines for C34.1 and J9271")
+
+        # Guideline retrieval itself is genuinely healthy.
+        assert outcome.mode == "pipeline"
+        assert outcome.reason is None
+        assert "guidance text" in outcome.text
+        assert "PRECEDENTS" not in outcome.text
+
+        # But the outcome is no longer falsely reported as fully healthy.
+        assert outcome.degraded is True
+        assert outcome.precedents_degraded is True
+        assert outcome.precedents_reason == "RuntimeError"
+
     def test_add_guideline_upserts_to_collection(self):
         """add_guideline() must call upsert on the guidelines collection."""
         from pacca.integrations import vector_store as vs_module
