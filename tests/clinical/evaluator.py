@@ -43,16 +43,17 @@ Teaching note — judge prompt design:
 """
 
 import json
-import logging
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 from anthropic import AsyncAnthropic
 
-from .golden_cases import GoldenCase
-from .holdout import HELD_OUT_CASE_IDS
+from pacca.config import get_logger
 
-logger = logging.getLogger(__name__)
+from .golden_cases import GoldenCase
+from .holdout import HELD_OUT_CASE_IDS, IN_SAMPLE_CASE_IDS
+
+logger = get_logger(__name__)
 
 # Minimum acceptable accuracy rate for the CI gate
 # If the system scores below this on the golden dataset, CI fails.
@@ -143,17 +144,32 @@ class EvaluationReport:
             f"  Accuracy: {self.accuracy:.1%} "
             f"({self.passed_cases}/{self.total_cases} cases passed)\n"
             f"  CI threshold: {MINIMUM_ACCEPTABLE_ACCURACY:.0%}\n"
-            f"  Accuracy (in-sample):  {self.accuracy_in_sample:.1%} "
-            f"({self.in_sample_passed}/{self.in_sample_total} cases)\n"
-            f"  Accuracy (held-out):   {self.accuracy_held_out:.1%} "
-            f"({self.held_out_passed}/{self.held_out_total} cases)\n"
+            f"  Accuracy (in-sample):  {_render_subset_accuracy(self.accuracy_in_sample, self.in_sample_passed, self.in_sample_total)}\n"
+            f"  Accuracy (held-out):   {_render_subset_accuracy(self.accuracy_held_out, self.held_out_passed, self.held_out_total)}\n"
             f"  Hallucinations detected: {len(self.hallucinations)} cases\n"
             f"  Failed cases: {', '.join(self.failed_cases) if self.failed_cases else 'none'}"
         )
 
 
+def _render_subset_accuracy(accuracy: float, passed: int, total: int) -> str:
+    """
+    Render a subset's accuracy for summary() output.
+
+    "0.0% (0/0 cases)" reads as "evaluated and failed everything" — it is
+    indistinguishable from a real 0% accuracy on a non-empty subset. Render
+    the zero-cases case as "n/a" instead, since no verdicts were ever
+    evaluated for that subset (e.g. accuracy_held_out before any test runs
+    the pipeline over HELD_OUT_CASE_IDS).
+    """
+    if total == 0:
+        return "n/a (0 evaluated)"
+    return f"{accuracy:.1%} ({passed}/{total} cases)"
+
+
 def split_verdicts_by_holdout(
-    verdicts: list[JudgeVerdict], held_out_ids: AbstractSet[str]
+    verdicts: list[JudgeVerdict],
+    held_out_ids: AbstractSet[str],
+    known_ids: AbstractSet[str] | None = None,
 ) -> tuple[int, int, float, int, int, float]:
     """
     Partition verdicts into in-sample vs held-out and compute each subset's
@@ -170,12 +186,34 @@ def split_verdicts_by_holdout(
     Args:
         verdicts:      All verdicts to partition (by `JudgeVerdict.case_id`)
         held_out_ids:  Case ids considered held-out; everything else is in-sample
+        known_ids:     Optional — the full set of valid case ids (in-sample +
+                       held-out combined). When provided, any verdict whose
+                       case_id is in neither `held_out_ids` nor `known_ids`
+                       (e.g. a typo, or a case from a list the split doesn't
+                       know about) is logged as a warning. It still counts
+                       toward in-sample — "not held-out" is the only
+                       determination this function can make on membership
+                       alone — but the mismatch is never silent.
 
     Returns:
         A 6-tuple: (in_sample_total, in_sample_passed, accuracy_in_sample,
         held_out_total, held_out_passed, accuracy_held_out). Accuracy is
         0.0 (not a ZeroDivisionError) for an empty subset.
     """
+    if known_ids is not None:
+        unrecognized = {v.case_id for v in verdicts} - held_out_ids - known_ids
+        for case_id in sorted(unrecognized):
+            logger.warning(
+                "unrecognized_case_id_in_holdout_split",
+                case_id=case_id,
+                reason=(
+                    "case_id is in neither HELD_OUT_CASE_IDS nor the known "
+                    "in-sample/held-out dataset; counted as in-sample by "
+                    "default, but this likely indicates a typo or a case "
+                    "list the holdout split doesn't know about"
+                ),
+            )
+
     in_sample = [v for v in verdicts if v.case_id not in held_out_ids]
     held_out = [v for v in verdicts if v.case_id in held_out_ids]
 
@@ -415,11 +453,7 @@ class ClinicalEvaluator:
             )
 
         except json.JSONDecodeError as e:
-            logger.error(
-                "judge_json_parse_failed: case=%s error=%s",
-                case.case_id,
-                str(e),
-            )
+            logger.error("judge_json_parse_failed", case_id=case.case_id, error=str(e))
             # Return a failing verdict when the judge response is unparseable
             return JudgeVerdict(
                 case_id=case.case_id,
@@ -433,11 +467,7 @@ class ClinicalEvaluator:
             )
 
         except Exception as e:
-            logger.error(
-                "judge_evaluation_failed: case=%s error=%s",
-                case.case_id,
-                str(e),
-            )
+            logger.error("judge_evaluation_failed", case_id=case.case_id, error=str(e))
             return JudgeVerdict(
                 case_id=case.case_id,
                 score=1,
@@ -472,7 +502,9 @@ class ClinicalEvaluator:
             held_out_total,
             held_out_passed,
             accuracy_held_out,
-        ) = split_verdicts_by_holdout(verdicts, HELD_OUT_CASE_IDS)
+        ) = split_verdicts_by_holdout(
+            verdicts, HELD_OUT_CASE_IDS, known_ids=HELD_OUT_CASE_IDS | IN_SAMPLE_CASE_IDS
+        )
 
         return EvaluationReport(
             verdicts=verdicts,

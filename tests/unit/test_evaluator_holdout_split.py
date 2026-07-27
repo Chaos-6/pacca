@@ -21,7 +21,13 @@ the `clinical` marker. They exercise:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import tests.clinical.evaluator as evaluator_module
 from tests.clinical.evaluator import ClinicalEvaluator, JudgeVerdict, split_verdicts_by_holdout
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _verdict(case_id: str, passed: bool) -> JudgeVerdict:
@@ -152,3 +158,83 @@ def test_compile_report_wires_split_without_changing_existing_accuracy() -> None
     summary = report.summary()
     assert "in-sample" in summary.lower()
     assert "held-out" in summary.lower()
+
+
+def test_summary_renders_zero_cases_as_not_available_not_zero_percent() -> None:
+    """
+    "0.0% (0/0 cases)" reads as "evaluated and failed everything" -- a human
+    scanning CI logs can't tell that apart from a real 0% accuracy. When a
+    subset has never been evaluated (today's live gate runs zero held-out
+    cases), the summary must say so explicitly rather than print a
+    misleading 0.0%.
+    """
+    from tests.clinical.holdout import HELD_OUT_CASE_IDS
+
+    in_sample_id = "GC-002"
+    assert in_sample_id not in HELD_OUT_CASE_IDS
+
+    # No held-out case in this run's verdicts -> held_out_total stays 0,
+    # exactly like today's live gate (test_full_pipeline_meets_accuracy_threshold
+    # never touches HELD_OUT_CASE_IDS).
+    verdicts = [_verdict(in_sample_id, passed=True)]
+
+    evaluator = ClinicalEvaluator(api_key="unused-for-compile-report")
+    report = evaluator.compile_report(verdicts)
+
+    assert report.held_out_total == 0
+    summary = report.summary()
+    assert "n/a" in summary.lower()
+    assert "0.0% (0/0 cases)" not in summary
+
+
+def test_split_warns_on_case_id_not_in_held_out_or_known_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A verdict whose case_id is in neither `held_out_ids` nor `known_ids` is
+    still counted in-sample (the function can't do better with membership
+    alone), but the mismatch must never be silent -- it is logged as a
+    warning naming the offending case_id.
+    """
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeLogger:
+        def warning(self, event: str, **kwargs: object) -> None:
+            calls.append((event, kwargs))
+
+    monkeypatch.setattr(evaluator_module, "logger", _FakeLogger())
+
+    verdicts = [_verdict("GC-999", passed=True)]  # not a real dataset id
+    held_out_ids: frozenset[str] = frozenset({"GC-100"})
+    known_ids = frozenset({"GC-001", "GC-100"})  # GC-999 is in neither set
+
+    result = split_verdicts_by_holdout(verdicts, held_out_ids, known_ids=known_ids)
+
+    # Still counted in-sample (only determination possible from membership).
+    assert result[0] == 1  # in_sample_total
+
+    assert len(calls) == 1
+    event, kwargs = calls[0]
+    assert event == "unrecognized_case_id_in_holdout_split"
+    assert kwargs["case_id"] == "GC-999"
+
+
+def test_split_with_known_ids_and_no_unrecognized_ids_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity check: passing known_ids does not warn when every case_id is recognized."""
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _FakeLogger:
+        def warning(self, event: str, **kwargs: object) -> None:
+            calls.append((event, kwargs))
+
+    monkeypatch.setattr(evaluator_module, "logger", _FakeLogger())
+
+    verdicts = [_verdict("GC-001", passed=True), _verdict("GC-100", passed=True)]
+    held_out_ids = frozenset({"GC-100"})
+    known_ids = frozenset({"GC-001", "GC-100"})
+
+    split_verdicts_by_holdout(verdicts, held_out_ids, known_ids=known_ids)
+
+    assert calls == []
