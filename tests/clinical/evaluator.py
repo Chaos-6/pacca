@@ -44,11 +44,13 @@ Teaching note — judge prompt design:
 
 import json
 import logging
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 
 from anthropic import AsyncAnthropic
 
 from .golden_cases import GoldenCase
+from .holdout import HELD_OUT_CASE_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,19 @@ class EvaluationReport:
         passed_ci_gate:  True if accuracy >= MINIMUM_ACCEPTABLE_ACCURACY
         hallucinations:  Cases where agent invented clinical details
         failed_cases:    Case IDs that scored below passing threshold
+        in_sample_total:    Verdicts for cases NOT in the declared holdout
+                            (tests/clinical/holdout.py::HELD_OUT_CASE_IDS)
+        in_sample_passed:   In-sample cases that scored >= MINIMUM_PASSING_SCORE
+        accuracy_in_sample: in_sample_passed / in_sample_total (0.0 if none evaluated)
+        held_out_total:     Verdicts for cases in the declared holdout
+        held_out_passed:    Held-out cases that scored >= MINIMUM_PASSING_SCORE
+        accuracy_held_out:  held_out_passed / held_out_total (0.0 if none evaluated)
+
+    The in-sample/held-out split is reporting only — it does NOT change
+    `accuracy` or `passed_ci_gate`, which remain computed over every verdict
+    exactly as before. See `split_verdicts_by_holdout()` for the pure
+    function that computes the split, and `tests/clinical/holdout.py` for
+    why the split exists and how membership was chosen.
     """
 
     verdicts: list[JudgeVerdict]
@@ -113,6 +128,12 @@ class EvaluationReport:
     passed_ci_gate: bool
     hallucinations: list[str]
     failed_cases: list[str]
+    in_sample_total: int
+    in_sample_passed: int
+    accuracy_in_sample: float
+    held_out_total: int
+    held_out_passed: int
+    accuracy_held_out: float
 
     def summary(self) -> str:
         """Return a human-readable summary for test output."""
@@ -122,9 +143,58 @@ class EvaluationReport:
             f"  Accuracy: {self.accuracy:.1%} "
             f"({self.passed_cases}/{self.total_cases} cases passed)\n"
             f"  CI threshold: {MINIMUM_ACCEPTABLE_ACCURACY:.0%}\n"
+            f"  Accuracy (in-sample):  {self.accuracy_in_sample:.1%} "
+            f"({self.in_sample_passed}/{self.in_sample_total} cases)\n"
+            f"  Accuracy (held-out):   {self.accuracy_held_out:.1%} "
+            f"({self.held_out_passed}/{self.held_out_total} cases)\n"
             f"  Hallucinations detected: {len(self.hallucinations)} cases\n"
             f"  Failed cases: {', '.join(self.failed_cases) if self.failed_cases else 'none'}"
         )
+
+
+def split_verdicts_by_holdout(
+    verdicts: list[JudgeVerdict], held_out_ids: AbstractSet[str]
+) -> tuple[int, int, float, int, int, float]:
+    """
+    Partition verdicts into in-sample vs held-out and compute each subset's
+    pass count and accuracy.
+
+    A pure function over its arguments — no dataset import, no API calls —
+    so it can be unit-tested with synthetic `JudgeVerdict`s and an arbitrary
+    `held_out_ids` set (see tests/unit/test_evaluator_holdout_split.py).
+    `compile_report()` calls this with the real
+    `tests.clinical.holdout.HELD_OUT_CASE_IDS`; the split does not affect
+    `EvaluationReport.accuracy` or `passed_ci_gate`, which are still computed
+    over every verdict exactly as before this feature was added.
+
+    Args:
+        verdicts:      All verdicts to partition (by `JudgeVerdict.case_id`)
+        held_out_ids:  Case ids considered held-out; everything else is in-sample
+
+    Returns:
+        A 6-tuple: (in_sample_total, in_sample_passed, accuracy_in_sample,
+        held_out_total, held_out_passed, accuracy_held_out). Accuracy is
+        0.0 (not a ZeroDivisionError) for an empty subset.
+    """
+    in_sample = [v for v in verdicts if v.case_id not in held_out_ids]
+    held_out = [v for v in verdicts if v.case_id in held_out_ids]
+
+    in_sample_total = len(in_sample)
+    in_sample_passed = sum(1 for v in in_sample if v.passed)
+    accuracy_in_sample = in_sample_passed / in_sample_total if in_sample_total > 0 else 0.0
+
+    held_out_total = len(held_out)
+    held_out_passed = sum(1 for v in held_out if v.passed)
+    accuracy_held_out = held_out_passed / held_out_total if held_out_total > 0 else 0.0
+
+    return (
+        in_sample_total,
+        in_sample_passed,
+        accuracy_in_sample,
+        held_out_total,
+        held_out_passed,
+        accuracy_held_out,
+    )
 
 
 # =============================================================================
@@ -395,6 +465,15 @@ class ClinicalEvaluator:
         hallucination_cases = [v.case_id for v in verdicts if v.hallucination_detected]
         failed_cases = [v.case_id for v in verdicts if not v.passed]
 
+        (
+            in_sample_total,
+            in_sample_passed,
+            accuracy_in_sample,
+            held_out_total,
+            held_out_passed,
+            accuracy_held_out,
+        ) = split_verdicts_by_holdout(verdicts, HELD_OUT_CASE_IDS)
+
         return EvaluationReport(
             verdicts=verdicts,
             total_cases=total,
@@ -403,4 +482,10 @@ class ClinicalEvaluator:
             passed_ci_gate=accuracy >= MINIMUM_ACCEPTABLE_ACCURACY,
             hallucinations=hallucination_cases,
             failed_cases=failed_cases,
+            in_sample_total=in_sample_total,
+            in_sample_passed=in_sample_passed,
+            accuracy_in_sample=accuracy_in_sample,
+            held_out_total=held_out_total,
+            held_out_passed=held_out_passed,
+            accuracy_held_out=accuracy_held_out,
         )
