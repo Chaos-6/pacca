@@ -80,9 +80,11 @@ every PR is one path or the other, never ambiguous.
   `enforce_scope(intent, action, **call_args)`, a fail-closed call-site *wrapper*
   (there is no middleware loader) that denies out-of-scope tool/DB/RAG calls against
   the `IntentRecord` and raises `ScopeViolation` → `EscalationReason.SCOPE_VIOLATION`.
-  **As built (chg-8 → chg-9):** wired into the submit route in **enforce** mode at three
-  sites — the two identifier-checked DB writes (`db.write_request`, `db.write_decision`)
-  and the RAG query. A cross-case leak fail-closes to human review. In correct operation
+  **As built (chg-8 → chg-9, +1 call site at chg-20):** wired into the submit route in
+  **enforce** mode at four sites — three identifier-checked DB writes (`db.write_request`;
+  `db.write_decision` at the normal-flow persist; `db.write_decision` again at the
+  RAG-degraded escalation persist) and the RAG query. A cross-case leak fail-closes to
+  human review. In correct operation
   the run always passes its own scope, so it does not deny in normal flow — its value is
   fail-closed defense against a leak/bug. Mode is `settings.scope_guard_mode`.
 - `src/pacca/integrations/vector_store.py` — `GuidelineRetriever`, the **live**
