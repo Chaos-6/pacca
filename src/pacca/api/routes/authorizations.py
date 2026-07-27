@@ -29,7 +29,15 @@ from ...agents.orchestrator import DecisionContext, Orchestrator
 
 # Minimum-necessary scope guard (P-4 / chg-8) + the fail-closed escalation path.
 from ...agents.scope_guard import ScopeViolation, enforce_scope
-from ...config.settings import get_settings
+
+# get_settings() is the cached, process-start snapshot; effective_settings()
+# merges the PATCH /config runtime-override store on top of it (the repo
+# convention for tunables — see orchestrator.py, clinical_risk_detector.py,
+# base.py). rag_degraded_escalates (chg-20) reads effective_settings() so it
+# is genuinely flippable via PATCH /config without an env change + restart.
+# scope_guard_mode below still reads get_settings() — a pre-existing pattern
+# in this file, out of scope for chg-20 to change.
+from ...config.settings import effective_settings, get_settings
 
 # The repository that writes audit records.
 # A "repository" is a design pattern that wraps all database operations
@@ -327,6 +335,11 @@ async def submit_authorization(
         # how often this fires, and jumping straight to enforce risks flooding
         # the human review queue — its own safety problem.
         if retrieval.degraded:
+            # Covers BOTH degradation axes: mode != "pipeline" (guideline
+            # retrieval fell back) and precedents_degraded (institutional
+            # memory failed during an otherwise-healthy pipeline call) —
+            # RetrievalOutcome.degraded is True for either, and the audit
+            # record always carries both so a reader can tell which one fired.
             await audit.log(
                 action="rag.degraded",
                 actor="rag",
@@ -335,10 +348,18 @@ async def submit_authorization(
                 correlation_id=correlation_id,
                 success=False,
                 output_summary=f"RAG retrieval degraded (mode={retrieval.mode})",
-                details={"mode": retrieval.mode, "reason": retrieval.reason},
+                details={
+                    "mode": retrieval.mode,
+                    "reason": retrieval.reason,
+                    "precedents_degraded": retrieval.precedents_degraded,
+                    "precedents_reason": retrieval.precedents_reason,
+                },
             )
 
-            if get_settings().rag_degraded_escalates:
+            # effective_settings() (not get_settings()) so this flag is
+            # genuinely tunable via PATCH /config at runtime, not just an env
+            # var read once at process start.
+            if effective_settings().rag_degraded_escalates:
                 duration_ms = int((time.time() - start_time) * 1000)
                 await audit.log(
                     action="escalation_human_review_required",
@@ -355,9 +376,11 @@ async def submit_authorization(
                         "escalation_reason": EscalationReason.RAG_DEGRADED.value,
                         "mode": retrieval.mode,
                         "reason": retrieval.reason,
+                        "precedents_degraded": retrieval.precedents_degraded,
+                        "precedents_reason": retrieval.precedents_reason,
                     },
                 )
-                return AuthorizationDecision(
+                escalated_decision = AuthorizationDecision(
                     decision_id=f"RAGDEGRADED-{request.request_id}-{int(time.time())}",
                     status=AuthorizationStatus.IN_REVIEW,
                     confidence_score=0.0,
@@ -368,6 +391,18 @@ async def submit_authorization(
                     ),
                     review_tier_used=ReviewTier.HUMAN,
                 )
+                # Persist the escalated decision — without this, the case is
+                # routed to human review but never lands in the
+                # authorization_decisions table, so GET /review-queue (which
+                # reads persisted IN_REVIEW rows) can never surface it: a
+                # human review nobody can see. Same fix as any other IN_REVIEW
+                # outcome further down this function.
+                await DecisionRepository(session).create(
+                    escalated_decision,
+                    request_id=request.request_id,
+                    processing_time_ms=duration_ms,
+                )
+                return escalated_decision
 
         # ── ORCHESTRATOR: Run the AI decision pipeline ────────────────────────
         # DecisionContext bundles the case + retrieved guidelines together.
