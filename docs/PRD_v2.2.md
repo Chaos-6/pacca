@@ -322,7 +322,7 @@ async def login(
     result = await session.execute(select(User).where(User.username == credentials.username))
 ```
 
-The legacy sync `SessionLocal` (from `api/database.py`) is used only for `Base.metadata.create_all()` at startup. Zero route handlers use the sync session.
+The `users` table shares the single async engine with every other table — there is no separate sync engine or session. Schema for all tables (including `users`) is built by Alembic migrations (`alembic upgrade head`, applied at deploy by `docker-entrypoint.sh`), not by `create_all` at startup (C5 — Alembic is the single schema source).
 
 **Connection pooling** (`db/session.py`):
 ```python
