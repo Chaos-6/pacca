@@ -60,18 +60,22 @@ class Settings(BaseSettings):
     rag_degraded_escalates: bool = Field(
         default=False,
         description=(
-            "When a RAG retrieval degrades to the direct-ChromaDB fallback "
-            "(GuidelineRetriever.query() reports RetrievalOutcome.degraded=True), "
-            "should the case be forced to human review? Default False (warn): the "
-            "degradation is always audited (action='rag.degraded') and logged, but "
-            "the decision proceeds on the fallback context. True (enforce): the case "
-            "is routed to AuthorizationStatus.IN_REVIEW / ReviewTier.HUMAN instead. "
-            "This mirrors the P-4 scope guard's own iter-8 -> iter-9 rollout: land "
-            "in warn mode, observe how often degradation actually fires in "
-            "production, then promote to fail-closed in a later iteration. Jumping "
-            "straight to enforce risks flooding the human review queue on a "
-            "condition nobody has measured yet — that queue-flood risk is itself a "
-            "safety problem, not just an inconvenience."
+            "When GuidelineRetriever.query() reports RetrievalOutcome.degraded=True "
+            "— EITHER guideline retrieval fell back to the direct-ChromaDB path "
+            "(RetrievalOutcome.mode != 'pipeline'), OR the precedents collection "
+            "raised during an otherwise-healthy pipeline call "
+            "(RetrievalOutcome.precedents_degraded, no guideline fallback involved) "
+            "— should the case be forced to human review? Default False (warn): the "
+            "degradation is always audited (action='rag.degraded', details carry "
+            "both axes) and logged, but the decision proceeds on the retrieved "
+            "context as-is. True (enforce): the case is routed to "
+            "AuthorizationStatus.IN_REVIEW / ReviewTier.HUMAN instead. This mirrors "
+            "the P-4 scope guard's own iter-8 -> iter-9 rollout: land in warn mode, "
+            "observe how often degradation actually fires in production, then "
+            "promote to fail-closed in a later iteration. Jumping straight to "
+            "enforce risks flooding the human review queue on a condition nobody "
+            "has measured yet — that queue-flood risk is itself a safety problem, "
+            "not just an inconvenience."
         ),
     )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
