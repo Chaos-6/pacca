@@ -5,12 +5,12 @@
   "author": "David Reed",
   "base_model": "claude-sonnet-4-5-20250929",
   "previous_iteration_tag": "harness-iter-14",
-  "summary": "Closes the silent-fallback pattern iter-14 fixed one instance of. chg-19: GuidelineRetriever.query() returns a structured RetrievalOutcome (text, mode, degraded, reason) instead of a bare str, making a RAGPipeline failure visible to the caller instead of only a log line. chg-20: the submit route always audits a degraded retrieval and, behind a warn-by-default flag, can force human review instead of letting the DecisionAgent reason over unverified fallback context.",
+  "summary": "Closes the silent-fallback pattern iter-14 fixed one instance of. chg-19: GuidelineRetriever.query() returns a RetrievalOutcome instead of a str, covering guideline-retrieval fallback and a separate precedents-failure axis, so degradation is visible instead of only a log line. chg-20: the submit route always audits a degraded retrieval and, behind a PATCH-/config-tunable warn-default flag, can force human review with a persisted decision instead of reasoning over unverified fallback context.",
   "changes": [
     {
       "id": "chg-19",
       "type": "improvement",
-      "description": "GuidelineRetriever.query() returns RetrievalOutcome(text, mode, degraded, reason) instead of a bare str. mode is 'pipeline' (intended path), 'direct_fallback' (pipeline unavailable/raised, fallback found something), or 'empty' (fallback found nothing in either collection). reason is the exception TYPE name only, never the raw message.",
+      "description": "GuidelineRetriever.query() returns RetrievalOutcome(text, mode, degraded, reason, precedents_degraded, precedents_reason) instead of a bare str. mode is pipeline (intended path), direct_fallback (pipeline unavailable/raised, fallback found something), or empty (fallback found nothing). reason is the exception TYPE name only, never the raw message. precedents_degraded/precedents_reason track precedent retrieval failing during an otherwise-healthy pipeline call.",
       "files": [
         "src/pacca/integrations/vector_store.py",
         "src/pacca/api/routes/authorizations.py",
@@ -34,12 +34,17 @@
         {
           "source": "tests/unit/test_security_and_scalability.py::TestRAGPipelineIntegration::test_guideline_retriever_reason_never_carries_raw_exception_text",
           "note": "Regression guard: a synthetic PHI-like exception message is asserted absent from RetrievalOutcome.reason — only the exception's type name crosses the boundary that chg-20 writes into an audit record."
+        },
+        {
+          "source": "tests/unit/test_security_and_scalability.py::TestRAGPipelineIntegration::test_precedents_failure_is_visible_even_when_pipeline_is_healthy",
+          "note": "Adversarial-Validator finding (HIGH, pre-merge): the first draft of this change surfaced guideline-retrieval degradation but left _query_precedents' own except-and-swallow untouched, so a total precedents outage on an otherwise-healthy pipeline call still reported mode='pipeline', degraded=False. Fixed by threading a (text, failure_reason) result out of _query_precedents into the new precedents_degraded/precedents_reason fields."
         }
       ],
       "predicted_fixes": [
         "A RAGPipeline failure (ChromaDB error, embedding-function exception, any future exception in the retrieval path) is now distinguishable from a healthy retrieval by mode/degraded on the return value, not just a log line.",
         "An unseeded or genuinely empty retrieval (mode='empty') is distinguishable from a real fallback that found something (mode='direct_fallback'), so an operator reading audit records can tell 'degraded but real context' from 'the agent decided on nothing'.",
-        "Every existing call site of query() (7 files found by repo-wide grep) is updated in the same change, per repo lesson P-005 on contract changes."
+        "Every existing call site of query() (7 files found by repo-wide grep) is updated in the same change, per repo lesson P-005 on contract changes.",
+        "A precedents-collection-only failure during a healthy pipeline call now flips RetrievalOutcome.degraded to True via precedents_degraded, instead of being indistinguishable from 'no precedents matched'."
       ],
       "risk_cases": [
         "Any call site not caught by the grep for '.query(' would silently break (AttributeError on .text) rather than degrade gracefully — mitigated by grepping the whole repo, not just files already open.",
@@ -54,11 +59,12 @@
     {
       "id": "chg-20",
       "type": "new",
-      "description": "The submit route audits every degraded RetrievalOutcome (action='rag.degraded') before proceeding, and a new settings.rag_degraded_escalates flag (default False) can force the case to human review (IN_REVIEW/HUMAN, EscalationReason.RAG_DEGRADED) instead of letting the DecisionAgent reason over unverified fallback context.",
+      "description": "The submit route audits every degraded RetrievalOutcome (action=rag.degraded, details cover both the guideline-mode axis and the precedents axis) before proceeding. A new settings.rag_degraded_escalates flag (default False, read via effective_settings, patchable through PATCH /config) can force human review (IN_REVIEW/HUMAN, EscalationReason.RAG_DEGRADED) instead of reasoning over unverified fallback context. The escalated decision is persisted so it is visible on GET /review-queue.",
       "files": [
         "src/pacca/config/settings.py",
         "src/pacca/models/enums.py",
         "src/pacca/api/routes/authorizations.py",
+        "src/pacca/api/routes/admin.py",
         "tests/unit/test_effective_settings.py",
         "tests/unit/test_audit_trail.py"
       ],
@@ -71,22 +77,36 @@
         },
         {
           "source": "tests/unit/test_audit_trail.py::TestAuditTrailWiring::test_rag_degraded_escalates_to_human_review_when_flag_enabled",
-          "note": "Drives the real submit_authorization handler with a degraded RetrievalOutcome and rag_degraded_escalates=True; asserts IN_REVIEW/HUMAN, the escalation audit record, and that the orchestrator never runs."
+          "note": "Drives the real submit_authorization handler with a degraded RetrievalOutcome and rag_degraded_escalates=True (flipped via apply_overrides, the same runtime path PATCH /config uses); asserts IN_REVIEW/HUMAN, the escalation audit record, that the orchestrator never runs, AND that DecisionRepository.create persists the escalated decision (see the two Validator findings below)."
+        },
+        {
+          "source": "tests/unit/test_audit_trail.py::TestAuditTrailWiring::test_rag_healthy_with_escalation_flag_enabled_does_not_escalate",
+          "note": "Adversarial-Validator-requested guard: rag_degraded_escalates=True with a healthy RetrievalOutcome must produce zero rag.degraded / escalation records — the predicate does not fire on the happy path."
+        },
+        {
+          "source": "Adversarial Validator, pre-merge (MEDIUM)",
+          "note": "First draft read this flag via get_settings() (the cached, process-start snapshot) and did not expose it on ConfigPatchRequest, so 'operators can flip it without another code change' was only true in the env-var-plus-restart sense. Fixed: the route now reads effective_settings(), and admin.py's ConfigPatchRequest gained the field (one line, src/pacca/api/routes/admin.py) so PATCH /config actually works."
+        },
+        {
+          "source": "Adversarial Validator, pre-merge (MEDIUM)",
+          "note": "First draft's enforce-mode escalation path returned AuthorizationDecision(status=IN_REVIEW) without calling DecisionRepository.create — GET /review-queue reads persisted IN_REVIEW rows, so the escalated case would never have appeared there: a human review nobody could see. Fixed by persisting before return, mirroring the normal-flow decision write further down this function. NOTE: the pre-existing ScopeViolation handler (same file, ~line 460) has the identical non-persistence defect (confirmed by the Validator) and was deliberately NOT touched here — it is shipped behavior from chg-9/iter-9 and needs its own manifest entry and falsifiable prediction in a future iteration, not a scope-creep fix bundled into chg-20."
         }
       ],
       "predicted_fixes": [
-        "Every RAG degradation in production now leaves an audit record (action='rag.degraded') regardless of the escalation flag, closing the 'no trace of what context the agent actually saw' gap.",
-        "Operators can flip rag_degraded_escalates to True once they have data on how often degradation fires, without another code change."
+        "Every RAG degradation in production now leaves an audit record (action='rag.degraded') regardless of the escalation flag, closing the 'no trace of what context the agent actually saw' gap. The audit details also carry the precedents axis (precedents_degraded/precedents_reason), so a reader can tell which axis of retrieval failed.",
+        "Operators can flip rag_degraded_escalates to True at runtime via PATCH /admin/config (ConfigPatchRequest), once they have data on how often degradation fires, with no env change or process restart.",
+        "An escalated RAG-degraded case is persisted and therefore visible on GET /review-queue, not silently dropped."
       ],
       "risk_cases": [
         "If degradation fires far more often than expected (e.g. a flaky embedding function), warn mode means many decisions proceed on fallback context before anyone notices — mitigated by the audit record being written every time, so the rate is observable without needing enforce mode on.",
-        "Flipping rag_degraded_escalates to True without first observing production rates could flood the human review queue, per the same risk the P-4 scope guard rollout was designed against — this is why the default stays False here."
+        "Flipping rag_degraded_escalates to True without first observing production rates could flood the human review queue, per the same risk the P-4 scope guard rollout was designed against — this is why the default stays False here.",
+        "The pre-existing ScopeViolation escalation path (same file) shares the non-persistence defect this change fixed for its own path; it was not fixed here (out of scope per the Validator's explicit instruction) and remains a known gap until it gets its own iteration."
       ],
       "constraint_level": "escalation_branch",
       "why_this_component": "This is a new deterministic pre-agent short-circuit in the 7-branch escalation tree's spirit (though it lives in the route rather than the orchestrator, matching where the RAG query itself happens, before DecisionContext is built) — the same constraint level as SCOPE_VIOLATION, not a tool or prompt change.",
       "phi_impact": "none",
       "audit_relevant": true,
-      "rollback_plan": "Revert all three files together (settings.py, enums.py, authorizations.py each landed as their own commit). Reverting only settings.py would leave a dangling EscalationReason.RAG_DEGRADED reference in authorizations.py; revert the full set."
+      "rollback_plan": "Revert settings.py, enums.py, authorizations.py, and admin.py together (each landed as its own commit). Reverting only settings.py would leave a dangling EscalationReason.RAG_DEGRADED reference in authorizations.py; reverting admin.py alone would leave a PATCH /config field with no backing setting. Revert the full set or not at all."
     }
   ]
 }
