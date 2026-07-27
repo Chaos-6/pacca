@@ -59,6 +59,8 @@ from ...models.enums import AuthorizationStatus, EscalationReason, ReviewTier
 # The per-run intent contract (P-3 / chg-7): declared and audited at run start.
 from ...models.intent import IntentRecord
 from ..auth import verify_token
+from ..models.user import User
+from ..rbac import Role, require_min_role
 
 router = APIRouter()
 
@@ -67,6 +69,11 @@ router = APIRouter()
 # initializing the LLM client and RAG engine has overhead.
 orchestrator = Orchestrator()
 rag_engine = GuidelineRetriever()
+
+# require_min_role(...) is a dependency FACTORY — bound once here (rather than
+# called inline inside each Depends(...) default below) so it is evaluated a
+# single time at import, not once per route definition.
+_require_medical_director = require_min_role(Role.MEDICAL_DIRECTOR)
 
 
 class FeedbackRequest(BaseModel):
@@ -130,6 +137,10 @@ async def get_review_queue(
     limit: int = 50,
     session: AsyncSession = Depends(get_session),
     _user: str = Depends(verify_token),
+    # Per-endpoint medical_director floor, IN ADDITION to the router-wide
+    # clinician guard in main.py (§2 of the RBAC design) — a clinician token
+    # passes the router-wide check but must still 403 here.
+    _role: User = Depends(_require_medical_director),
 ) -> ReviewQueueResponse:
     """
     List the cases the agent escalated to a human Medical Director.
@@ -418,6 +429,9 @@ async def submit_authorization(
 async def learn_from_feedback(
     feedback: FeedbackRequest,
     session: AsyncSession = Depends(get_session),
+    # Per-endpoint medical_director floor, IN ADDITION to the router-wide
+    # clinician guard in main.py (§2 of the RBAC design).
+    _role: User = Depends(_require_medical_director),
 ):
     """
     Level 4 Learning Loop: teach the system from human override decisions.

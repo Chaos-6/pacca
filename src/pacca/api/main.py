@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, status
 from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 
 # Observability
@@ -43,12 +43,14 @@ from .auth import (
     get_password_hash,
     validate_secret_key,
     verify_password,
-    verify_token,
 )
 
 # Middleware
 from .middleware import SecurityHeadersMiddleware
 from .models import User as SyncUser  # SQLAlchemy model for the users table
+
+# RBAC (see api/rbac.py) — DB is the source of truth for role, never the JWT.
+from .rbac import DEFAULT_ROLE, Role, require_min_role
 
 # Route modules
 from .routes import admin, authorizations, sme_authoring
@@ -159,21 +161,24 @@ app.add_middleware(
 )
 
 # ── Route registration ────────────────────────────────────────────────────────
+# Router-wide minimum role. Note this is now `require_min_role`, not the bare
+# `verify_token` identity check — see api/rbac.py for why the database (not a
+# JWT claim) is the source of truth for role.
 app.include_router(
     authorizations.router,
     prefix="/api/v1/authorizations",
-    dependencies=[Depends(verify_token)],
+    dependencies=[Depends(require_min_role(Role.CLINICIAN))],
     tags=["Authorizations"],
 )
 app.include_router(
     admin.router,
     prefix="/api/v1/admin",
-    dependencies=[Depends(verify_token)],
+    dependencies=[Depends(require_min_role(Role.ADMIN))],
     tags=["Admin — Configuration & Operations"],
 )
 
 # SME Case Authoring Web UI backend (v1.1, PR-WUI-1).
-# Auth is enforced per-endpoint via Depends(verify_token) inside the
+# Auth is enforced per-endpoint via Depends(require_min_role(...)) inside the
 # router module rather than as a router-wide dependency, because the
 # WebSocket endpoint needs its own auth-via-first-message protocol.
 app.include_router(sme_authoring.router)
@@ -200,7 +205,18 @@ async def sme_draft_stream(websocket: "WebSocket", session_id: str) -> None:
 
 
 class UserCreate(BaseModel):
-    """Request body for user registration."""
+    """
+    Request body for user registration.
+
+    `extra="forbid"` is a deliberate privilege-escalation guard: registration
+    is ALWAYS forced to `DEFAULT_ROLE` (clinician) — see `register_user`
+    below — so a client that includes a `"role"` key in the body (hoping it
+    is silently accepted or silently ignored) must instead get a 422. Silent
+    ignore would be a worse failure mode than a loud rejection: it would look
+    to the caller like the role was accepted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     username: str
     password: str
@@ -244,7 +260,14 @@ async def register_user(
         )
 
     hashed_password = get_password_hash(user.password)
-    new_user = SyncUser(username=user.username, hashed_password=hashed_password)
+    # Role is ALWAYS DEFAULT_ROLE here, set explicitly rather than relying on
+    # the column's server_default — registration must never be able to create
+    # anything but a clinician account (see UserCreate's extra="forbid").
+    new_user = SyncUser(
+        username=user.username,
+        hashed_password=hashed_password,
+        role=DEFAULT_ROLE.value,
+    )
     session.add(new_user)
     # session is committed automatically when the request ends (get_session handles this)
 

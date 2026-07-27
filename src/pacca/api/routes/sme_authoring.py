@@ -12,7 +12,10 @@ and the Web UI are two surfaces over one core.
 DESIGN
 ======
 
-- All endpoints require JWT auth via `verify_token` dependency.
+- All endpoints require `medical_director`-or-above via `require_min_role`
+  (RBAC — see `src/pacca/api/rbac.py`). Case authoring is an SME workflow;
+  a plain clinician token is not sufficient here even though it clears the
+  `/api/v1/authorizations/*` router-wide floor.
 - Request/response shapes live in `src/pacca/api/models/sme_authoring.py`.
 - Errors surface as `HTTPException(detail=...)` per the existing PACCA
   pattern; the frontend parses `{"detail": "..."}`.
@@ -33,6 +36,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import uuid_extensions
 from fastapi import APIRouter, Depends, HTTPException
@@ -82,7 +86,6 @@ from pacca.agents.sme_authoring.session import (
 )
 from pacca.agents.sme_authoring.test_runner import run_integrity_tests
 from pacca.agents.sme_authoring.validators import run_all_validators
-from pacca.api.auth import verify_token
 from pacca.api.models.sme_authoring import (
     BatchCaseItem,
     BatchItem,
@@ -101,8 +104,17 @@ from pacca.api.models.sme_authoring import (
     ValidateRequest,
     ValidateResponse,
 )
+from pacca.api.rbac import Role, require_min_role
+
+if TYPE_CHECKING:
+    from pacca.api.models.user import User
 
 router = APIRouter(prefix="/api/v1/sme-authoring", tags=["sme-authoring"])
+
+# require_min_role(...) is a dependency FACTORY — bound once here (rather
+# than called inline inside each Depends(...) default below) so it is
+# evaluated a single time at import, not once per route definition.
+_require_medical_director = require_min_role(Role.MEDICAL_DIRECTOR)
 
 
 # =============================================================================
@@ -136,7 +148,7 @@ def _safe_load_session(session_id: str) -> SessionState:
 @router.post("/sessions", response_model=SessionResponse, status_code=201)
 async def create_session(
     request: CreateSessionRequest,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> SessionResponse:
     """
     Start a new SME-authoring session.
@@ -164,7 +176,7 @@ async def create_session(
 
 @router.get("/sessions", response_model=SessionListResponse)
 async def list_sessions_endpoint(
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> SessionListResponse:
     """List all saved SME-authoring sessions (most-recent first)."""
     sessions = list_sessions()
@@ -174,7 +186,7 @@ async def list_sessions_endpoint(
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
 async def get_session_endpoint(
     session_id: str,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> SessionResponse:
     """Get a single session's full state."""
     return _to_session_response(_safe_load_session(session_id))
@@ -183,7 +195,7 @@ async def get_session_endpoint(
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_session_endpoint(
     session_id: str,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> None:
     """Delete a session. Releases any pending case-ID reservation."""
     state = _safe_load_session(session_id)
@@ -200,7 +212,7 @@ async def delete_session_endpoint(
 @router.post("/sessions/{session_id}/draft", response_model=DraftResponse)
 async def draft_case_endpoint(
     session_id: str,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> DraftResponse:
     """
     Synchronously draft a case via the LLM agent (buffered response).
@@ -297,7 +309,7 @@ def _routing_placeholder(allocated_id: str, state: SessionState) -> CaseDraftRes
 async def validate_session_endpoint(
     session_id: str,
     request: ValidateRequest,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> ValidateResponse:
     """
     Run all 6 deterministic validators against the session's draft.
@@ -346,7 +358,7 @@ async def validate_session_endpoint(
 async def commit_session_endpoint(
     session_id: str,
     request: CommitRequest,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> CommitResponse:
     """
     Write the case to disk + update companion docs + run integrity tests.
@@ -475,7 +487,7 @@ async def commit_session_endpoint(
 
 @router.get("/status", response_model=StatusResponse)
 async def status_endpoint(
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> StatusResponse:
     """Dataset-state snapshot for the Dashboard page."""
     snapshot = read_coverage()
@@ -517,7 +529,7 @@ async def status_endpoint(
 
 @router.get("/batches", response_model=BatchListResponse)
 async def list_batches_endpoint(
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> BatchListResponse:
     """List all roadmap batches from DATASET_GROWTH_ROADMAP.md."""
     batches = read_batches()
@@ -528,7 +540,7 @@ async def list_batches_endpoint(
 @router.get("/batches/{batch_id}", response_model=BatchResponse)
 async def get_batch_endpoint(
     batch_id: str,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> BatchResponse:
     """Get a single batch's case-slot manifest."""
     batch = get_batch(batch_id)
@@ -558,7 +570,7 @@ def _to_batch_item(batch: object) -> BatchItem:
 @router.get("/gaps", response_model=GapListResponse)
 async def list_gaps_endpoint(
     top: int = 10,
-    user: str = Depends(verify_token),
+    user: User = Depends(_require_medical_director),
 ) -> GapListResponse:
     """List prioritized coverage gaps. `top` limits the response size."""
     gaps = compute_gaps()

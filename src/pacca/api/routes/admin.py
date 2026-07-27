@@ -42,8 +42,10 @@ Teaching note — runtime config vs. environment variables:
   no-restart override for operational urgency.
 """
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...agents.evolution import (
     EvolutionAgent,
@@ -61,7 +63,11 @@ from ...config.settings import (
     clear_all_overrides,
     effective_settings,
 )
+from ...db.repository import AuditRepository
+from ...db.session import get_session
 from ...integrations.vector_store import GuidelineRetriever
+from ..models.user import User
+from ..rbac import Role, get_current_user
 
 logger = get_logger(__name__)
 
@@ -387,6 +393,92 @@ async def get_metrics() -> MetricsResponse:
             "Traces available at http://localhost:3001 — login: admin@pacca.local / pacca_admin_dev"
         ),
     )
+
+
+# =============================================================================
+# Role management (RBAC — see pacca.api.rbac)
+# =============================================================================
+
+
+class RoleUpdateRequest(BaseModel):
+    """Body for PATCH /users/{username}/role — the new role for the target user."""
+
+    role: Role
+
+
+class RoleUpdateResponse(BaseModel):
+    """Confirms the role change that was applied."""
+
+    username: str
+    previous_role: str
+    role: str
+
+
+@router.patch(
+    "/users/{username}/role",
+    response_model=RoleUpdateResponse,
+    summary="Change a user's role (admin only)",
+    description=(
+        "Promotes or demotes a user to clinician/medical_director/admin. Requires "
+        "admin (enforced by the router-wide dependency in main.py — invalid role "
+        "values 422 via Pydantic before this body even runs). Refuses (409) to "
+        "demote the only remaining admin — locking every operator out of this API "
+        "during an incident is a worse outcome than a refused request. Every "
+        "change is audited as `user.role_changed` BEFORE the row is updated, "
+        "matching the repo's pre-write-audit convention (see AuditRepository / "
+        "the submit route in routes/authorizations.py)."
+    ),
+)
+async def update_user_role(
+    username: str,
+    body: RoleUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+    acting_user: User = Depends(get_current_user),
+) -> RoleUpdateResponse:
+    """Change `username`'s role. See RBAC design §4.1 for the full contract."""
+    result = await session.execute(select(User).where(User.username == username))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+
+    previous_role = target.role
+    new_role = body.role
+
+    # Last-admin guard: refuse to demote the only remaining admin. A locked-out
+    # config API during a security incident is worse than a refused request.
+    if previous_role == Role.ADMIN.value and new_role != Role.ADMIN:
+        admin_count = (
+            await session.execute(
+                select(func.count()).select_from(User).where(User.role == Role.ADMIN.value)
+            )
+        ).scalar_one()
+        if admin_count <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot demote the only remaining admin.",
+            )
+
+    # Pre-write audit: recorded BEFORE the state change (repo convention — see
+    # AuditRepository callers in routes/authorizations.py).
+    await AuditRepository(session).log(
+        action="user.role_changed",
+        actor=acting_user.username,
+        actor_type="user",
+        details={"target": username, "from": previous_role, "to": new_role.value},
+    )
+
+    target.role = new_role.value
+    await session.flush()
+
+    logger.info(
+        "user_role_changed",
+        target=username,
+        previous_role=previous_role,
+        new_role=new_role.value,
+        actor=acting_user.username,
+    )
+
+    return RoleUpdateResponse(username=username, previous_role=previous_role, role=new_role.value)
 
 
 # =============================================================================
