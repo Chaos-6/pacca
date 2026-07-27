@@ -67,12 +67,56 @@ exists to prevent, and guard test #1 will fail the build, by design.
 per-subset counts), computed by the pure function `split_verdicts_by_holdout()`
 over whatever verdicts a run produces. This is reporting only: the existing
 `accuracy` and `passed_ci_gate` fields — and the 80% CI-gate threshold — are
-still computed over every verdict exactly as before. **As built**, the live
-gate (`test_full_pipeline_meets_accuracy_threshold`) does not yet evaluate the
-held-out cases at all, so `accuracy_held_out` reports `0/0` until a future
-iteration wires the holdout into an actual evaluation run (see the "Unified
-benchmark of 100+ cases" Phase H5 item below) — this split is the reporting
-plumbing for that, added ahead of the run it will eventually score.
+still computed over every verdict exactly as before, byte-for-byte.
+
+**The held-out cases are now actually evaluated.** A dedicated
+`@pytest.mark.clinical` test, `test_held_out_accuracy_report`
+(`tests/clinical/test_clinical_accuracy.py::TestFullClinicalEvaluation`),
+runs the real pipeline (pre-flight → Decision Agent → LLM judge — the same
+`_run_cases_through_pipeline()` helper the golden-set gate uses, so the two
+paths can't silently drift apart) over `held_out_cases()` and reports
+`accuracy_held_out`. Run it with:
+
+```bash
+make test-holdout    # requires ANTHROPIC_API_KEY; not a CI gate; ~1 minute
+```
+
+It skips cleanly (like every other `clinical`-marked test) when
+`ANTHROPIC_API_KEY` is unset, so `make test` stays fast and green.
+`tests/unit/test_held_out_pipeline_wiring.py` is the fast, fully-mocked
+regression proof that this test genuinely iterates all 32 declared ids and
+produces a non-empty held-out denominator — it runs in `make test`, with
+zero API calls, and would fail if a future refactor broke the wiring.
+
+**Deliberately NOT a blocking gate — yet.** `test_held_out_accuracy_report`
+asserts only that all 32 cases were evaluated (a wiring sanity check, not an
+accuracy threshold). There is no accuracy floor asserted on
+`accuracy_held_out`, because there is no established out-of-sample baseline
+to gate against on this test's first-ever run — picking a threshold now would
+be a unilateral policy call, not an engineering one. This follows the repo's
+own **warn-then-enforce precedent**: the P-4 scope guard
+(`src/pacca/agents/scope_guard.py`) shipped in warn mode at iter-8 before
+enforce mode at iter-9 (see `docs/DECISIONS.md`). Promoting
+`accuracy_held_out` to a blocking threshold — and choosing that threshold —
+is a deliberate follow-up decision once a baseline exists, not taken in this
+change.
+
+**Structural gap: branches 4–7 are unmeasurable out-of-sample.**
+`BRANCH_4_EXPERIMENTAL`, `BRANCH_5_RARE`, `BRANCH_6_CONFLICTING`,
+`BRANCH_7_PRIOR_DENIAL`, and `ExpectedOutcome.PRE_FLIGHT_ESCALATE` exist ONLY
+inside the contaminated golden-20 — GC-006 and GC-009 (branch 4), GC-007
+(branch 5), GC-011 (branch 6), GC-008 (branch 7). Every case that exercises
+PACCA's deterministic pre-flight safety layer is inside the already-excluded
+gate, so **no re-slicing of the existing 105-case dataset can produce an
+out-of-sample measurement for it** — only authoring new pre-flight cases in
+those four categories can, and that is not done in this change. Concretely:
+this holdout can measure out-of-sample performance for branch-1
+auto-approvals and branch-2/3 escalations and denials; it proves nothing
+out-of-sample about the deterministic pre-flight safety layer that
+`ClinicalRiskDetector` implements. Authoring GC-106+ pre-flight cases
+(experimental treatment, rare condition, conflicting guidelines, prior
+denial — never referenced under `src/pacca/`) is named here as the follow-up
+that closes this gap; it is out of scope for this change.
 
 ## What ships in Phase H5
 
