@@ -105,6 +105,17 @@ def test_default_confidence_thresholds_preserve_orchestrator_behavior() -> None:
     assert fields["escalation_confidence_threshold"].default == 0.90, coupling
 
 
+def test_rag_degraded_escalates_defaults_to_warn_mode() -> None:
+    """
+    chg-20: RAG-degradation enforcement must default to False (warn) — audit
+    and proceed, not fail-closed — mirroring the P-4 scope guard's warn-first
+    rollout. Promoting to True is a deliberate later step once production
+    degradation rates are known, never the out-of-the-box behavior.
+    """
+    assert get_settings().rag_degraded_escalates is False
+    assert Settings.model_fields["rag_degraded_escalates"].default is False
+
+
 def test_env_file_is_anchored_to_repo_root_not_cwd() -> None:
     """env_file must resolve to an absolute repo-root path, not a CWD-relative
     '.env'. Otherwise a process launched from src/pacca/ would load the stray

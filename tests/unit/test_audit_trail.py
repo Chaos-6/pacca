@@ -40,6 +40,12 @@ def _healthy_outcome(text: str) -> RetrievalOutcome:
     return RetrievalOutcome(text=text, mode="pipeline", degraded=False, reason=None)
 
 
+def _degraded_outcome(text: str = "Mock guideline (degraded)") -> RetrievalOutcome:
+    """A degraded RetrievalOutcome (chg-19) — simulates the pipeline having
+    fallen back to the legacy direct-ChromaDB path."""
+    return RetrievalOutcome(text=text, mode="direct_fallback", degraded=True, reason="RuntimeError")
+
+
 # ── Test fixtures — reusable test data ──────────────────────────────────────
 
 
@@ -492,6 +498,119 @@ class TestAuditTrailWiring:
         assert failure_records[0].get("success") is False, (
             "The failure audit record should have success=False."
         )
+
+    @pytest.mark.asyncio
+    async def test_rag_degraded_writes_audit_record_and_proceeds_in_warn_mode(
+        self, sample_request, mock_auto_approved_decision
+    ):
+        """
+        chg-19/chg-20: a degraded RetrievalOutcome must always be audited
+        (action='rag.degraded'), and in warn mode (rag_degraded_escalates
+        defaults False) the decision proceeds normally rather than being
+        forced to human review — visibility, not fragility.
+        """
+        audit_log_calls = []
+
+        async def capture_log(**kwargs):
+            audit_log_calls.append(kwargs)
+            return MagicMock()
+
+        with (
+            patch(
+                "pacca.api.routes.authorizations.orchestrator.process_decision",
+                new_callable=AsyncMock,
+                return_value=mock_auto_approved_decision,
+            ),
+            patch(
+                "pacca.api.routes.authorizations.rag_engine.query",
+                return_value=_degraded_outcome(),
+            ),
+            patch(
+                "pacca.db.repository.AuditRepository.log",
+                side_effect=capture_log,
+            ),
+        ):
+            from pacca.api.routes.authorizations import submit_authorization
+            from pacca.models.authorization import AuthorizationRequest
+
+            req = AuthorizationRequest(**sample_request)
+            mock_session = AsyncMock()
+            result = await submit_authorization(request=req, session=mock_session)
+
+        # The decision proceeds normally — this is warn mode, not enforce.
+        assert result.status == mock_auto_approved_decision.status
+        assert result.review_tier_used == mock_auto_approved_decision.review_tier_used
+
+        degraded_records = [c for c in audit_log_calls if c["action"] == "rag.degraded"]
+        assert len(degraded_records) == 1, (
+            f"Expected exactly 1 'rag.degraded' audit record, got {len(degraded_records)}."
+        )
+        record = degraded_records[0]
+        assert record["request_id"] == req.request_id
+        # Shares the run's correlation_id with every other record in the trail.
+        assert record["correlation_id"] == audit_log_calls[0]["correlation_id"]
+        assert record["actor"] == "rag"
+        assert record["actor_type"] == "system"
+        assert record["details"] == {"mode": "direct_fallback", "reason": "RuntimeError"}
+        # Warn mode never escalates.
+        assert not any(c["action"] == "escalation_human_review_required" for c in audit_log_calls)
+
+    @pytest.mark.asyncio
+    async def test_rag_degraded_escalates_to_human_review_when_flag_enabled(
+        self, sample_request, mock_auto_approved_decision, monkeypatch
+    ):
+        """
+        chg-20: with rag_degraded_escalates=True, a degraded retrieval routes
+        the case to human review (IN_REVIEW / HUMAN) instead of letting the
+        DecisionAgent reason over unverified fallback context — the enforce
+        side of the same warn->enforce rollout the P-4 scope guard used.
+        """
+        from pacca.api.routes import authorizations
+        from pacca.config.settings import get_settings
+
+        real_settings = get_settings()
+        escalating_settings = real_settings.model_copy(update={"rag_degraded_escalates": True})
+        monkeypatch.setattr(authorizations, "get_settings", lambda: escalating_settings)
+
+        audit_log_calls = []
+
+        async def capture_log(**kwargs):
+            audit_log_calls.append(kwargs)
+            return MagicMock()
+
+        with (
+            patch(
+                "pacca.api.routes.authorizations.orchestrator.process_decision",
+                new_callable=AsyncMock,
+                return_value=mock_auto_approved_decision,
+            ),
+            patch(
+                "pacca.api.routes.authorizations.rag_engine.query",
+                return_value=_degraded_outcome(),
+            ),
+            patch(
+                "pacca.db.repository.AuditRepository.log",
+                side_effect=capture_log,
+            ),
+        ):
+            from pacca.api.routes.authorizations import submit_authorization
+            from pacca.models.authorization import AuthorizationRequest
+
+            req = AuthorizationRequest(**sample_request)
+            mock_session = AsyncMock()
+            result = await submit_authorization(request=req, session=mock_session)
+
+        assert result.status == AuthorizationStatus.IN_REVIEW
+        assert result.review_tier_used == ReviewTier.HUMAN
+
+        assert any(c["action"] == "rag.degraded" for c in audit_log_calls)
+        escalation_records = [
+            c for c in audit_log_calls if c["action"] == "escalation_human_review_required"
+        ]
+        assert len(escalation_records) == 1
+        assert escalation_records[0]["details"]["escalation_reason"] == "rag_degraded"
+        # The orchestrator never ran — the case was routed before the AI pipeline.
+        assert not any(c["action"] == "authorization_decision_made" for c in audit_log_calls)
 
     @pytest.mark.asyncio
     async def test_feedback_endpoint_writes_audit_record(self):
