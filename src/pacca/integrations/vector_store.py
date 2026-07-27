@@ -30,10 +30,11 @@ Architecture history (important context for reviewers):
 
 import hashlib
 import os
-from typing import Any
+from typing import Any, Literal
 
 import chromadb
 from chromadb.utils import embedding_functions
+from pydantic import BaseModel
 
 # Use the project's structlog-backed logger — accepts arbitrary kwargs
 # like logger.warning("event", error=str(e)). The previous
@@ -81,6 +82,52 @@ def _build_pipeline(collection: Any) -> Any:
 
     vector_store = GuidelineVectorStore(collection=collection)
     return RAGPipeline(vector_store=vector_store)
+
+
+class RetrievalOutcome(BaseModel):
+    """
+    Structured result of ``GuidelineRetriever.query()`` (chg-19).
+
+    Before this type existed, ``query()`` always returned a plausible-looking
+    ``str`` — a caller had no way to tell "the governed RAGPipeline answered
+    this" from "the pipeline errored and we silently served the legacy
+    direct-ChromaDB fallback instead". iter-14's own root-cause note put it
+    bluntly: *"a silent fallback plus an unimportable module is
+    indistinguishable from a working system."* That iteration fixed one
+    instance (a bad import latching the fallback forever); this type closes
+    the pattern by making degradation part of the return value instead of
+    something only a log line at error level would show.
+
+    The fallback behaviour itself is unchanged and deliberately kept: a
+    retrieval failure must not crash a prior-authorization request. This is
+    strictly a visibility fix, not a fragility one.
+
+    Attributes:
+        text: The guideline/precedent context to inject into the agent
+            prompt. Populated in every mode.
+        mode: ``"pipeline"`` is the intended path — chunked, cosine-scored
+            retrieval via ``RAGPipeline``. ``"direct_fallback"`` and
+            ``"empty"`` are both degraded: the legacy direct-ChromaDB path
+            ran instead, either because the pipeline was never built or
+            because it raised. ``"empty"`` additionally means that fallback
+            itself found nothing in either collection, so the caller is
+            about to reason over zero retrieved context rather than merely
+            degraded-but-real context.
+        degraded: True for any mode other than ``"pipeline"``. A convenience
+            flag for callers (the submit route's audit + escalation check)
+            that only need "is this the intended path or not."
+        reason: The exception TYPE name only (e.g. ``"RuntimeError"``) or
+            ``"pipeline_unavailable"`` when there was no live pipeline to
+            try. NEVER the raw exception message — clinical query text or
+            case details could end up in an exception message, and this
+            field is written verbatim into an audit record. None when not
+            degraded.
+    """
+
+    text: str
+    mode: Literal["pipeline", "direct_fallback", "empty"]
+    degraded: bool
+    reason: str | None = None
 
 
 class GuidelineRetriever:
@@ -139,6 +186,10 @@ class GuidelineRetriever:
         # Built per instance (not as a module singleton) so a retriever pointed
         # at a temp db_path gets a pipeline over *that* store. A failure here is
         # logged at error level and degrades to _query_direct; it is not silent.
+        # Exception TYPE name only (never the message — see RetrievalOutcome.reason)
+        # for a construction-time pipeline failure, surfaced by query() as the
+        # `reason` on a degraded outcome when self._pipeline is None from the start.
+        self._pipeline_build_error_type: str | None = None
         try:
             self._pipeline = _build_pipeline(self._guidelines)
             logger.info(
@@ -148,6 +199,7 @@ class GuidelineRetriever:
             )
         except Exception as e:
             self._pipeline = None
+            self._pipeline_build_error_type = type(e).__name__
             logger.error(
                 "rag_pipeline_init_failed",
                 error=str(e),
@@ -235,21 +287,26 @@ class GuidelineRetriever:
         )
         logger.info("precedent_added", outcome=outcome)
 
-    def query(self, clinical_query: str) -> str:
+    def query(self, clinical_query: str) -> RetrievalOutcome:
         """
         Retrieve relevant guidelines and precedents for a clinical query.
 
         Uses RAGPipeline for the guidelines collection, then appends
         institutional-memory precedents. Falls back to direct ChromaDB queries
-        if the pipeline is unavailable or errors.
+        if the pipeline is unavailable or errors — the fallback itself is
+        unchanged and intentionally retained (a retrieval failure must not
+        crash the request). What changed (chg-19) is that the caller no
+        longer has to infer which path ran from a log line: the return value
+        says so. See ``RetrievalOutcome`` for the field semantics.
 
         Args:
             clinical_query: Natural language query built from the case details
 
         Returns:
-            Formatted string with official guidelines and relevant precedents,
-            ready to be injected into agent prompts as context.
+            A ``RetrievalOutcome`` carrying the formatted context text plus
+            whether retrieval degraded to the fallback path and why.
         """
+        reason: str | None
         if self._pipeline is not None:
             try:
                 # Parse the query to extract diagnosis/treatment components.
@@ -283,27 +340,45 @@ class GuidelineRetriever:
                     "rag_pipeline_query_completed",
                     query_length=len(clinical_query),
                 )
-                return guidelines_text
+                return RetrievalOutcome(
+                    text=guidelines_text, mode="pipeline", degraded=False, reason=None
+                )
 
             except Exception as e:
+                # Full exception text stays in the structured log (internal,
+                # operator-facing); only the exception TYPE crosses into the
+                # RetrievalOutcome, which the submit route writes to an audit
+                # record (see RetrievalOutcome.reason).
+                reason = type(e).__name__
                 logger.error(
                     "rag_pipeline_query_failed",
                     error=str(e),
                     fallback="direct_chromadb",
                 )
                 # Fall through to direct ChromaDB fallback
+        else:
+            reason = self._pipeline_build_error_type or "pipeline_unavailable"
 
         # Fallback: direct ChromaDB queries (original behavior)
-        return self._query_direct(clinical_query)
+        text, found_any = self._query_direct(clinical_query)
+        mode: Literal["direct_fallback", "empty"] = "direct_fallback" if found_any else "empty"
+        return RetrievalOutcome(text=text, mode=mode, degraded=True, reason=reason)
 
-    def _query_direct(self, clinical_query: str) -> str:
+    def _query_direct(self, clinical_query: str) -> tuple[str, bool]:
         """
         Fallback: query ChromaDB collections directly.
 
         This is the original GuidelineRetriever.query() implementation,
         retained as a fallback when RAGPipeline is unavailable.
+
+        Returns:
+            ``(text, found_any)`` — ``found_any`` is False when neither
+            collection yielded a single document, so ``query()`` can report
+            ``mode="empty"`` instead of silently returning boilerplate as if
+            real context had been retrieved.
         """
         context = "OFFICIAL GUIDELINES:\n"
+        found_any = False
 
         try:
             rules = self._guidelines.query(
@@ -313,6 +388,7 @@ class GuidelineRetriever:
             if rules["documents"]:
                 for doc in rules["documents"][0]:
                     context += f"- {doc}\n"
+                    found_any = True
         except Exception as e:
             logger.warning("guidelines_query_failed", error=str(e))
             context += "(No guidelines retrieved)\n"
@@ -326,10 +402,11 @@ class GuidelineRetriever:
                 context += "\nPAST MEDICAL DIRECTOR DECISIONS (PRECEDENTS):\n"
                 for doc in memories["documents"][0]:
                     context += f"- {doc}\n"
+                    found_any = True
         except Exception as e:
             logger.warning("precedents_query_failed", error=str(e))
 
-        return context
+        return context, found_any
 
     def _query_precedents(self, clinical_query: str) -> str:
         """
