@@ -309,11 +309,65 @@ async def submit_authorization(
                 mode=get_settings().scope_guard_mode,
                 collection_name=_collection,
             )
-        # query() now returns a RetrievalOutcome rather than a bare str
-        # (chg-19) — the caller (here) reads `.text` for the prompt context.
-        # Whether the retrieval degraded is not yet acted on; that lands in
-        # chg-20.
-        context_text = rag_engine.query(query).text
+        retrieval = rag_engine.query(query)
+        context_text = retrieval.text
+
+        # ── RAG DEGRADATION VISIBILITY (chg-19/chg-20) ────────────────────────
+        # query() now reports whether it served the governed RAGPipeline or fell
+        # back to the legacy direct-ChromaDB path (RetrievalOutcome, chg-19).
+        # Every degradation is audited BEFORE we decide whether to proceed, so
+        # the trail always shows exactly what context the DecisionAgent reasoned
+        # over — this closes the "silent fallback into a clinical decision"
+        # pattern iter-14's root-cause note called out.
+        #
+        # `rag_degraded_escalates` mirrors the P-4 scope guard's own iter-8 ->
+        # iter-9 rollout: land in warn mode (audit + proceed), observe how often
+        # degradation actually fires in production, and only then promote to
+        # fail-closed enforcement in a later iteration. Nobody has data yet on
+        # how often this fires, and jumping straight to enforce risks flooding
+        # the human review queue — its own safety problem.
+        if retrieval.degraded:
+            await audit.log(
+                action="rag.degraded",
+                actor="rag",
+                actor_type="system",
+                request_id=request.request_id,
+                correlation_id=correlation_id,
+                success=False,
+                output_summary=f"RAG retrieval degraded (mode={retrieval.mode})",
+                details={"mode": retrieval.mode, "reason": retrieval.reason},
+            )
+
+            if get_settings().rag_degraded_escalates:
+                duration_ms = int((time.time() - start_time) * 1000)
+                await audit.log(
+                    action="escalation_human_review_required",
+                    actor="rag",
+                    actor_type="system",
+                    request_id=request.request_id,
+                    correlation_id=correlation_id,
+                    duration_ms=duration_ms,
+                    success=False,
+                    output_summary=(
+                        f"RAG retrieval degraded (mode={retrieval.mode}); routed to human review"
+                    ),
+                    details={
+                        "escalation_reason": EscalationReason.RAG_DEGRADED.value,
+                        "mode": retrieval.mode,
+                        "reason": retrieval.reason,
+                    },
+                )
+                return AuthorizationDecision(
+                    decision_id=f"RAGDEGRADED-{request.request_id}-{int(time.time())}",
+                    status=AuthorizationStatus.IN_REVIEW,
+                    confidence_score=0.0,
+                    rationale=(
+                        "RAG retrieval degraded to the direct-ChromaDB fallback; "
+                        "case routed to human review rather than deciding on "
+                        "unverified guideline context."
+                    ),
+                    review_tier_used=ReviewTier.HUMAN,
+                )
 
         # ── ORCHESTRATOR: Run the AI decision pipeline ────────────────────────
         # DecisionContext bundles the case + retrieved guidelines together.
