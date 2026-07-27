@@ -551,54 +551,73 @@ class TestAuditTrailWiring:
         assert record["correlation_id"] == audit_log_calls[0]["correlation_id"]
         assert record["actor"] == "rag"
         assert record["actor_type"] == "system"
-        assert record["details"] == {"mode": "direct_fallback", "reason": "RuntimeError"}
+        assert record["details"] == {
+            "mode": "direct_fallback",
+            "reason": "RuntimeError",
+            "precedents_degraded": False,
+            "precedents_reason": None,
+        }
         # Warn mode never escalates.
         assert not any(c["action"] == "escalation_human_review_required" for c in audit_log_calls)
 
     @pytest.mark.asyncio
     async def test_rag_degraded_escalates_to_human_review_when_flag_enabled(
-        self, sample_request, mock_auto_approved_decision, monkeypatch
+        self, sample_request, mock_auto_approved_decision
     ):
         """
         chg-20: with rag_degraded_escalates=True, a degraded retrieval routes
         the case to human review (IN_REVIEW / HUMAN) instead of letting the
         DecisionAgent reason over unverified fallback context — the enforce
         side of the same warn->enforce rollout the P-4 scope guard used.
+
+        The flag is flipped via apply_overrides(), the same runtime-override
+        path PATCH /config uses (Validator FIX 2) — NOT by monkeypatching
+        get_settings(), because the route reads this flag via
+        effective_settings(), which is the whole point of making it actually
+        tunable without a restart.
+
+        Also asserts the escalated decision is persisted (Validator FIX 3):
+        without that write, GET /review-queue — which reads persisted
+        IN_REVIEW rows — could never surface this case; a human review
+        nobody can see.
         """
-        from pacca.api.routes import authorizations
-        from pacca.config.settings import get_settings
+        from pacca.config.settings import apply_overrides, clear_all_overrides
 
-        real_settings = get_settings()
-        escalating_settings = real_settings.model_copy(update={"rag_degraded_escalates": True})
-        monkeypatch.setattr(authorizations, "get_settings", lambda: escalating_settings)
+        apply_overrides({"rag_degraded_escalates": True})
+        try:
+            audit_log_calls = []
 
-        audit_log_calls = []
+            async def capture_log(**kwargs):
+                audit_log_calls.append(kwargs)
+                return MagicMock()
 
-        async def capture_log(**kwargs):
-            audit_log_calls.append(kwargs)
-            return MagicMock()
+            with (
+                patch(
+                    "pacca.api.routes.authorizations.orchestrator.process_decision",
+                    new_callable=AsyncMock,
+                    return_value=mock_auto_approved_decision,
+                ),
+                patch(
+                    "pacca.api.routes.authorizations.rag_engine.query",
+                    return_value=_degraded_outcome(),
+                ),
+                patch(
+                    "pacca.db.repository.AuditRepository.log",
+                    side_effect=capture_log,
+                ),
+                patch(
+                    "pacca.db.repository.DecisionRepository.create",
+                    new_callable=AsyncMock,
+                ) as mock_decision_create,
+            ):
+                from pacca.api.routes.authorizations import submit_authorization
+                from pacca.models.authorization import AuthorizationRequest
 
-        with (
-            patch(
-                "pacca.api.routes.authorizations.orchestrator.process_decision",
-                new_callable=AsyncMock,
-                return_value=mock_auto_approved_decision,
-            ),
-            patch(
-                "pacca.api.routes.authorizations.rag_engine.query",
-                return_value=_degraded_outcome(),
-            ),
-            patch(
-                "pacca.db.repository.AuditRepository.log",
-                side_effect=capture_log,
-            ),
-        ):
-            from pacca.api.routes.authorizations import submit_authorization
-            from pacca.models.authorization import AuthorizationRequest
-
-            req = AuthorizationRequest(**sample_request)
-            mock_session = AsyncMock()
-            result = await submit_authorization(request=req, session=mock_session)
+                req = AuthorizationRequest(**sample_request)
+                mock_session = AsyncMock()
+                result = await submit_authorization(request=req, session=mock_session)
+        finally:
+            clear_all_overrides()
 
         assert result.status == AuthorizationStatus.IN_REVIEW
         assert result.review_tier_used == ReviewTier.HUMAN
@@ -611,6 +630,62 @@ class TestAuditTrailWiring:
         assert escalation_records[0]["details"]["escalation_reason"] == "rag_degraded"
         # The orchestrator never ran — the case was routed before the AI pipeline.
         assert not any(c["action"] == "authorization_decision_made" for c in audit_log_calls)
+
+        # The escalated decision was actually persisted, not just returned.
+        mock_decision_create.assert_called_once()
+        persisted_decision = mock_decision_create.call_args.args[0]
+        assert persisted_decision.status == AuthorizationStatus.IN_REVIEW
+        assert mock_decision_create.call_args.kwargs["request_id"] == req.request_id
+
+    @pytest.mark.asyncio
+    async def test_rag_healthy_with_escalation_flag_enabled_does_not_escalate(
+        self, sample_request, mock_auto_approved_decision
+    ):
+        """
+        Validator-requested guard: rag_degraded_escalates=True must not fire
+        on the happy path. A healthy RetrievalOutcome (degraded=False) must
+        proceed normally with zero 'rag.degraded' / escalation records, even
+        with the flag on -- otherwise an over-broad predicate could route
+        every case to human review regardless of actual retrieval health.
+        """
+        from pacca.config.settings import apply_overrides, clear_all_overrides
+
+        apply_overrides({"rag_degraded_escalates": True})
+        try:
+            audit_log_calls = []
+
+            async def capture_log(**kwargs):
+                audit_log_calls.append(kwargs)
+                return MagicMock()
+
+            with (
+                patch(
+                    "pacca.api.routes.authorizations.orchestrator.process_decision",
+                    new_callable=AsyncMock,
+                    return_value=mock_auto_approved_decision,
+                ),
+                patch(
+                    "pacca.api.routes.authorizations.rag_engine.query",
+                    return_value=_healthy_outcome("Mock guideline (healthy)"),
+                ),
+                patch(
+                    "pacca.db.repository.AuditRepository.log",
+                    side_effect=capture_log,
+                ),
+            ):
+                from pacca.api.routes.authorizations import submit_authorization
+                from pacca.models.authorization import AuthorizationRequest
+
+                req = AuthorizationRequest(**sample_request)
+                mock_session = AsyncMock()
+                result = await submit_authorization(request=req, session=mock_session)
+        finally:
+            clear_all_overrides()
+
+        assert result.status == mock_auto_approved_decision.status
+        assert result.review_tier_used == mock_auto_approved_decision.review_tier_used
+        assert not any(c["action"] == "rag.degraded" for c in audit_log_calls)
+        assert not any(c["action"] == "escalation_human_review_required" for c in audit_log_calls)
 
     @pytest.mark.asyncio
     async def test_feedback_endpoint_writes_audit_record(self):
