@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from jose import jwt
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 
 # Registers User on AuthBase's metadata — never referenced directly, but the
 # import's side effect (populating AuthBase.metadata.tables) is required
@@ -94,6 +94,43 @@ def inject_rag(test_rag, monkeypatch):
         test_rag._precedents.delete(ids=existing)
 
 
+def _ensure_users_role_column(sync_engine) -> None:
+    """
+    Repair a `users` table that predates migration 006 (RBAC's `role` column).
+
+    `create_all(checkfirst=True)` — used by the `client` fixture below to
+    build schema — CANNOT add a column to an ALREADY-EXISTING `users` table:
+    checkfirst only skips tables that already exist wholesale, it never
+    diffs columns against the current model. The common case the `client`
+    fixture runs against is a developer's persistent local `./pacca.db`,
+    built long before RBAC and never migrated via `alembic upgrade head`
+    (this repo's own dev DB has no `alembic_version` table at all —
+    confirmed by inspection, not assumed, when this function was written).
+    Left unrepaired, the very next `SELECT ... FROM users` (which implicitly
+    selects every column) fails with "no such column: users.role" — a
+    confusing crash, not a graceful skip.
+
+    This repairs exactly that column gap, matching migration 006's own DDL
+    exactly (String(30) NOT NULL DEFAULT 'clinician'). Deliberately NOT
+    wrapped in a try/except that swallows the failure and skips the caller:
+    a schema this function cannot repair must still be a loud, actionable
+    error, never a quietly-skipped anti-hallucination gate (GC-018 / GC-019
+    run in this module). Idempotent — a no-op when `role` is already present
+    (the fresh-DB case, where `create_all` already built it).
+
+    Covered by a DETERMINISTIC (non-`clinical`) regression test —
+    tests/unit/test_level5_flow_fixture_repair.py — against both a
+    pre-006-shaped table and a fresh one, since this whole module is
+    `clinical`-marked and skipped by `make test`.
+    """
+    existing_columns = {col["name"] for col in inspect(sync_engine).get_columns("users")}
+    if "role" not in existing_columns:
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE users ADD COLUMN role VARCHAR(30) NOT NULL DEFAULT 'clinician'")
+            )
+
+
 @pytest.fixture(scope="module")
 def client():
     """
@@ -120,6 +157,7 @@ def client():
     try:
         DomainBase.metadata.create_all(sync_engine)
         AuthBase.metadata.create_all(sync_engine)
+        _ensure_users_role_column(sync_engine)
 
         # RBAC (see pacca.api.rbac): the router-wide guards on both routers
         # under test (clinician on /authorizations/*, admin on /admin/*) now
