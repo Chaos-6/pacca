@@ -47,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import pacca.api.models.user as user_module
 import pacca.db.session as db_session_module
-from pacca.api.auth import ALGORITHM, SECRET_KEY, get_password_hash
+from pacca.api.auth import ALGORITHM, SECRET_KEY, get_password_hash, verify_password
 from pacca.api.database import Base as AuthBase
 from pacca.api.main import app
 from pacca.api.models.user import User
@@ -666,7 +666,13 @@ class TestMigrationRoundTrip:
 
 @pytest.fixture
 def cli_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """An isolated `users`-table-only on-disk DB for `pacca create-admin`."""
+    """An isolated on-disk DB for `pacca create-admin`.
+
+    Builds both Bases, not just `users`: create-admin now writes a
+    `user.role_changed` audit record (a Validator finding — the CLI's
+    privilege grant used to leave no audit trail), which needs the
+    `audit_logs` table (on DomainBase) to exist.
+    """
     db_path = tmp_path / "cli_test.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     get_settings.cache_clear()
@@ -676,6 +682,7 @@ def cli_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     sync_engine = create_engine(f"sqlite:///{db_path}")
     try:
         AuthBase.metadata.create_all(sync_engine)
+        DomainBase.metadata.create_all(sync_engine)
     finally:
         sync_engine.dispose()
 
@@ -700,7 +707,13 @@ class TestCreateAdminCLI:
         assert _role_in_db(cli_db, "brand-new-admin") == "admin"
 
     def test_promotes_existing_user(self, cli_db: Path) -> None:
-        """Item 20: create-admin on an existing user promotes them."""
+        """Item 20: create-admin on an existing user promotes them.
+
+        Also covers the Validator's FIX 2 finding: promotion must NOT touch
+        the existing user's credential (a fuller adversarial version of
+        this lives in test_rbac_adversarial.py's
+        test_finding_cli_create_admin_no_longer_resets_an_existing_users_password).
+        """
         sync_engine = create_engine(f"sqlite:///{cli_db}")
         try:
             with sync_engine.begin() as conn:
@@ -722,7 +735,24 @@ class TestCreateAdminCLI:
         )
         assert result.exit_code == 0, result.output
         assert "Promoted existing user 'existing-clinician' to admin" in result.output
+        assert "Password NOT changed" in result.output
         assert _role_in_db(cli_db, "existing-clinician") == "admin"
+
+        sync_engine = create_engine(f"sqlite:///{cli_db}")
+        try:
+            with sync_engine.connect() as conn:
+                row = conn.execute(
+                    user_module.User.__table__.select().where(
+                        user_module.User.__table__.c.username == "existing-clinician"
+                    )
+                ).first()
+        finally:
+            sync_engine.dispose()
+        assert row is not None
+        assert verify_password("old-pw", row.hashed_password) is True, (
+            "promotion must not rotate the existing user's password"
+        )
+        assert verify_password("new-pw-123", row.hashed_password) is False
 
     def test_running_twice_is_not_an_error(self, cli_db: Path) -> None:
         """Idempotency, explicitly called out in the design spec."""

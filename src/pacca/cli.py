@@ -69,35 +69,95 @@ def _assign_str(obj: object, field: str, value: str) -> None:
 
 async def _create_or_promote_admin(username: str, password: str) -> str:
     """
-    Create `username` as an admin, or promote them if the account exists.
+    Create `username` as an admin, or PROMOTE-ONLY if the account exists.
 
     Idempotent: running this twice for the same username is not an error —
-    the second run simply re-promotes (a no-op role-wise) and re-hashes the
-    supplied password. Returns a human-readable summary line for the CLI to
-    echo (never the password itself).
+    the second run simply re-promotes (a no-op role-wise).
+
+    VALIDATOR FINDING, FIXED: this used to also overwrite an existing
+    user's `hashed_password` with whatever the operator typed, unconditionally
+    — an operator granting Alice admin would silently rotate her credential
+    to a value the operator now knows, and Alice's own password would stop
+    working. Design spec §3.3 only ever authorised "creates the user if
+    absent; promotes to admin if present" — never a credential change on an
+    existing account. The password this function receives is used ONLY to
+    hash a NEW account; an existing account's `hashed_password` is never
+    touched. (A password *reset* is a legitimate, separate operation — it
+    should be its own command with its own name and its own audit story,
+    not a side effect of a role grant.)
+
+    Returns a human-readable summary line for the CLI to echo (never the
+    password itself).
     """
     # Local imports: this CLI module is imported at package-import time by
     # pyproject's console-script entry point, and the DB/auth stack pulls in
     # heavier dependencies (SQLAlchemy engine, bcrypt) that a plain
     # `pacca sme-author --help` invocation shouldn't need to pay for.
+    import getpass
+
     from pacca.api.auth import get_password_hash
     from pacca.api.models.user import User
     from pacca.api.rbac import Role
+    from pacca.db.repository import AuditRepository
     from pacca.db.session import get_session_context
-
-    hashed = get_password_hash(password)
 
     async with get_session_context() as session:
         result = await session.execute(select(User).where(User.username == username))
         existing = result.scalar_one_or_none()
 
+        # VALIDATOR FINDING, FIXED: this is the highest-privilege operation
+        # in the system (it mints/grants `admin`, PACCA's top role) and it
+        # previously wrote no audit trail at all — every other role change
+        # (PATCH /admin/users/{username}/role) writes a `user.role_changed`
+        # record, but this out-of-band CLI path was invisible. `actor` is
+        # prefixed `cli:` (never a bare username) so an audit-log reader can
+        # tell an out-of-band CLI grant apart from an in-app admin action at
+        # a glance, and `details` records that provenance explicitly rather
+        # than leaving it implicit in the actor string alone.
+        #
+        # Known limitation, not fixed here (queued as its own change): this
+        # audit write shares the repo-wide defect where audit rows ride the
+        # same transaction as the state change they describe, rather than
+        # being flushed durably before it (the pre-write-audit pattern used
+        # on the HTTP submit path in routes/authorizations.py). A process
+        # crash between `session.add`/`_assign_str` and commit could in
+        # theory lose both together. That durability gap is pre-existing
+        # and out of scope for this fix.
+        audit = AuditRepository(session)
+
         if existing is None:
+            hashed = get_password_hash(password)
             session.add(User(username=username, hashed_password=hashed, role=Role.ADMIN.value))
+            await audit.log(
+                action="user.role_changed",
+                actor=f"cli:{getpass.getuser()}",
+                actor_type="user",
+                details={
+                    "target": username,
+                    "from": None,
+                    "to": Role.ADMIN.value,
+                    "via": "cli_bootstrap",
+                },
+            )
             return f"Created new admin user '{username}'."
 
-        _assign_str(existing, "hashed_password", hashed)
+        previous_role = existing.role
         _assign_str(existing, "role", Role.ADMIN.value)
-        return f"Promoted existing user '{username}' to admin."
+        await audit.log(
+            action="user.role_changed",
+            actor=f"cli:{getpass.getuser()}",
+            actor_type="user",
+            details={
+                "target": username,
+                "from": previous_role,
+                "to": Role.ADMIN.value,
+                "via": "cli_bootstrap",
+            },
+        )
+        return (
+            f"Promoted existing user '{username}' to admin. "
+            "Password NOT changed — the existing credential still applies."
+        )
 
 
 @pacca_cli.command(name="create-admin")
