@@ -97,6 +97,12 @@ every PR is one path or the other, never ambiguous.
 - Span emission lives in `src/pacca/agents/base.py` + `src/pacca/config/tracing.py`
   (one span per agent call). There is **no** `src/pacca/observability/` package.
 - `src/pacca/api/`, `src/pacca/db/`, `src/pacca/models/`, `src/pacca/config/` — standard.
+- `src/pacca/db/migrations/` — Alembic migrations are the **single source of truth** for
+  the schema (C5). The app no longer calls `create_all` at startup; `docker-entrypoint.sh`
+  runs `alembic upgrade head` before uvicorn (run `make db-upgrade` for local dev). `env.py`
+  combines BOTH declarative Bases' metadata (`db.models.Base` + `api.database.Base`) so
+  `users` is migration-covered (migration 004). A `migration-drift` CI job asserts models ≡
+  migrations on Postgres. Don't reintroduce `create_all` on a runtime path.
 - `.githooks/pacca_guard.py` — the **PHI/secret pre-commit guard** (wired via
   `.pre-commit-config.yaml`, reusing `sme_authoring/validators.py` as SSOT, tested in
   `tests/unit/test_pacca_guard_hook.py`). This is PACCA's strongest existing example of a

@@ -1,5 +1,13 @@
 """Initial schema creation
 
+JSON columns use `sa.JSON().with_variant(postgresql.JSONB(), "postgresql")`
+(the same dialect-agnostic pattern the ORM models use — see PR #19 / B2),
+not a bare `postgresql.JSONB()`. Bare JSONB doesn't compile on SQLite at
+all, which silently blocked `alembic upgrade head` on every backend but
+Postgres (uncovered while closing C5's migration-drift CI guard). This is
+schema-identical on Postgres (still JSONB there) and only changes what
+SQLite gets (JSON/TEXT instead of a compile error).
+
 Revision ID: 001_initial
 Revises:
 Create Date: 2026-02-03
@@ -32,7 +40,11 @@ def upgrade() -> None:
         sa.Column("patient_gender", sa.String(10), nullable=False),
         sa.Column("primary_diagnosis_code", sa.String(20), nullable=False),
         sa.Column("primary_diagnosis_description", sa.Text(), nullable=False),
-        sa.Column("secondary_diagnoses", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "secondary_diagnoses",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
         sa.Column("treatment_code", sa.String(20), nullable=False),
         sa.Column("treatment_description", sa.Text(), nullable=False),
         sa.Column("treatment_category", sa.String(30), nullable=False),
@@ -47,8 +59,14 @@ def upgrade() -> None:
         sa.Column("complexity", sa.Integer(), nullable=True),
         sa.Column("assigned_specialty", sa.String(50), nullable=True),
         sa.Column("evidence_quality", sa.String(20), nullable=True),
-        sa.Column("evidence_data", postgresql.JSONB(), nullable=True),
-        sa.Column("narrative_data", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "evidence_data", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+        ),
+        sa.Column(
+            "narrative_data",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
         sa.Column("submitted_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
@@ -82,9 +100,19 @@ def upgrade() -> None:
         sa.Column("request_id", sa.String(50), nullable=False),
         sa.Column("outcome", sa.String(30), nullable=False),
         sa.Column("confidence_score", sa.Float(), nullable=False),
-        sa.Column("rationale_data", postgresql.JSONB(), nullable=True),
-        sa.Column("conditions", postgresql.JSONB(), nullable=True),
-        sa.Column("required_actions", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "rationale_data",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
+        sa.Column(
+            "conditions", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+        ),
+        sa.Column(
+            "required_actions",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
         sa.Column("effective_date", sa.DateTime(), nullable=True),
         sa.Column("expiration_date", sa.DateTime(), nullable=True),
         sa.Column("authorized_quantity", sa.Integer(), nullable=True),
@@ -93,7 +121,11 @@ def upgrade() -> None:
         sa.Column("decided_by", sa.String(100), nullable=False),
         sa.Column("is_autonomous", sa.Boolean(), nullable=False),
         sa.Column("was_escalated", sa.Boolean(), nullable=False),
-        sa.Column("escalation_reasons", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "escalation_reasons",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
         sa.Column("total_tokens_used", sa.Integer(), nullable=True),
         sa.Column("processing_time_ms", sa.Integer(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
@@ -126,7 +158,9 @@ def upgrade() -> None:
         sa.Column("reviewer_notes", sa.Text(), nullable=True),
         sa.Column("additional_rationale", sa.Text(), nullable=True),
         sa.Column("ai_accuracy_rating", sa.Integer(), nullable=True),
-        sa.Column("feedback_tags", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "feedback_tags", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+        ),
         sa.Column("reviewed_at", sa.DateTime(), nullable=False),
         sa.Column("time_spent_seconds", sa.Integer(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
@@ -148,13 +182,17 @@ def upgrade() -> None:
         sa.Column("action", sa.String(100), nullable=False),
         sa.Column("actor", sa.String(100), nullable=False),
         sa.Column("actor_type", sa.String(30), nullable=False),
-        sa.Column("details", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "details", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+        ),
         sa.Column("input_summary", sa.Text(), nullable=True),
         sa.Column("output_summary", sa.Text(), nullable=True),
         sa.Column("success", sa.Boolean(), nullable=False),
         sa.Column("error_message", sa.Text(), nullable=True),
         sa.Column("duration_ms", sa.Integer(), nullable=True),
-        sa.Column("token_usage", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "token_usage", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.ForeignKeyConstraint(["request_id"], ["authorization_requests.request_id"]),
     )
@@ -174,17 +212,31 @@ def upgrade() -> None:
         sa.Column("source", sa.String(100), nullable=False),
         sa.Column("source_url", sa.Text(), nullable=True),
         sa.Column("evidence_level", sa.String(20), nullable=True),
-        sa.Column("specialties", postgresql.JSONB(), nullable=True),
-        sa.Column("treatment_categories", postgresql.JSONB(), nullable=True),
-        sa.Column("applicable_diagnoses", postgresql.JSONB(), nullable=True),
+        sa.Column(
+            "specialties", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True
+        ),
+        sa.Column(
+            "treatment_categories",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
+        sa.Column(
+            "applicable_diagnoses",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
         sa.Column("summary", sa.Text(), nullable=False),
         sa.Column("effective_date", sa.DateTime(), nullable=False),
         sa.Column("expiration_date", sa.DateTime(), nullable=True),
         sa.Column("is_active", sa.Boolean(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
-        sa.Column("tags", postgresql.JSONB(), nullable=True),
-        sa.Column("vector_store_ids", postgresql.JSONB(), nullable=True),
+        sa.Column("tags", sa.JSON().with_variant(postgresql.JSONB(), "postgresql"), nullable=True),
+        sa.Column(
+            "vector_store_ids",
+            sa.JSON().with_variant(postgresql.JSONB(), "postgresql"),
+            nullable=True,
+        ),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_guidelines_guideline_id", "guidelines", ["guideline_id"], unique=True)

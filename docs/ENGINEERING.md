@@ -30,7 +30,7 @@ The technical companion to the [README](../README.md). That document is written 
 |---|---|---|
 | **LLM** | Claude, `claude-sonnet-4-5-20250929` | Tool-use forced for structured output |
 | **Backend** | Python 3.12, FastAPI, Pydantic v2 | Async throughout; no blocking calls in request paths |
-| **Production DB** | PostgreSQL 16, SQLAlchemy 2.0, Alembic | JSONB compliance queries, async pool |
+| **Production DB** | PostgreSQL 16, SQLAlchemy 2.0, Alembic | JSONB compliance queries, async pool; Alembic is the single schema source — migrations run at deploy (`docker-entrypoint.sh`), CI drift-guarded |
 | **Dev DB** | SQLite via `aiosqlite` | Same ORM layer, one env var to switch |
 | **Vector store** | ChromaDB, two collections | Separate trust levels — see [Retrieval](#retrieval) |
 | **Cache** | Redis 7 | Present in Compose; caching/rate-limiting groundwork |

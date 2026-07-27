@@ -353,7 +353,9 @@ In SQLite, JSONB falls back to TEXT — queries still work, but without JSON-pat
 
 **Rationale:** PostgreSQL's native JSONB type, row-level locking, connection pooling, and replication support are requirements at production scale. SQLite is retained for local development because the ORM abstraction makes it a zero-cost option.
 
-**Consequence:** `docker-compose.yml` requires a PostgreSQL service. Local development requires either Docker or explicitly setting `DATABASE_URL` to the SQLite option.
+**Consequence:** `docker-compose.yml` requires a PostgreSQL service. Local development requires either Docker or explicitly setting `DATABASE_URL` to the SQLite option, then `make db-upgrade` (`alembic upgrade head`) to build the schema.
+
+**Schema management (C5).** Alembic migrations are the single source of truth for the schema on both backends; the app no longer calls `create_all` at startup. Containers apply migrations via `docker-entrypoint.sh` (`alembic upgrade head`) before uvicorn accepts traffic, and a `migration-drift` CI job asserts the ORM models and the migrations agree (empty `autogenerate`) on Postgres. One Postgres-only refinement is scoped deliberately: the deferrable `audit_logs` FK (B3) is applied only on Postgres — SQLite does not enforce FK timing — so the SQLite-built schema carries a plain FK by design.
 
 ---
 

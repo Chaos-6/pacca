@@ -129,16 +129,18 @@ async def get_session_context() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_database() -> None:
     """
-    Initialize the database, creating all tables.
+    Verify the database engine is reachable at startup.
 
-    Should be called during application startup.
+    Schema creation is NOT performed here. Alembic migrations are the single
+    source of truth for the schema (C5) — `alembic upgrade head` is run by
+    docker-entrypoint.sh before the app starts in containers, or via
+    `make db-upgrade` for local dev outside Docker. This function only
+    creates/warms the engine so connection errors surface at startup rather
+    than on the first request.
     """
-    from pacca.db.models import Base
-
-    engine = get_engine()
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # Instantiating the engine is enough to validate configuration (URL
+    # parsing, driver availability); no query is issued.
+    get_engine()
 
     logger.info("database_initialized")
 
