@@ -20,12 +20,20 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from jose import jwt
+from sqlalchemy import create_engine
 
+# Registers User on AuthBase's metadata — never referenced directly, but the
+# import's side effect (populating AuthBase.metadata.tables) is required
+# before create_all(AuthBase.metadata) below, or `users` silently isn't built.
+import pacca.api.models.user  # noqa: F401
 from pacca.api.auth import ALGORITHM, SECRET_KEY
+from pacca.api.database import Base as AuthBase
 from pacca.api.main import app
 
 # Import the module where the global 'rag_engine' lives so we can overwrite it
 from pacca.api.routes import authorizations
+from pacca.config.settings import get_settings
+from pacca.db.models import Base as DomainBase
 from pacca.integrations.vector_store import GuidelineRetriever
 
 pytestmark = pytest.mark.clinical
@@ -92,7 +100,29 @@ def client():
     Context-managed so the app lifespan runs. A bare `TestClient(app)` never
     enters it, so `init_database()` never ran and the first audit write failed
     with "no such table: audit_logs".
+
+    Schema creation (C5): as of the Alembic-single-source-of-truth change,
+    `init_database()` in the app lifespan no longer calls `create_all` — it
+    only verifies the engine, on the assumption `alembic upgrade head` already
+    ran. Nothing in this test module runs Alembic, so the test has to build
+    its own schema, on BOTH declarative Bases (`db.models.Base` for the
+    domain tables — audit_logs, authorization_requests, decisions — and
+    `api.database.Base` for the legacy sync `users` table). Done with a SYNC
+    engine (L-025): this fixture is plain `def`, not `async def`, so there is
+    no running event loop to hand an async engine to — a sync engine pointed
+    at the same sqlite file sidesteps any "attached to a different loop"
+    failure. `create_all` is idempotent (`checkfirst=True` by default), so
+    this is safe whether or not the app/Alembic has already built the schema.
     """
+    settings = get_settings()
+    sync_url = settings.database_url.replace("+aiosqlite", "")
+    sync_engine = create_engine(sync_url)
+    try:
+        DomainBase.metadata.create_all(sync_engine)
+        AuthBase.metadata.create_all(sync_engine)
+    finally:
+        sync_engine.dispose()
+
     with TestClient(app) as test_client:
         yield test_client
 
