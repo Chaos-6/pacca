@@ -113,21 +113,41 @@ class RetrievalOutcome(BaseModel):
             itself found nothing in either collection, so the caller is
             about to reason over zero retrieved context rather than merely
             degraded-but-real context.
-        degraded: True for any mode other than ``"pipeline"``. A convenience
-            flag for callers (the submit route's audit + escalation check)
-            that only need "is this the intended path or not."
+        degraded: True whenever ANY part of retrieval is untrustworthy —
+            either ``mode != "pipeline"``, or ``precedents_degraded`` is
+            True. A caller (the submit route's audit + escalation check)
+            that only checks this one flag is correctly alerted either way.
         reason: The exception TYPE name only (e.g. ``"RuntimeError"``) or
             ``"pipeline_unavailable"`` when there was no live pipeline to
             try. NEVER the raw exception message — clinical query text or
             case details could end up in an exception message, and this
-            field is written verbatim into an audit record. None when not
-            degraded.
+            field is written verbatim into an audit record. Describes the
+            GUIDELINE-retrieval axis only: None whenever ``mode=="pipeline"``,
+            even if ``precedents_degraded`` is True — see
+            ``precedents_reason`` for that separate axis.
+        precedents_degraded: True when institutional-memory precedent
+            retrieval itself raised during an otherwise-healthy pipeline
+            call (``mode=="pipeline"``). Before this field existed, a total
+            precedents outage on a healthy pipeline call was
+            indistinguishable from "no precedents matched the query" — both
+            silently produced text with no PRECEDENTS section, so `degraded`
+            stayed False even though institutional memory (what `/feedback`
+            exists to build, and what the DecisionAgent prompt explicitly
+            weighs) had completely failed to load. Populated only on the
+            pipeline path: when ``mode != "pipeline"`` the whole retrieval is
+            already degraded and precedents ran through the separate
+            ``_query_direct`` fallback, already covered by mode/reason.
+        precedents_reason: The exception TYPE name when ``precedents_degraded``
+            is True, else None. Same PHI-safety rule as ``reason`` — never the
+            raw exception message.
     """
 
     text: str
     mode: Literal["pipeline", "direct_fallback", "empty"]
     degraded: bool
     reason: str | None = None
+    precedents_degraded: bool = False
+    precedents_reason: str | None = None
 
 
 class GuidelineRetriever:
@@ -331,8 +351,12 @@ class GuidelineRetriever:
                     n_results=5,
                 )
 
-                # Append precedents from the institutional memory collection
-                precedents_text = self._query_precedents(clinical_query)
+                # Append precedents from the institutional memory collection.
+                # precedents_reason is None on success (matches or not) and
+                # the exception TYPE name if the precedents query itself
+                # raised — see RetrievalOutcome.precedents_degraded for why
+                # this is tracked separately from the guideline mode.
+                precedents_text, precedents_reason = self._query_precedents(clinical_query)
                 if precedents_text:
                     guidelines_text += f"\n\n{precedents_text}"
 
@@ -341,7 +365,12 @@ class GuidelineRetriever:
                     query_length=len(clinical_query),
                 )
                 return RetrievalOutcome(
-                    text=guidelines_text, mode="pipeline", degraded=False, reason=None
+                    text=guidelines_text,
+                    mode="pipeline",
+                    degraded=precedents_reason is not None,
+                    reason=None,
+                    precedents_degraded=precedents_reason is not None,
+                    precedents_reason=precedents_reason,
                 )
 
             except Exception as e:
@@ -408,12 +437,22 @@ class GuidelineRetriever:
 
         return context, found_any
 
-    def _query_precedents(self, clinical_query: str) -> str:
+    def _query_precedents(self, clinical_query: str) -> tuple[str, str | None]:
         """
         Query the institutional memory (precedents) collection.
 
         This supplements RAGPipeline results with human override decisions.
         RAGPipeline queries the guidelines collection; this adds the precedents.
+
+        Returns:
+            ``(text, failure_reason)``. ``failure_reason`` is None whether or
+            not anything matched (an empty ``text`` with ``failure_reason is
+            None`` means "no precedents matched") and the exception TYPE name
+            (never the message) when the query itself raised. Before this
+            distinction existed, a raised exception here was swallowed
+            identically to a genuine empty result — a total precedents outage
+            on an otherwise-healthy pipeline call was invisible to the caller
+            (see ``RetrievalOutcome.precedents_degraded``).
         """
         try:
             memories = self._precedents.query(
@@ -424,7 +463,8 @@ class GuidelineRetriever:
                 precedents = "\nPAST MEDICAL DIRECTOR DECISIONS (PRECEDENTS):\n"
                 for doc in memories["documents"][0]:
                     precedents += f"- {doc}\n"
-                return precedents
+                return precedents, None
+            return "", None
         except Exception as e:
             logger.warning("precedents_query_failed", error=str(e))
-        return ""
+            return "", type(e).__name__
