@@ -221,6 +221,7 @@ class ConfigPatchRequest(BaseModel):
     enable_autonomous_decisions: bool | None = None
     enable_rag: bool | None = None
     demo_mode: bool | None = None
+    rag_degraded_escalates: bool | None = None
 
 
 class ConfigResetResponse(BaseModel):
