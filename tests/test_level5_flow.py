@@ -133,11 +133,10 @@ def test_happy_path_lung_cancer(client):
     assert data["status"] == "AUTO_APPROVED"
 
 
-def test_learning_loop_spine(client):
-    """Level 4 Test: Fail -> Teach -> Succeed"""
-    # 1. Submit WEAK Case (Should Fail/Review)
-    case_payload = {
-        "request_id": f"test_spine_{RUN}",
+def _thin_spine_case(request_id: str) -> dict:
+    """The weak case: 2 weeks of back pain, no motor-weakness finding documented."""
+    return {
+        "request_id": request_id,
         "patient_id": "p2",
         "provider_npi": "123",
         "clinical_case": {
@@ -156,10 +155,9 @@ def test_learning_loop_spine(client):
         },
     }
 
-    resp1 = client.post("/api/v1/authorizations/", json=case_payload, headers=auth_headers())
-    assert resp1.json()["status"] == "IN_REVIEW"
 
-    # 2. Teach the System (Override)
+def _teach_spine_precedent(client) -> None:
+    """Teach the override precedent: MRI approved because of severe motor weakness."""
     feedback = {
         "case_summary": "MRI Spine requested for 2 weeks pain.",
         "decision": "AUTO_APPROVED",
@@ -167,12 +165,76 @@ def test_learning_loop_spine(client):
     }
     client.post("/api/v1/authorizations/feedback", json=feedback, headers=auth_headers())
 
-    # 3. Submit SAME Case Again (Should Pass via Memory).
-    # Same clinical content, new request id — the id is a submission identifier,
-    # not part of the case.
+
+def test_precedent_does_not_override_absent_evidence(client):
+    """
+    Level 4 Test (guard-holds): a taught precedent is weighed, not blindly applied.
+
+    The precedent's justification for auto-approval is "severe motor weakness" —
+    a clinical finding that is NOT present in this case's evidence. The P-5
+    evidence-grounding safety invariant (same family as GC-018/019) means the
+    DecisionAgent must not manufacture that finding just because a similar-looking
+    precedent says to approve. Resubmitting the identical thin case after teaching
+    the precedent must still land in human review.
+    """
+    case_payload = _thin_spine_case(f"test_spine_guard_{RUN}")
+
+    # 1. Submit the thin case — no motor weakness documented → review.
+    resp1 = client.post("/api/v1/authorizations/", json=case_payload, headers=auth_headers())
+    assert resp1.json()["status"] == "IN_REVIEW"
+
+    # 2. Teach the override precedent (severe motor weakness → AUTO_APPROVED).
+    _teach_spine_precedent(client)
+
+    # 3. Resubmit the SAME thin case (new request id, evidence unchanged — still
+    #    no motor weakness). The precedent must not override absent evidence.
     resp2 = client.post(
         "/api/v1/authorizations/",
-        json={**case_payload, "request_id": f"test_spine_{RUN}_retry"},
+        json={**case_payload, "request_id": f"test_spine_guard_{RUN}_retry"},
+        headers=auth_headers(),
+    )
+    data = resp2.json()
+    assert data["status"] == "IN_REVIEW"
+
+
+def test_learning_loop_spine(client):
+    """Level 4 Test: Fail -> Teach -> (evidence now documented) -> Succeed.
+
+    The learning loop only fires auto-approval once the case's OWN evidence
+    documents the finding the precedent was granted on (severe motor weakness).
+    This is the counterpart to test_precedent_does_not_override_absent_evidence:
+    the precedent is followed when its grounding evidence is actually present,
+    never when it is absent.
+    """
+    case_payload = _thin_spine_case(f"test_spine_{RUN}")
+
+    # 1. Submit WEAK Case (Should Fail/Review)
+    resp1 = client.post("/api/v1/authorizations/", json=case_payload, headers=auth_headers())
+    assert resp1.json()["status"] == "IN_REVIEW"
+
+    # 2. Teach the System (Override)
+    _teach_spine_precedent(client)
+
+    # 3. Resubmit with the motor-weakness finding now DOCUMENTED in the case's
+    #    own evidence — same request family, new request id, plus a second
+    #    evidence item.
+    documented_payload = _thin_spine_case(f"test_spine_{RUN}_retry")
+    documented_payload["clinical_case"]["evidence"].append(
+        {
+            "id": "e3",
+            "source_type": "CLINICAL_NOTE",
+            "description": (
+                "Neuro exam: severe progressive motor weakness, 3/5 strength "
+                "with foot drop in the left lower extremity."
+            ),
+            "original_text": "...",
+            "confidence": 1.0,
+        }
+    )
+
+    resp2 = client.post(
+        "/api/v1/authorizations/",
+        json=documented_payload,
         headers=auth_headers(),
     )
     data = resp2.json()
