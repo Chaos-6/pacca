@@ -174,7 +174,7 @@ make sme-author-web        # backend on :8000, frontend on :3000
 
 Then open <http://localhost:3000/login>. There is no default admin account by design — register the first user via `/admin` or `POST /api/v1/register/`.
 
-> **Known limitation:** `make db-upgrade` runs cleanly against PostgreSQL (the Docker path below), but currently fails against fresh SQLite — migration `001_initial_schema` predates the ORM's dialect-agnostic JSON typing and still uses `postgresql.JSONB()` directly, which SQLite's compiler rejects. Uncovered while building the C5 migration-drift CI guard; tracked as a follow-up, not fixed here (out of scope for this change). Use the Docker/PostgreSQL path for a working `make db-upgrade` today.
+`make db-upgrade` runs cleanly on both SQLite and PostgreSQL — Alembic is the single schema source for either backend.
 
 **Backing services via Docker** (API, PostgreSQL, Redis, ChromaDB, Langfuse — the frontend runs from npm, not Compose):
 
