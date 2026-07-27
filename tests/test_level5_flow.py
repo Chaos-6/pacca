@@ -1,58 +1,60 @@
-import contextlib
+"""
+Level 3-5 end-to-end flow: rule-based approval, the learning loop, policy evolution.
+
+Marked `clinical` because every test here POSTs to the real submit/admin routes,
+which call Claude. `-m "not clinical"` (the deterministic suite and CI) deselects
+the module; it runs alongside the other billable gates.
+
+This file previously subclassed GuidelineRetriever to redirect its ChromaDB path,
+reimplementing __init__ with public attribute names (`self.guidelines`,
+`self.client`) that the real class never had. Every method it inherited then
+raised AttributeError on `self._guidelines`. The subclass is gone: the retriever
+takes `db_path` directly, so the test uses the supported seam.
+"""
+
 import os
 import shutil
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from src.pacca.api.main import app
+from jose import jwt
+from sqlalchemy import create_engine
 
-# Import the modules where the global 'rag_engine' lives so we can overwrite it
-from src.pacca.api.routes import admin, authorizations
-from src.pacca.integrations.vector_store import GuidelineRetriever
+# Registers User on AuthBase's metadata — never referenced directly, but the
+# import's side effect (populating AuthBase.metadata.tables) is required
+# before create_all(AuthBase.metadata) below, or `users` silently isn't built.
+import pacca.api.models.user  # noqa: F401
+from pacca.api.auth import ALGORITHM, SECRET_KEY
+from pacca.api.database import Base as AuthBase
+from pacca.api.main import app
+
+# Import the module where the global 'rag_engine' lives so we can overwrite it
+from pacca.api.routes import authorizations
+from pacca.config.settings import get_settings
+from pacca.db.models import Base as DomainBase
+from pacca.integrations.vector_store import GuidelineRetriever
+
+pytestmark = pytest.mark.clinical
 
 # We create a specific test database path
 TEST_DB_PATH = os.path.join(os.getcwd(), "test_pacca_db")
 
+# authorization_requests.request_id is UNIQUE and the SQLite file outlives the
+# run, so fixed ids ("test_1") collide on the second execution. The learning-loop
+# test also submits the *same clinical case* twice, which is the point — only the
+# request id has to differ.
+RUN = uuid.uuid4().hex[:8]
+
 
 @pytest.fixture(scope="module")
 def test_rag():
-    """
-    Creates a single RAG engine for the entire test session
-    pointed at a temporary directory.
-    """
-    # 1. Setup: Create clean DB
+    """A single RAG engine for the module, pointed at a throwaway directory."""
     if os.path.exists(TEST_DB_PATH):
         shutil.rmtree(TEST_DB_PATH)
 
-    # Initialize the Retriever with the custom path
-    # We need to hack the init slightly or just rely on the fact
-    # that we can swap the client.
-    # Actually, simpler: We monkeypatch the class to use our path.
-
-    # Let's just create it and manually swap the client if needed,
-    # BUT since your code hardcodes "./pacca_db", we need to be clever.
-    # The cleanest way without changing source code is to change the CWD
-    # or just Mock the class.
-
-    # Let's PATCH the global instances in the route files.
-    # But first we need an instance that uses the test path.
-
-    # Since 'GuidelineRetriever' hardcodes the path, we will subclass it for tests.
-    class TestRetriever(GuidelineRetriever):
-        def __init__(self):
-            import chromadb
-            from chromadb.utils import embedding_functions
-
-            self.client = chromadb.PersistentClient(path=TEST_DB_PATH)
-            self.embedding_fn = embedding_functions.DefaultEmbeddingFunction()
-            self.guidelines = self.client.get_or_create_collection(
-                name="nccn_guidelines", embedding_function=self.embedding_fn
-            )
-            self.precedents = self.client.get_or_create_collection(
-                name="case_precedents", embedding_function=self.embedding_fn
-            )
-
-    rag = TestRetriever()
+    rag = GuidelineRetriever(db_path=TEST_DB_PATH)
 
     # Seed it immediately
     rag.add_guideline(
@@ -76,31 +78,68 @@ def test_rag():
 
 
 @pytest.fixture(autouse=True)
-def inject_rag(test_rag):
+def inject_rag(test_rag, monkeypatch):
     """
-    This fixture runs before EVERY test.
-    It overwrites the 'rag_engine' variable in your API routes
-    with our safe 'test_rag' instance.
+    Point the route's module-level rag_engine at the throwaway store.
+
+    Precedents are emptied between tests so the learning-loop test cannot be
+    satisfied by a precedent an earlier test wrote. Rows are deleted rather than
+    the collection dropped: dropping it would leave the retriever (and the
+    pipeline built over it) holding a handle to a deleted collection.
     """
-    authorizations.rag_engine = test_rag
-    admin.rag_engine = test_rag
+    monkeypatch.setattr(authorizations, "rag_engine", test_rag)
 
-    # IMPORTANT: Clear the 'Memory' collection between tests
-    # so learning tests don't pollute each other.
-    with contextlib.suppress(Exception):
-        test_rag.client.delete_collection("case_precedents")
-    test_rag.precedents = test_rag.client.get_or_create_collection(
-        name="case_precedents", embedding_function=test_rag.embedding_fn
-    )
+    existing = test_rag._precedents.get(include=[])["ids"]
+    if existing:
+        test_rag._precedents.delete(ids=existing)
 
 
-client = TestClient(app)
+@pytest.fixture(scope="module")
+def client():
+    """
+    Context-managed so the app lifespan runs. A bare `TestClient(app)` never
+    enters it, so `init_database()` never ran and the first audit write failed
+    with "no such table: audit_logs".
+
+    Schema creation (C5): as of the Alembic-single-source-of-truth change,
+    `init_database()` in the app lifespan no longer calls `create_all` — it
+    only verifies the engine, on the assumption `alembic upgrade head` already
+    ran. Nothing in this test module runs Alembic, so the test has to build
+    its own schema, on BOTH declarative Bases (`db.models.Base` for the
+    domain tables — audit_logs, authorization_requests, decisions — and
+    `api.database.Base` for the legacy sync `users` table). Done with a SYNC
+    engine (L-025): this fixture is plain `def`, not `async def`, so there is
+    no running event loop to hand an async engine to — a sync engine pointed
+    at the same sqlite file sidesteps any "attached to a different loop"
+    failure. `create_all` is idempotent (`checkfirst=True` by default), so
+    this is safe whether or not the app/Alembic has already built the schema.
+    """
+    settings = get_settings()
+    sync_url = settings.database_url.replace("+aiosqlite", "")
+    sync_engine = create_engine(sync_url)
+    try:
+        DomainBase.metadata.create_all(sync_engine)
+        AuthBase.metadata.create_all(sync_engine)
+    finally:
+        sync_engine.dispose()
+
+    with TestClient(app) as test_client:
+        yield test_client
 
 
-def test_happy_path_lung_cancer():
+def auth_headers() -> dict[str, str]:
+    """
+    Both routers under test are mounted with `dependencies=[Depends(verify_token)]`,
+    so every request here needs a Bearer token. Mirrors tests/unit/api/conftest.py.
+    """
+    payload = {"sub": "test-user", "exp": datetime.now(UTC) + timedelta(minutes=30)}
+    return {"Authorization": f"Bearer {jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)}"}
+
+
+def test_happy_path_lung_cancer(client):
     """Level 3 Test: Auto-Approval based on Rules"""
     payload = {
-        "request_id": "test_1",
+        "request_id": f"test_1_{RUN}",
         "patient_id": "p1",
         "provider_npi": "123",
         "clinical_case": {
@@ -118,17 +157,16 @@ def test_happy_path_lung_cancer():
             ],
         },
     }
-    response = client.post("/api/v1/authorizations/", json=payload)
+    response = client.post("/api/v1/authorizations/", json=payload, headers=auth_headers())
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "AUTO_APPROVED"
 
 
-def test_learning_loop_spine():
-    """Level 4 Test: Fail -> Teach -> Succeed"""
-    # 1. Submit WEAK Case (Should Fail/Review)
-    case_payload = {
-        "request_id": "test_spine",
+def _thin_spine_case(request_id: str) -> dict:
+    """The weak case: 2 weeks of back pain, no motor-weakness finding documented."""
+    return {
+        "request_id": request_id,
         "patient_id": "p2",
         "provider_npi": "123",
         "clinical_case": {
@@ -147,19 +185,88 @@ def test_learning_loop_spine():
         },
     }
 
-    resp1 = client.post("/api/v1/authorizations/", json=case_payload)
-    assert resp1.json()["status"] == "IN_REVIEW"
 
-    # 2. Teach the System (Override)
+def _teach_spine_precedent(client) -> None:
+    """Teach the override precedent: MRI approved because of severe motor weakness."""
     feedback = {
         "case_summary": "MRI Spine requested for 2 weeks pain.",
         "decision": "AUTO_APPROVED",
         "rationale": "Override: Patient actually had severe motor weakness not documented in initial NLP.",
     }
-    client.post("/api/v1/authorizations/feedback", json=feedback)
+    client.post("/api/v1/authorizations/feedback", json=feedback, headers=auth_headers())
 
-    # 3. Submit SAME Case Again (Should Pass via Memory)
-    resp2 = client.post("/api/v1/authorizations/", json=case_payload)
+
+def test_precedent_does_not_override_absent_evidence(client):
+    """
+    Level 4 Test (guard-holds): a taught precedent is weighed, not blindly applied.
+
+    The precedent's justification for auto-approval is "severe motor weakness" —
+    a clinical finding that is NOT present in this case's evidence. The P-5
+    evidence-grounding safety invariant (same family as GC-018/019) means the
+    DecisionAgent must not manufacture that finding just because a similar-looking
+    precedent says to approve. Resubmitting the identical thin case after teaching
+    the precedent must still land in human review.
+    """
+    case_payload = _thin_spine_case(f"test_spine_guard_{RUN}")
+
+    # 1. Submit the thin case — no motor weakness documented → review.
+    resp1 = client.post("/api/v1/authorizations/", json=case_payload, headers=auth_headers())
+    assert resp1.json()["status"] == "IN_REVIEW"
+
+    # 2. Teach the override precedent (severe motor weakness → AUTO_APPROVED).
+    _teach_spine_precedent(client)
+
+    # 3. Resubmit the SAME thin case (new request id, evidence unchanged — still
+    #    no motor weakness). The precedent must not override absent evidence.
+    resp2 = client.post(
+        "/api/v1/authorizations/",
+        json={**case_payload, "request_id": f"test_spine_guard_{RUN}_retry"},
+        headers=auth_headers(),
+    )
+    data = resp2.json()
+    assert data["status"] == "IN_REVIEW"
+
+
+def test_learning_loop_spine(client):
+    """Level 4 Test: Fail -> Teach -> (evidence now documented) -> Succeed.
+
+    The learning loop only fires auto-approval once the case's OWN evidence
+    documents the finding the precedent was granted on (severe motor weakness).
+    This is the counterpart to test_precedent_does_not_override_absent_evidence:
+    the precedent is followed when its grounding evidence is actually present,
+    never when it is absent.
+    """
+    case_payload = _thin_spine_case(f"test_spine_{RUN}")
+
+    # 1. Submit WEAK Case (Should Fail/Review)
+    resp1 = client.post("/api/v1/authorizations/", json=case_payload, headers=auth_headers())
+    assert resp1.json()["status"] == "IN_REVIEW"
+
+    # 2. Teach the System (Override)
+    _teach_spine_precedent(client)
+
+    # 3. Resubmit with the motor-weakness finding now DOCUMENTED in the case's
+    #    own evidence — same request family, new request id, plus a second
+    #    evidence item.
+    documented_payload = _thin_spine_case(f"test_spine_{RUN}_retry")
+    documented_payload["clinical_case"]["evidence"].append(
+        {
+            "id": "e3",
+            "source_type": "CLINICAL_NOTE",
+            "description": (
+                "Neuro exam: severe progressive motor weakness, 3/5 strength "
+                "with foot drop in the left lower extremity."
+            ),
+            "original_text": "...",
+            "confidence": 1.0,
+        }
+    )
+
+    resp2 = client.post(
+        "/api/v1/authorizations/",
+        json=documented_payload,
+        headers=auth_headers(),
+    )
     data = resp2.json()
     assert data["status"] == "AUTO_APPROVED"
 
@@ -169,14 +276,14 @@ def test_learning_loop_spine():
     )
 
 
-def test_dark_factory_evolution():
+def test_dark_factory_evolution(client):
     """Level 5 Test: Policy Rewriting"""
     # Trigger optimization
-    resp = client.post("/api/v1/admin/optimize_policies")
+    resp = client.post("/api/v1/admin/optimize_policies", headers=auth_headers())
     data = resp.json()
 
-    if data["status"] == "optimized":
-        assert "weakness" in data["change"].lower()
-    else:
-        assert data["status"] == "proposed"
-        assert "weakness" in data["proposal"]["proposed_text"].lower()
+    # The route stores a PENDING proposal and deploys nothing; it has returned
+    # "proposal_pending" with a `proposed_text_preview` since iter-6. The old
+    # "optimized"/"proposed" branches asserted a contract that no longer exists.
+    assert data["status"] == "proposal_pending"
+    assert "weakness" in data["proposed_text_preview"].lower()

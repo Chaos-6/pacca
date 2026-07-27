@@ -21,7 +21,8 @@ integrity are non-negotiable, not nice-to-haves.
 Stack: Python 3.12 + FastAPI (async), Pydantic v2, PostgreSQL 16 / SQLite (dev),
 ChromaDB (**dual-collection**: `nccn_guidelines` + `case_precedents`, via the live
 `integrations/vector_store.py` — see the RAG note below), React 18 + Vite frontend,
-OpenTelemetry spans (Langfuse export intended), Claude (`claude-sonnet-4`) with
+OpenTelemetry spans (Langfuse export intended), Claude (`claude-sonnet-4-5-20250929`,
+the `settings.anthropic_model` default) with
 tool-use forced for structured output.
 
 ## The one rule that governs every behavioral change
@@ -90,10 +91,13 @@ every PR is one path or the other, never ambiguous.
   `/feedback`, retrieved on submit under a "PAST MEDICAL DIRECTOR DECISIONS" header the
   DecisionAgent prompt weighs). Both collections are governed by the P-4 scope guard
   (iter-13): `RAG_COLLECTIONS` is the SSOT the `IntentRecord` allow-list mirrors.
-- `src/pacca/rag/pipeline.py` — the OLD single-collection `GuidelineVectorStore`
-  (`clinical_guidelines`). **Dead code:** it does not import cleanly (stale references in
-  `models/guidelines.py`) and the live path (`integrations/vector_store.py`) falls back
-  past it. Revival or removal is a tracked follow-up; do not add to it.
+- `src/pacca/rag/pipeline.py` — `GuidelineVectorStore` + `RAGPipeline`: chunking,
+  embedding, ingest and cosine-scored retrieval. **Live.** It was dead until the
+  import chain was repaired (missing `ClinicalSpecialty`/`TreatmentCategory` enums,
+  the `uuid7` → `uuid_extensions` module name); the bare `except ImportError` in
+  `integrations/vector_store.py` swallowed that and fell back forever. It no longer
+  names a collection of its own — `GuidelineRetriever` injects the governed
+  collection it already holds, so there is no ungoverned `clinical_guidelines` store.
 - Span emission lives in `src/pacca/agents/base.py` + `src/pacca/config/tracing.py`
   (one span per agent call). There is **no** `src/pacca/observability/` package.
 - `src/pacca/api/`, `src/pacca/db/`, `src/pacca/models/`, `src/pacca/config/` — standard.
@@ -140,7 +144,8 @@ Use the Makefile targets (they encode the correct markers):
   reports the current count rather than a number baked into this doc.)
 - **Everything non-clinical:** `make test-all` (`pytest tests/ -m "not clinical"`).
 - **Coverage:** `make test-cov`.
-- **Clinical / LLM-as-judge gate:** `make test-clinical` (`pytest tests/clinical/ -m clinical`).
+- **Clinical / LLM-as-judge gate:** `make test-clinical` (`pytest tests/ -m clinical` —
+  the marker is the selector, and `tests/test_level5_flow.py` carries it too).
   Makes real Claude calls (~3–5 min); requires `ANTHROPIC_API_KEY` in the shell env —
   source it from the gitignored `.env`, never hardcode or print it. This is the golden-set
   accuracy gate (incl. GC-018/019); run it at the final merge HEAD for any behavior change.
@@ -151,7 +156,7 @@ Use the Makefile targets (they encode the correct markers):
 > **Manifest validation:** `python -m pacca.harness.validate_manifest harness/manifests/iter-N.json`
 > (or `--all`) validates a change manifest against `change_manifest.schema.json` plus the
 > `GC-\d{3}` case-id convention; exit 0 = valid, 1 = errors (per-error report on stderr).
-> CI does not yet run it as a gate — that is harness change P-6.
+> CI runs it on every PR as the `validate-manifests` job (P-6).
 
 ## Limitations (what the design intends but the code does not yet do)
 
@@ -160,11 +165,6 @@ Use the Makefile targets (they encode the correct markers):
   scope guard (`agents/scope_guard.py`) is the first middleware-*pattern* component — a
   call-site wrapper, not a framework middleware — now wired into the submit route in
   enforce mode (chg-9). A true middleware loader remains roadmap.
-- **Dead `rag/pipeline.py`.** The dual-collection RAG is **built and governed** in the
-  live `integrations/vector_store.py` (see Where-things-live). What remains dead is the
-  OLD `rag/pipeline.py` single-collection store — it does not import cleanly (stale
-  `uuid7` / missing-enum references in `models/guidelines.py`) and nothing on the live
-  path depends on it. Reviving or removing it is a tracked follow-up.
 - **Precedent grounding (P-5 policy, iter-13).** Retrieved precedents are institutional
   *context*, not citable evidence: the DecisionAgent still populates
   `cited_evidence_ids` from **submission** `EvidenceItem`s only, so the P-5
@@ -177,10 +177,13 @@ Use the Makefile targets (they encode the correct markers):
   `chg-`/agent-rag PRs and nightly). They run and can fail, but *blocking merge* on them
   requires David's branch-protection setting + the `ANTHROPIC_API_KEY` repo secret (the
   clinical-gate is inert without it). Doc-drift already runs inside `tests/unit` (P-1).
-- **No SECRET_KEY fail-fast.** `config/settings.py` ships a weak default `secret_key`
-  (and a placeholder `anthropic_api_key`) with **no** startup validator rejecting weak or
-  missing values. The server will start with insecure defaults. Add a fail-fast validator
-  before relying on the earlier "refuses to start" behavior.
+- **Medical Director case resolution is unimplemented.** The review queue
+  (`GET /authorizations/review-queue`) reads real escalated decisions, and `/feedback`
+  writes a real precedent, but nothing records a director's *disposition*: no
+  `HumanReviewModel` row, no decision-outcome change. A reviewed case reappears on the
+  next fetch. The API says so in `ReviewQueueResponse.resolution_supported` (False) and
+  the UI renders that flag rather than a constant of its own — so this stays honest by
+  construction. Implementing resolution means a disposition write plus flipping the flag.
 - **Policy change log is in-memory.** See the safety-invariants note above.
 
 ## Target architecture (roadmap)
@@ -192,26 +195,27 @@ These are the intended end-states, moved here so they are not mistaken for curre
   `tools/*.py` + `middleware/*.py` + `skills/<name>/SKILL.md` +
   `sub_agents/<name>/agent.yaml`, declared in a per-agent `agent.yaml` loaded by a
   framework. Rationale: file-level component decoupling + one-file-diff rollback.
-- **Dual-collection RAG:** separate `nccn_guidelines` (authoritative) and
-  `case_precedents` (institutional memory) stores, kept apart for their different trust
-  levels.
 - **RAG chunk-id grounding (P-5 follow-up):** thread stable chunk ids from
   `retrieve_relevant_guidelines` through into the agent-visible context and expose the
   retrieved-id set to the orchestrator, so the P-5 evidence-grounding detector
   (`agents/evidence_grounding.py`) can also verify citations against *retrieved RAG
   chunks*. Today the retriever hands the agent concatenated text with no ids, so P-5
-  grounds only against submission `EvidenceItem` ids. Pairs naturally with the
-  dual-collection RAG work above.
-- **CI enforcement (P-6):** `validate-manifests` + `clinical-gate` jobs that make the
-  manifest and GC-018/019 gates build-blocking.
-- **Integration test tier:** `tests/integration/` exists but is **empty** (an
-  `__init__.py` and nothing else) — `pytest tests/integration` collects 0 items. The
-  intent is a tier that exercises the submit route end-to-end across real component
-  boundaries (API → orchestrator → scope guard → repository → audit log) against a
-  live test DB, rather than the unit tier's mocked seams. Until it holds tests, do
-  **not** list it as a test tier in user-facing docs — the README project-structure
-  tree drops it, and it comes back to the tree when it has coverage. Current real
-  tiers: `tests/unit` (652), `tests/clinical` (28), `tests/harness` (27).
+  grounds only against submission `EvidenceItem` ids.
+- **CI enforcement (P-6):** the `validate-manifests` + `clinical-gate` jobs exist and
+  run; what remains is branch protection making them build-blocking (David's step).
+- **Integration test tier:** `tests/integration/` holds 2 real-Postgres tests
+  (`test_submit_postgres.py`, marked `postgres`), which skip unless `POSTGRES_TEST_URL`
+  is set — `make test-postgres`. The intent is wider end-to-end coverage across real
+  component boundaries (API → orchestrator → scope guard → repository → audit log)
+  rather than the unit tier's mocked seams.
+
+Test-tier sizes as of 2026-07-25 (`pytest --collect-only -q` is authoritative;
+these drift): `tests/unit` 724, `tests/clinical` 28, `tests/harness` 27,
+`tests/integration` 2, `tests/test_level5_flow.py` 3 — 784 total, of which 8 carry
+the `clinical` marker. `pytest tests/ -m "not clinical"` = 774 passed, 2 skipped.
+
+The frontend has its own tier: `frontend/e2e/` (Playwright, backend mocked by route
+interception) — `cd frontend && npx playwright test`. Not part of `make test-all`.
 
 ## Canonical repo
 

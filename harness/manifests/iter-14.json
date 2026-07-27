@@ -1,0 +1,84 @@
+{
+  "iteration": 14,
+  "iteration_tag": "harness-iter-14",
+  "iso_date": "2026-07-25",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-13",
+  "summary": "Makes the RAG retrieval path real. chg-17: repair the import chain that made pacca.rag.pipeline unimportable, so the production pipeline runs instead of a bare-except fallback nobody could see. chg-18: remove the phantom ungoverned collection, fix metadata filters that silently matched nothing, and derive similarity from the collection's real distance space. Both change what guideline context the DecisionAgent sees, so both are behavioral.",
+  "changes": [
+    {
+      "id": "chg-17",
+      "type": "improvement",
+      "description": "Repair the import chain behind pacca.rag.pipeline (uuid7 -> uuid_extensions module name, the missing ClinicalSpecialty / TreatmentCategory enums, absent re-exports) and build the pipeline per retriever instance, logging at error level when it cannot be built.",
+      "files": [
+        "src/pacca/models/enums.py",
+        "src/pacca/models/guidelines.py",
+        "src/pacca/models/__init__.py",
+        "src/pacca/integrations/vector_store.py",
+        "tests/unit/test_rag_pipeline_wired.py"
+      ],
+      "failure_pattern": "Every deployment served guideline context from the degraded direct-ChromaDB fallback, not the chunked, cosine-scored pipeline the design describes. Nothing in a log or a test could tell the two apart, so the condition was permanent and invisible.",
+      "root_cause": "models/guidelines.py did 'from uuid7 import uuid7' (the distribution installs its module as uuid_extensions) and referenced two enums that did not exist, so importing pacca.rag.pipeline raised ImportError. integrations/vector_store.py caught that in a bare 'except ImportError' and latched a module-level None, which every later call read as 'no pipeline'. A silent fallback plus an unimportable module is indistinguishable from a working system.",
+      "evidence": [
+        {
+          "source": "python -c 'import pacca.rag.pipeline'",
+          "note": "Pre-fix: ModuleNotFoundError: No module named 'uuid7' (the installed distribution exposes uuid_extensions), then NameError on ClinicalSpecialty once that was worked around. Post-fix: imports cleanly."
+        },
+        {
+          "source": "tests/unit/test_rag_pipeline_wired.py",
+          "note": "22 tests: the pipeline initializes over the injected collection, retrieval goes through it, pipeline_available reports the truth, and the fallback path is still reachable and logged. Mutation-checked by restoring the bad module name — the initialization test fails."
+        }
+      ],
+      "predicted_fixes": [
+        "GuidelineRetriever builds a RAGPipeline on construction and retrieval runs through it.",
+        "A pipeline that cannot be built is logged at error level rather than swallowed, and pipeline_available reports it.",
+        "The DecisionAgent receives chunk-scored guideline context instead of the fallback's raw documents."
+      ],
+      "risk_cases": [
+        "A ChromaDB store seeded under the fallback path holds documents that were never chunked; they remain retrievable, just as whole documents.",
+        "The pipeline is per-instance now, so a test that swapped the module-level latch no longer affects other instances — intended, but it is a behavior change for test code."
+      ],
+      "constraint_level": "tool_implementation",
+      "why_this_component": "The defect is in the retrieval tool's implementation and its import graph, not in how any agent reasons over what it returns.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Revert the four src/ files together; they are one import graph and a partial revert reintroduces the ImportError. The retriever then falls back to direct ChromaDB as before."
+    },
+    {
+      "id": "chg-18",
+      "type": "improvement",
+      "description": "GuidelineVectorStore no longer opens a collection of its own (the phantom, ungoverned 'clinical_guidelines'); the retriever injects the governed collection. Specialty/category filters use per-value boolean flags instead of $contains, and similarity is derived from the collection's real distance space.",
+      "files": [
+        "src/pacca/rag/pipeline.py",
+        "src/pacca/integrations/vector_store.py"
+      ],
+      "failure_pattern": "Filtered retrieval returned nothing and fell through to an unfiltered retry, so a specialty-scoped query silently became a global one. Separately, a second ChromaDB client held a 'clinical_guidelines' collection that sat outside the P-4 scope guard and outside the test seam.",
+      "root_cause": "The where clause used $contains, a where_document operator ChromaDB accepts on metadata but never satisfies — zero rows, no error. The unfiltered retry then masked it. The phantom collection existed because the pipeline named and opened its own store rather than being handed the governed one, which also meant scope-guard governance covered a collection the pipeline never used.",
+      "evidence": [
+        {
+          "source": "ChromaDB query with where={'specialty': {'$contains': 'oncology'}}",
+          "note": "Returns [] against a collection whose documents carry that specialty. Post-fix, ingest writes a boolean flag per value and the flag-based where clause matches."
+        },
+        {
+          "source": "collection.configuration_json['hnsw']['space']",
+          "note": "Reports the collection's real space. metadata={'hnsw:space': 'cosine'} only applies at creation, so a pre-existing l2 collection was being scored as if cosine. similarity_from_distance now branches on the reported space."
+        }
+      ],
+      "predicted_fixes": [
+        "A specialty- or category-filtered retrieval returns the matching subset instead of falling back to everything.",
+        "There is exactly one governed guideline collection; RAG_COLLECTIONS remains the SSOT the IntentRecord mirrors.",
+        "Similarity scores are correct for l2 collections, not only cosine ones."
+      ],
+      "risk_cases": [
+        "Documents ingested before this change carry no boolean flags, so a filtered query will not return them until re-ingested. Unfiltered retrieval is unaffected.",
+        "Chunk-overlap forward-progress guard changes chunk boundaries, so scores are not comparable across the change."
+      ],
+      "constraint_level": "tool_implementation",
+      "why_this_component": "Collection ownership, filter construction and score derivation are all properties of the retrieval tool. The agent-visible contract (a block of guideline text) is unchanged in shape.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Revert both files. Filtered queries return to silently matching nothing; the phantom collection returns. Re-ingestion is not required to roll back, only to roll forward."
+    }
+  ]
+}

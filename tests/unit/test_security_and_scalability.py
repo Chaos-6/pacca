@@ -30,7 +30,7 @@ unit suite on every commit.
 """
 
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -106,45 +106,99 @@ class TestSecretKeyFromEnvironment:
         )
 
 
+GOOD_KEY = "9f3c1a7be24d05f8c6a1becd730f4821a95d6ec4bb0713fe2a8c5d90416b7fae"
+
+
 class TestValidateSecretKey:
     """
     Verify validate_secret_key() fails fast on bad configuration.
+
+    The length-only version of this check accepted two things it should not have:
+    a 32-char key of a single repeated character, and the 61-char placeholder
+    shipped in .env.example. Both are covered below.
     """
 
     def test_raises_on_empty_key(self):
         """Empty SECRET_KEY must raise RuntimeError at startup."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", ""):
-            with pytest.raises(RuntimeError) as exc_info:
-                validate_secret_key()
-            assert "SECRET_KEY" in str(exc_info.value)
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="", app_env="production")
+        assert "SECRET_KEY" in str(exc_info.value)
 
     def test_raises_on_short_key(self):
         """Keys shorter than 32 characters must raise RuntimeError."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", "tooshort"):
-            with pytest.raises(RuntimeError) as exc_info:
-                validate_secret_key()
-            assert "32" in str(exc_info.value), (
-                "Error message should mention the 32-character minimum."
-            )
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="tooshort", app_env="production")
+        assert "32" in str(exc_info.value), "Error message should mention the 32-character minimum."
 
     def test_passes_on_adequate_key(self):
-        """A 32-character key must pass validation without raising."""
+        """A generated 32-character key must pass validation without raising."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", "x" * 32):
-            # Should not raise
-            validate_secret_key()
+        validate_secret_key(key=GOOD_KEY[:32], app_env="production")
 
     def test_passes_on_long_key(self):
         """Keys longer than 32 characters must also pass."""
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", "x" * 64):
-            validate_secret_key()
+        validate_secret_key(key=GOOD_KEY, app_env="production")
+
+    def test_raises_on_long_but_low_entropy_key(self):
+        """
+        Length is not entropy. "xxxx...x" is 64 characters and one distinct
+        character; the length-only check accepted it.
+        """
+        from pacca.api.auth import validate_secret_key
+
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="x" * 64, app_env="production")
+        assert "distinct" in str(exc_info.value)
+
+    def test_raises_on_placeholder_key_in_production(self):
+        """
+        The .env.example placeholder is long enough to pass a length check, and
+        it is published in this repository — anyone can forge a token with it.
+        """
+        from pacca.api.auth import validate_secret_key
+
+        placeholder = "REPLACE-THIS-generate-with-python-secrets-module-min-32-chars"
+        assert len(placeholder) >= 32, "guard: this must be long enough to reach the marker check"
+
+        for env in ("production", "staging"):
+            with pytest.raises(RuntimeError) as exc_info:
+                validate_secret_key(key=placeholder, app_env=env)
+            assert "placeholder" in str(exc_info.value).lower()
+
+    def test_placeholder_key_is_allowed_outside_production(self):
+        """
+        Running the suite must not require a real secret, so development/test
+        tolerate a placeholder — the environment picks the strictness, and the
+        permissive case is the explicitly-named one.
+        """
+        from pacca.api.auth import validate_secret_key
+
+        for env in ("development", "test"):
+            validate_secret_key(
+                key="test-secret-key-min-32-chars-for-unit-tests",
+                app_env=env,
+            )
+
+    def test_a_short_key_still_raises_in_development(self):
+        """Relaxing the placeholder rule must not relax the length rule."""
+        from pacca.api.auth import validate_secret_key
+
+        with pytest.raises(RuntimeError):
+            validate_secret_key(key="short", app_env="development")
+
+    def test_defaults_to_the_module_key(self):
+        """Called with no arguments, it validates the env-derived SECRET_KEY."""
+        from pacca.api.auth import validate_secret_key
+
+        with patch("pacca.api.auth.SECRET_KEY", "x" * 64), pytest.raises(RuntimeError):
+            validate_secret_key(app_env="production")
 
     def test_error_message_includes_generation_command(self):
         """
@@ -153,14 +207,61 @@ class TestValidateSecretKey:
         """
         from pacca.api.auth import validate_secret_key
 
-        with patch("pacca.api.auth.SECRET_KEY", ""):
-            with pytest.raises(RuntimeError) as exc_info:
-                validate_secret_key()
-            # Error should tell the user how to generate a proper key
-            assert "secrets" in str(exc_info.value).lower() or "token_hex" in str(exc_info.value), (
-                "Error message should include the key generation command: "
-                'python -c "import secrets; print(secrets.token_hex(32))"'
-            )
+        with pytest.raises(RuntimeError) as exc_info:
+            validate_secret_key(key="", app_env="production")
+        # Error should tell the user how to generate a proper key
+        assert "secrets" in str(exc_info.value).lower() or "token_hex" in str(exc_info.value), (
+            "Error message should include the key generation command: "
+            'python -c "import secrets; print(secrets.token_hex(32))"'
+        )
+
+
+class TestStartupSecretKeyGate:
+    """
+    The startup gate itself — that validation is reached at all.
+
+    The lifespan previously wrapped the call in `if settings.app_env != "test"`,
+    so a production deployment skipped signing-key validation entirely by setting
+    one environment variable. These tests assert the bypass is gone.
+    """
+
+    def test_lifespan_validates_unconditionally(self):
+        """No app_env value may skip the call."""
+        import ast
+        import inspect
+
+        from pacca.api import main as main_module
+
+        source = inspect.getsource(main_module.lifespan)
+        tree = ast.parse(source.strip())
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "validate_secret_key"
+        ]
+        assert len(calls) == 1, "lifespan must call validate_secret_key exactly once"
+
+        # The call must not sit inside a conditional — that is what made the
+        # APP_ENV=test bypass possible.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                assert not any(call in ast.walk(node) for call in calls), (
+                    "validate_secret_key must not be guarded by a conditional"
+                )
+
+    def test_settings_has_no_secret_key_field(self):
+        """
+        Settings must not carry a second, weakly-defaulted copy of the signing key.
+
+        It previously defaulted to a published 51-char string that no code read —
+        long enough to look valid, and a standing invitation to drift from the
+        real env-only key in pacca.api.auth.
+        """
+        from pacca.config.settings import Settings
+
+        assert "secret_key" not in Settings.model_fields
 
 
 class TestTokenExpiry:
@@ -325,63 +426,110 @@ class TestRAGPipelineIntegration:
 
     def test_guideline_retriever_attempts_rag_pipeline(self):
         """
-        GuidelineRetriever.query() must attempt to use RAGPipeline.
+        GuidelineRetriever.query() must route through RAGPipeline.
 
-        We verify this by patching _get_pipeline() to return a mock
-        and confirming the pipeline's retrieve method is called.
+        The pipeline handle now lives on the instance (self._pipeline) rather
+        than a module singleton, so the mock is attached there.
         """
         from pacca.integrations import vector_store as vs_module
 
         mock_pipeline = MagicMock()
-        mock_pipeline.retrieve_relevant_guidelines = AsyncMock(
-            return_value="NCCN: Pembrolizumab recommended for PD-L1 >= 50%."
+        mock_pipeline.retrieve_relevant_guidelines_sync.return_value = (
+            "NCCN: Pembrolizumab recommended for PD-L1 >= 50%."
         )
 
-        with patch.object(vs_module, "_get_pipeline", return_value=mock_pipeline):
-            # Reset the singleton so our mock is used
-            vs_module._rag_pipeline = mock_pipeline
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        # Patch the chromadb client to avoid filesystem access
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = mock_pipeline
 
-            retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
-            # Patch the chromadb client to avoid filesystem access
-            retriever._client = MagicMock()
-            retriever._embedding_fn = MagicMock()
-            retriever._guidelines = MagicMock()
-            retriever._precedents = MagicMock()
-            retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        result = retriever.query("Guidelines for C34.1 and J9271")
 
-            # The call should go through RAGPipeline
-            result = retriever.query("Guidelines for C34.1 and J9271")
+        # The pipeline was actually invoked — not silently skipped. The old
+        # assertion allowed `len(result) > 0`, which the fallback also satisfies,
+        # so it passed for months while the pipeline never ran at all.
+        mock_pipeline.retrieve_relevant_guidelines_sync.assert_called_once()
+        assert "Pembrolizumab" in result
+        # The direct-ChromaDB fallback must NOT have been used.
+        retriever._guidelines.query.assert_not_called()
 
-        # RAGPipeline was used (result contains its return value)
-        assert "Pembrolizumab" in result or len(result) > 0
+    def test_query_parses_diagnosis_and_procedure_from_route_query(self):
+        """The route's 'Guidelines for {dx} and {cpt}' string is split into codes."""
+        from pacca.integrations import vector_store as vs_module
 
-    def test_guideline_retriever_falls_back_gracefully(self):
+        mock_pipeline = MagicMock()
+        mock_pipeline.retrieve_relevant_guidelines_sync.return_value = "guidelines"
+
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = mock_pipeline
+
+        retriever.query("Guidelines for C34.1 and J9271")
+
+        kwargs = mock_pipeline.retrieve_relevant_guidelines_sync.call_args.kwargs
+        assert kwargs["diagnosis_code"] == "C34.1"
+        assert kwargs["treatment_code"] == "J9271"
+        # No fabricated "general" category — it filtered out every document and
+        # forced a wasted unfiltered retry on every single query.
+        assert kwargs.get("treatment_category") is None
+
+    def test_guideline_retriever_falls_back_when_pipeline_unavailable(self):
         """
-        When RAGPipeline is unavailable, GuidelineRetriever falls back
-        to direct ChromaDB queries without raising an exception.
+        When RAGPipeline is unavailable, query() degrades to direct ChromaDB
+        queries without raising.
         """
         from pacca.integrations import vector_store as vs_module
 
-        # Simulate pipeline unavailable
-        vs_module._rag_pipeline = None
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._guidelines.query.return_value = {
+            "documents": [["NCCN guideline text"]],
+            "metadatas": [[{"source": "NCCN"}]],
+        }
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+        }
+        retriever._pipeline = None
 
-        with patch.object(vs_module, "_get_pipeline", return_value=None):
-            retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
-            retriever._client = MagicMock()
-            retriever._embedding_fn = MagicMock()
-            retriever._guidelines = MagicMock()
-            retriever._guidelines.query.return_value = {
-                "documents": [["NCCN guideline text"]],
-                "metadatas": [[{"source": "NCCN"}]],
-            }
-            retriever._precedents = MagicMock()
-            retriever._precedents.query.return_value = {
-                "documents": [[]],
-                "metadatas": [[]],
-            }
+        assert retriever.pipeline_available is False
 
-            # Should not raise even without RAGPipeline
-            result = retriever._query_direct("Guidelines for C34.1 and J9271")
+        result = retriever.query("Guidelines for C34.1 and J9271")
+
+        assert "OFFICIAL GUIDELINES" in result
+        assert "NCCN guideline text" in result
+
+    def test_guideline_retriever_falls_back_when_pipeline_raises(self):
+        """A pipeline error must degrade to the direct path, not surface to the caller."""
+        from pacca.integrations import vector_store as vs_module
+
+        mock_pipeline = MagicMock()
+        mock_pipeline.retrieve_relevant_guidelines_sync.side_effect = RuntimeError("chroma down")
+
+        retriever = vs_module.GuidelineRetriever.__new__(vs_module.GuidelineRetriever)
+        retriever._client = MagicMock()
+        retriever._embedding_fn = MagicMock()
+        retriever._guidelines = MagicMock()
+        retriever._guidelines.query.return_value = {
+            "documents": [["NCCN guideline text"]],
+            "metadatas": [[{"source": "NCCN"}]],
+        }
+        retriever._precedents = MagicMock()
+        retriever._precedents.query.return_value = {"documents": [[]], "metadatas": [[]]}
+        retriever._pipeline = mock_pipeline
+
+        result = retriever.query("Guidelines for C34.1 and J9271")
 
         assert "OFFICIAL GUIDELINES" in result
         assert "NCCN guideline text" in result

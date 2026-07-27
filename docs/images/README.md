@@ -16,7 +16,7 @@ Hosted images embedded in `README.md` and other docs. Keep filenames stable so e
 
 Both former pending captures have landed:
 
-- ~~`dashboard-hero.png`~~ → shipped as `decision-hero.png`. The provider surface was chosen over the Director queue because the Director queue renders a hardcoded `DEMO_QUEUE` fixture, whereas the provider surface shows a genuine end-to-end decision.
+- ~~`dashboard-hero.png`~~ → shipped as `decision-hero.png`. The provider surface was chosen over the Director queue because the Director queue rendered a hardcoded `DEMO_QUEUE` fixture at the time, whereas the provider surface shows a genuine end-to-end decision. The queue is now API-backed, so it is a candidate for a future capture — it just needs a stack with something actually escalated.
 - ~~`escalation-tree.svg`~~ → shipped as [`../assets/escalation_tree.svg`](../assets/escalation_tree.svg), covering all 7 pre-flight gates, the 3 confidence branches, and the 2 runtime short-circuits.
 
 ## Regenerating

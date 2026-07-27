@@ -188,6 +188,38 @@ class AuthorizationRepository:
         result = await self.session.execute(query)
         return list(result.scalars().all())
 
+    async def list_escalated_for_review(
+        self,
+        limit: int = 50,
+    ) -> list[tuple[AuthorizationDecisionModel, AuthorizationRequestModel]]:
+        """
+        List decisions awaiting Medical Director review, with their requests.
+
+        Keyed on the DECISION's outcome, not the request's `status` column. The
+        submit route never updates that column after the orchestrator runs, so
+        every row still reads "submitted" and filtering requests by
+        AuthorizationStatus.IN_REVIEW would return an empty queue forever.
+
+        Oldest first: a review queue is worked front to back, unlike
+        `list_requests`, which shows the most recent submissions.
+
+        Returns:
+            (decision, request) pairs, oldest decision first.
+        """
+        query = (
+            select(AuthorizationDecisionModel, AuthorizationRequestModel)
+            .join(
+                AuthorizationRequestModel,
+                AuthorizationDecisionModel.request_id == AuthorizationRequestModel.request_id,
+            )
+            .where(AuthorizationDecisionModel.outcome == AuthorizationStatus.IN_REVIEW.value)
+            .order_by(AuthorizationDecisionModel.decided_at)
+            .limit(limit)
+        )
+
+        result = await self.session.execute(query)
+        return [(decision, request) for decision, request in result.all()]
+
     async def count_requests(
         self,
         status: AuthorizationStatus | None = None,

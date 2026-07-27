@@ -17,6 +17,7 @@ Teaching note — why audit logging matters here:
 """
 
 import time
+from datetime import datetime
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -57,6 +58,7 @@ from ...models.enums import AuthorizationStatus, EscalationReason, ReviewTier
 
 # The per-run intent contract (P-3 / chg-7): declared and audited at run start.
 from ...models.intent import IntentRecord
+from ..auth import verify_token
 
 router = APIRouter()
 
@@ -84,6 +86,87 @@ class FeedbackRequest(BaseModel):
     case_summary: str
     decision: str
     rationale: str
+
+
+class ReviewQueueItem(BaseModel):
+    """
+    One case awaiting Medical Director review.
+
+    Field names mirror what the queue UI renders, so the typed frontend boundary
+    is a direct translation of this model rather than a reshaping layer.
+    """
+
+    request_id: str
+    decision_id: str
+    patient_ref: str
+    diagnosis_code: str
+    procedure_code: str
+    clinical_notes: str
+    ai_status: str
+    ai_rationale: str
+    confidence_score: float
+    escalated_at: datetime
+
+
+class ReviewQueueResponse(BaseModel):
+    """
+    The review queue, plus the honest statement of what it cannot do yet.
+
+    `resolution_supported` is False because no endpoint records a Medical
+    Director's disposition of a case: `/feedback` writes a precedent to the
+    institutional-memory collection (a real effect on future reasoning) but does
+    not write a HumanReviewModel row or change the decision outcome. A reviewed
+    case therefore reappears in this queue on the next fetch. The flag is part of
+    the response, not a UI-side constant, so the UI cannot claim resolution works
+    while the backend says otherwise.
+    """
+
+    items: list[ReviewQueueItem]
+    resolution_supported: bool = False
+
+
+@router.get("/review-queue", response_model=ReviewQueueResponse)
+async def get_review_queue(
+    limit: int = 50,
+    session: AsyncSession = Depends(get_session),
+    _user: str = Depends(verify_token),
+) -> ReviewQueueResponse:
+    """
+    List the cases the agent escalated to a human Medical Director.
+
+    Reads real persisted decisions (outcome IN_REVIEW) joined to their requests.
+    The queue UI previously rendered a hardcoded single-element array, so it
+    showed the same synthetic case whether the system had escalated nothing or a
+    hundred cases.
+
+    An empty list is a real answer — it means nothing has been escalated — and is
+    not padded with sample data.
+    """
+    rows = await AuthorizationRepository(session).list_escalated_for_review(limit=limit)
+
+    items = [
+        ReviewQueueItem(
+            request_id=request.request_id,
+            decision_id=decision.decision_id,
+            # Opaque reference only. Age is included when the submission carried
+            # it; there is no name or date of birth in this payload.
+            patient_ref=(
+                f"Patient {request.patient_id} · {request.patient_age}yo"
+                if request.patient_age is not None
+                else f"Patient {request.patient_id}"
+            ),
+            diagnosis_code=request.primary_diagnosis_code,
+            procedure_code=request.treatment_code,
+            clinical_notes=request.clinical_notes or "",
+            ai_status=decision.outcome,
+            ai_rationale=(decision.rationale_data or {}).get("text", ""),
+            confidence_score=decision.confidence_score,
+            escalated_at=decision.decided_at,
+        )
+        for decision, request in rows
+    ]
+
+    return ReviewQueueResponse(items=items)
 
 
 @router.post("/", response_model=AuthorizationDecision)

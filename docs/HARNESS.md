@@ -60,7 +60,7 @@ Beyond the seven NexAU-style component types, PACCA's harness has four additiona
 | Surface | Location | Purpose |
 |---------|----------|---------|
 | Escalation branch | `src/pacca/agents/orchestrator.py` (class `Orchestrator`) | The 7-branch deterministic escalation tree (4 pre-flight, 3 post-agent) |
-| RAG collection | `src/pacca/rag/pipeline.py` (`GuidelineVectorStore`, single collection `clinical_guidelines`) | **(roadmap)** dual-collection (`nccn_guidelines` + `case_precedents`); the dual-collection code is not yet functional |
+| RAG collection | `src/pacca/integrations/vector_store.py` (`GuidelineRetriever`, `RAG_COLLECTIONS`) over `src/pacca/rag/pipeline.py` (`GuidelineVectorStore` / `RAGPipeline`) | Dual-collection and live: `nccn_guidelines` (authoritative) + `case_precedents` (institutional memory), both governed by the P-4 scope guard. The pipeline no longer names a collection — the retriever injects the governed one it holds |
 | Prompt registry | `src/pacca/agents/prompts/templates.py` (PROMPT_REGISTRY) | Versioned prompt audit trail |
 | Audit schema | `src/pacca/db/models.py` (class `AuditLogModel`, table `audit_logs`) | HIPAA audit log structure |
 

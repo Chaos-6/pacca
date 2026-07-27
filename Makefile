@@ -74,7 +74,10 @@ test-clinical:
 		echo "ERROR: ANTHROPIC_API_KEY is not set. Export it before running clinical tests."; \
 		exit 1; \
 	fi
-	pytest tests/clinical/ -m clinical -v
+	# tests/, not tests/clinical/: the marker is the selector, and
+	# tests/test_level5_flow.py carries it too. Scoping to the directory would
+	# leave that module running in no target at all.
+	pytest tests/ -m clinical -v
 
 test-postgres:
 	@echo "Real-Postgres integration tests (catches SQLite-masked bugs like B2/B3)..."

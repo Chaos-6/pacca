@@ -125,11 +125,11 @@ Everything below is measured locally or explicitly labeled a benchmark on synthe
 
 | Metric | Value | How it's known |
 |---|---|---|
-| **Automated tests** | **743** collected (683 unit · 28 clinical · 27 harness · 2 integration · 3 flow) | `pytest tests/ --collect-only` |
+| **Automated tests** | **784** collected (724 unit · 28 clinical · 27 harness · 2 integration · 3 flow), plus 12 Playwright frontend specs | `pytest tests/ --collect-only`; `cd frontend && npx playwright test` |
 | **Clinical evaluation dataset** | 105 synthetic cases (GC-001–GC-105) across ~20 specialty suites | `tests/clinical/` |
 | **Clinical accuracy gate** | 20-case golden core, LLM-as-judge (1–5 rubric), threshold ≥80% — **20/20 at mean 4.9/5**, zero variance across repeat runs | `make test-clinical` |
 | **Hallucination tolerance** | **Zero.** Two sparse-notes traps (GC-018, GC-019) fail on any invented clinical fact | clinical gate + runtime detector |
-| **Harness iterations** | 14 recorded · 31 changes · 0 rollbacks | `harness/manifests/` |
+| **Harness iterations** | 15 recorded · 33 changes · 0 rollbacks | `harness/manifests/` |
 | **Real-Postgres CI guard** | submit path exercised on Postgres 16 every PR — catches FK/JSONB bugs SQLite masks | `make test-postgres` |
 | **Median decision latency** *(benchmark)* | ~2.1 s | 53-case synthetic run, Sonnet 4.5 |
 | **95th-percentile latency** *(benchmark)* | ~4.3 s | same |
