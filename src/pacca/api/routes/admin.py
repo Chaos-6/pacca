@@ -43,7 +43,7 @@ Teaching note — runtime config vs. environment variables:
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -401,7 +401,17 @@ async def get_metrics() -> MetricsResponse:
 
 
 class RoleUpdateRequest(BaseModel):
-    """Body for PATCH /users/{username}/role — the new role for the target user."""
+    """
+    Body for PATCH /users/{username}/role — the new role for the target user.
+
+    VALIDATOR FINDING, FIXED: `extra="forbid"` symmetric with UserCreate's
+    registration hardening. Without it, extra keys were silently ignored
+    (never applied — the promotion endpoint only ever reads `body.role`) but
+    a caller sending e.g. {"role": "clinician", "username": "x"} got a plain
+    200 and could believe both fields took effect. Now that shape 422s.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     role: Role
 
