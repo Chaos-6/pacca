@@ -8,6 +8,7 @@
 #   make test-cov     Run unit tests with HTML coverage report
 #   make test-all     Run everything except clinical (requires API key)
 #   make test-clinical Run LLM-as-judge clinical evaluation (requires API key)
+#   make test-holdout Run the held-out (out-of-sample) accuracy report (requires API key)
 #   make lint         Run ruff linter
 #   make typecheck    Run mypy type checker
 #   make clean        Remove build artifacts and __pycache__
@@ -19,7 +20,7 @@
 #   make install
 # =============================================================================
 
-.PHONY: install db-upgrade test test-cov test-all test-clinical test-postgres lint typecheck clean help \
+.PHONY: install db-upgrade test test-cov test-all test-clinical test-holdout test-postgres lint typecheck clean help \
         sme-author sme-author-test sme-author-status sme-author-help \
         sme-author-web sme-author-web-build sme-author-web-e2e
 
@@ -79,6 +80,18 @@ test-clinical:
 	# leave that module running in no target at all.
 	pytest tests/ -m clinical -v
 
+test-holdout:
+	@echo "Running held-out (out-of-sample) accuracy report (requires ANTHROPIC_API_KEY, ~1 minute)..."
+	@echo "NOT a CI gate -- see docs/EVALUATION.md, 'Train-on-test contamination and the held-out split'."
+	@if [ -z "$$ANTHROPIC_API_KEY" ]; then \
+		echo "ERROR: ANTHROPIC_API_KEY is not set. Export it before running clinical tests."; \
+		exit 1; \
+	fi
+	# -s so the printed accuracy_held_out summary is visible even on a pass --
+	# the whole point of this target is to obtain that number in one command.
+	pytest tests/clinical/test_clinical_accuracy.py::TestFullClinicalEvaluation::test_held_out_accuracy_report \
+		-m clinical -v -s
+
 test-postgres:
 	@echo "Real-Postgres integration tests (catches SQLite-masked bugs like B2/B3)..."
 	@echo "Starting throwaway Postgres 16 on :5499..."
@@ -122,6 +135,7 @@ help:
 	@echo "  make test-cov           Unit tests + HTML coverage report"
 	@echo "  make test-all           All fast tests"
 	@echo "  make test-clinical      Clinical LLM evaluation (needs API key)"
+	@echo "  make test-holdout       Held-out accuracy report, NOT a gate (needs API key)"
 	@echo "  make lint               Ruff linter"
 	@echo "  make typecheck          Mypy type checker"
 	@echo "  make clean              Remove build artifacts"

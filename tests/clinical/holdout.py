@@ -61,19 +61,42 @@ How membership was chosen (2026-07-27)
 4. From the remaining 63-case pool, selected 32 ids (comfortably above the
    n=20 power-floor target — see `docs/STATISTICAL_POWER.md`'s "20 pp drop"
    row), stratified across every `expected_branch` / `ExpectedOutcome`
-   combination present in that pool:
-     - BRANCH_1_AUTO_APPROVE / AUTO_APPROVED: 19 cases
-     - BRANCH_2_MEDICAL_DIRECTOR / IN_REVIEW: 7 cases
-     - BRANCH_3_LOW_CONFIDENCE / IN_REVIEW: 4 cases
-     - NONE / DENIED: 2 cases (both available DENIED cases in the pool)
+   combination present in that pool (branch labels below are the
+   `EscalationBranch` member names; the enum's actual *value* for the first
+   one is `"branch_1_high_confidence"`, not "auto_approve" — the member
+   name is what's stratified on here, so it's spelled out to avoid
+   confusion with the string value used elsewhere):
+     - EscalationBranch.BRANCH_1_AUTO_APPROVE ("branch_1_high_confidence")
+       / ExpectedOutcome.AUTO_APPROVED: 19 cases
+     - EscalationBranch.BRANCH_2_MEDICAL_DIRECTOR ("branch_2_medical_director")
+       / ExpectedOutcome.IN_REVIEW: 7 cases
+     - EscalationBranch.BRANCH_3_LOW_CONFIDENCE ("branch_3_low_confidence")
+       / ExpectedOutcome.IN_REVIEW: 4 cases
+     - EscalationBranch.NONE ("no_escalation_expected")
+       / ExpectedOutcome.DENIED: 2 cases (both available DENIED cases in the pool)
    The remaining pool had no BRANCH_4/5/6/7 or PRE_FLIGHT_ESCALATE cases
    outside the excluded set (those only exist inside the already-excluded
-   golden 20), so they are not represented in the holdout — see
-   `docs/EVALUATION.md` for the honest accounting of this gap.
+   golden 20), so they are not represented in the holdout.
    Selections were also spread across 13 distinct specialty case files
    (cardiology, mental health, geriatric, pulmonology, transplant,
    neurology, OB, endocrinology, hematology, oncology depth/breadth,
    depth-extension, ambiguous-completeness) rather than clustering in one.
+
+Structural gap — branches 4-7 are unmeasurable out-of-sample
+---------------------------------------------------------------
+`BRANCH_4_EXPERIMENTAL`, `BRANCH_5_RARE`, `BRANCH_6_CONFLICTING`,
+`BRANCH_7_PRIOR_DENIAL`, and `ExpectedOutcome.PRE_FLIGHT_ESCALATE` exist
+ONLY inside the contaminated golden-20: GC-006 and GC-009 (BRANCH_4),
+GC-007 (BRANCH_5), GC-011 (BRANCH_6), GC-008 (BRANCH_7) — five cases total,
+all pre-flight-escalated. Every case that exercises PACCA's deterministic
+pre-flight safety layer is inside the already-excluded gate, so no
+re-slicing of the existing 105-case dataset can produce an out-of-sample
+measurement for it — only authoring NEW pre-flight cases in those four
+categories can. This holdout can measure out-of-sample performance for
+branch-1 auto-approvals and branch-2/3 escalations plus deny-class
+outcomes; it proves nothing out-of-sample about pre-flight safety. See
+`docs/EVALUATION.md` for the full accounting; authoring the missing
+cases is named there as follow-up work, not done in this change.
 
 No held-out case may ever be referenced in a prompt, memory entry, detector
 rule, or added to a case list the live accuracy gate runs — doing so is
@@ -143,7 +166,8 @@ def all_dataset_case_ids() -> frozenset[str]:
 # ─────────────────────────────────────────────────────────────────────────
 HELD_OUT_CASE_IDS: frozenset[str] = frozenset(
     {
-        # BRANCH_1_AUTO_APPROVE / AUTO_APPROVED (19)
+        # EscalationBranch.BRANCH_1_AUTO_APPROVE (value: "branch_1_high_confidence")
+        # / ExpectedOutcome.AUTO_APPROVED (19)
         "GC-037",
         "GC-038",
         "GC-041",
@@ -163,7 +187,7 @@ HELD_OUT_CASE_IDS: frozenset[str] = frozenset(
         "GC-079",
         "GC-083",
         "GC-089",
-        # BRANCH_2_MEDICAL_DIRECTOR / IN_REVIEW (7)
+        # EscalationBranch.BRANCH_2_MEDICAL_DIRECTOR / ExpectedOutcome.IN_REVIEW (7)
         "GC-042",
         "GC-047",
         "GC-061",
@@ -171,15 +195,31 @@ HELD_OUT_CASE_IDS: frozenset[str] = frozenset(
         "GC-070",
         "GC-090",
         "GC-096",
-        # BRANCH_3_LOW_CONFIDENCE / IN_REVIEW (4)
+        # EscalationBranch.BRANCH_3_LOW_CONFIDENCE / ExpectedOutcome.IN_REVIEW (4)
         "GC-055",
         "GC-057",
         "GC-059",
         "GC-077",
-        # NONE / DENIED (2)
+        # EscalationBranch.NONE / ExpectedOutcome.DENIED (2)
         "GC-039",
         "GC-105",
     }
 )
 
 IN_SAMPLE_CASE_IDS: frozenset[str] = all_dataset_case_ids() - HELD_OUT_CASE_IDS
+
+
+def held_out_cases() -> list[GoldenCase]:
+    """
+    Resolve HELD_OUT_CASE_IDS to their actual GoldenCase objects, sorted by
+    case number for stable, deterministic ordering (e.g. in evaluation logs).
+
+    Used by the live held-out accuracy test
+    (`tests/clinical/test_clinical_accuracy.py::TestFullClinicalEvaluation::
+    test_held_out_accuracy_report`) to run the real pipeline over the
+    declared holdout.
+    """
+    lookup = {case.case_id: case for cases in _ALL_CASE_LISTS for case in cases}
+    return [
+        lookup[case_id] for case_id in sorted(HELD_OUT_CASE_IDS, key=lambda c: int(c.split("-")[1]))
+    ]

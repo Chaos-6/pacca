@@ -40,6 +40,7 @@ Teaching note — why the CI gate threshold is 80% and not 100%:
 """
 
 import os
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -67,6 +68,7 @@ from tests.clinical.golden_cases import (
     get_hallucination_trap_cases,
 )
 from tests.clinical.hematology_cases import HEMATOLOGY_CASES
+from tests.clinical.holdout import HELD_OUT_CASE_IDS, held_out_cases
 from tests.clinical.mental_health_cases import MENTAL_HEALTH_CASES
 from tests.clinical.near_miss_cases import NEAR_MISS_CASES
 from tests.clinical.neurology_cases import NEUROLOGY_CASES
@@ -571,6 +573,96 @@ class TestEvaluatorLogic:
 #   Pre-commit: pytest tests/ -m "not clinical"
 # =============================================================================
 
+if TYPE_CHECKING:
+    from pacca.agents.clinical_risk_detector import ClinicalRiskDetector
+    from pacca.agents.decision import DecisionAgent
+
+
+async def _run_cases_through_pipeline(
+    cases: list[GoldenCase],
+    detector: "ClinicalRiskDetector",
+    agent: "DecisionAgent",
+    evaluator: ClinicalEvaluator,
+) -> list[JudgeVerdict]:
+    """
+    Run each case through pre-flight -> Decision Agent -> LLM judge — exactly
+    what THE CI GATE does per-case. Shared by
+    `test_full_pipeline_meets_accuracy_threshold` (the golden-set gate) and
+    `test_held_out_accuracy_report` (the held-out accuracy report) so the two
+    evaluation paths run identical pipeline logic and cannot silently drift
+    apart from each other.
+    """
+    from pacca.agents.decision import DecisionContext
+    from pacca.models.clinical import ClinicalCase, EvidenceItem
+    from pacca.models.enums import AuthorizationStatus, EvidenceSourceType
+
+    verdicts: list[JudgeVerdict] = []
+    for golden in cases:
+        clinical_case = ClinicalCase(
+            patient_id=f"P-EVAL-{golden.case_id}",
+            primary_diagnosis_code=golden.diagnosis_code,
+            procedure_code=golden.procedure_code,
+            evidence=[
+                EvidenceItem(
+                    id="e1",
+                    source_type=EvidenceSourceType.CLINICAL_NOTE,
+                    description=golden.clinical_notes[:200],
+                    original_text=golden.clinical_notes,
+                    confidence=0.9,
+                )
+            ],
+        )
+
+        # Run pre-flight checks
+        flags = detector.evaluate(
+            case=clinical_case,
+            guidelines_context=golden.guidelines_context,
+            prior_denial_codes=golden.prior_denial_codes,
+        )
+
+        if flags.should_pre_escalate:
+            # Pre-flight fired — build the pre-flight decision
+            status = AuthorizationStatus.IN_REVIEW.value
+            rationale = (
+                f"Pre-flight escalation triggered. "
+                f"Reasons: {[r.value for r in flags.reasons]}. "
+                f"Details: {flags.details}"
+            )
+            confidence = 0.0
+        else:
+            # Run through Decision Agent
+            try:
+                ctx = DecisionContext(
+                    case=clinical_case,
+                    relevant_guidelines=golden.guidelines_context,
+                )
+                decision = await agent.run(ctx)
+                status = decision.status.value
+                rationale = decision.rationale
+                confidence = decision.confidence_score
+            except Exception as exc:
+                status = "ERROR"
+                rationale = f"Agent failed: {exc!s}"
+                confidence = 0.0
+
+        # Judge the decision
+        verdict = await evaluator.evaluate_case(
+            case=golden,
+            system_decision_status=status,
+            system_rationale=rationale,
+            system_confidence=confidence,
+        )
+        verdicts.append(verdict)
+
+        # Print per-case result for CI log visibility
+        result_icon = "✓" if verdict.passed else "✗"
+        print(
+            f"  {result_icon} {golden.case_id}: score={verdict.score} "
+            f"status={status} correct={verdict.correct_outcome}"
+        )
+
+    return verdicts
+
 
 @pytest.mark.clinical
 class TestFullClinicalEvaluation:
@@ -615,14 +707,11 @@ class TestFullClinicalEvaluation:
             pytest.skip("ANTHROPIC_API_KEY not set — skipping live evaluation")
 
         from pacca.agents.clinical_risk_detector import ClinicalRiskDetector
-        from pacca.agents.decision import DecisionAgent, DecisionContext
-        from pacca.models.clinical import ClinicalCase, EvidenceItem
-        from pacca.models.enums import AuthorizationStatus, EvidenceSourceType
+        from pacca.agents.decision import DecisionAgent
 
         detector = ClinicalRiskDetector()
         agent = DecisionAgent()
         evaluator = ClinicalEvaluator()
-        verdicts: list[JudgeVerdict] = []
 
         # GOLDEN_CASES (20) + NEAR_MISS_CASES (iter-2 chg-3 memory-trap siblings)
         # + PEDIATRIC_CASES (iter-5 chg-2 — complexity-score model validation set)
@@ -630,75 +719,17 @@ class TestFullClinicalEvaluation:
         # All supplementary lists run through the same judge but are kept separate
         # — the `len == 20` integrity assertion above still holds for GOLDEN_CASES.
         # + ADULT_COMPLEXITY_CASES (iter-6 chg-3 — adult pre-flight validation set).
-        for golden in (
+        # None of these ids overlap HELD_OUT_CASE_IDS — see tests/clinical/holdout.py.
+        verdicts = await _run_cases_through_pipeline(
             GOLDEN_CASES
             + NEAR_MISS_CASES
             + PEDIATRIC_CASES
             + EXPANSION_CASES
-            + ADULT_COMPLEXITY_CASES
-        ):
-            clinical_case = ClinicalCase(
-                patient_id=f"P-EVAL-{golden.case_id}",
-                primary_diagnosis_code=golden.diagnosis_code,
-                procedure_code=golden.procedure_code,
-                evidence=[
-                    EvidenceItem(
-                        id="e1",
-                        source_type=EvidenceSourceType.CLINICAL_NOTE,
-                        description=golden.clinical_notes[:200],
-                        original_text=golden.clinical_notes,
-                        confidence=0.9,
-                    )
-                ],
-            )
-
-            # Run pre-flight checks
-            flags = detector.evaluate(
-                case=clinical_case,
-                guidelines_context=golden.guidelines_context,
-                prior_denial_codes=golden.prior_denial_codes,
-            )
-
-            if flags.should_pre_escalate:
-                # Pre-flight fired — build the pre-flight decision
-                status = AuthorizationStatus.IN_REVIEW.value
-                rationale = (
-                    f"Pre-flight escalation triggered. "
-                    f"Reasons: {[r.value for r in flags.reasons]}. "
-                    f"Details: {flags.details}"
-                )
-                confidence = 0.0
-            else:
-                # Run through Decision Agent
-                try:
-                    ctx = DecisionContext(
-                        case=clinical_case,
-                        relevant_guidelines=golden.guidelines_context,
-                    )
-                    decision = await agent.run(ctx)
-                    status = decision.status.value
-                    rationale = decision.rationale
-                    confidence = decision.confidence_score
-                except Exception as exc:
-                    status = "ERROR"
-                    rationale = f"Agent failed: {exc!s}"
-                    confidence = 0.0
-
-            # Judge the decision
-            verdict = await evaluator.evaluate_case(
-                case=golden,
-                system_decision_status=status,
-                system_rationale=rationale,
-                system_confidence=confidence,
-            )
-            verdicts.append(verdict)
-
-            # Print per-case result for CI log visibility
-            result_icon = "✓" if verdict.passed else "✗"
-            print(
-                f"  {result_icon} {golden.case_id}: score={verdict.score} "
-                f"status={status} correct={verdict.correct_outcome}"
-            )
+            + ADULT_COMPLEXITY_CASES,
+            detector,
+            agent,
+            evaluator,
+        )
 
         # Compile final report
         report = evaluator.compile_report(verdicts)
@@ -727,6 +758,59 @@ class TestFullClinicalEvaluation:
             f"This failure means the system's clinical reasoning quality has "
             f"degraded below the minimum acceptable standard. Review the failed "
             f"cases above and the agent prompts in agents/decision.py."
+        )
+
+    @pytest.mark.asyncio
+    async def test_held_out_accuracy_report(self) -> None:
+        """
+        NOT A CI GATE. Runs PACCA's real pipeline over the 32-case declared
+        holdout (`tests/clinical/holdout.py::HELD_OUT_CASE_IDS`) and reports
+        `accuracy_held_out` — the first live, out-of-sample accuracy number
+        for this system, since none of these 32 cases are referenced under
+        `src/pacca/` or part of the golden-set gate above.
+
+        Deliberately UNTHRESHOLDED: there is no established out-of-sample
+        baseline yet to gate against, and picking a threshold on this test's
+        first-ever run (with zero prior data points) would be a unilateral
+        policy decision this test shouldn't make on its own. This mirrors
+        the repo's own warn-then-enforce precedent — the P-4 scope guard
+        shipped in warn mode (iter-8) before enforce mode (iter-9); see
+        `docs/EVALUATION.md` for why promoting this to a blocking gate is a
+        deliberate follow-up decision, not taken here.
+
+        The only assertion below is a wiring sanity check (every declared
+        held-out case was actually evaluated, none dropped or
+        double-counted) — it is not an accuracy-quality gate.
+
+        Reachable via `make test-holdout` (see Makefile).
+        """
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            pytest.skip("ANTHROPIC_API_KEY not set — skipping live evaluation")
+
+        from pacca.agents.clinical_risk_detector import ClinicalRiskDetector
+        from pacca.agents.decision import DecisionAgent
+
+        detector = ClinicalRiskDetector()
+        agent = DecisionAgent()
+        evaluator = ClinicalEvaluator()
+
+        verdicts = await _run_cases_through_pipeline(held_out_cases(), detector, agent, evaluator)
+        report = evaluator.compile_report(verdicts)
+
+        print(f"\n{report.summary()}")
+        print(
+            f"\nHeld-out accuracy (out-of-sample, NOT a CI gate): "
+            f"{report.accuracy_held_out:.1%} "
+            f"({report.held_out_passed}/{report.held_out_total} cases)"
+        )
+
+        # Wiring sanity check ONLY — confirms every declared held-out case
+        # was actually evaluated. NOT an accuracy threshold; see docstring.
+        assert report.held_out_total == len(HELD_OUT_CASE_IDS), (
+            f"Expected all {len(HELD_OUT_CASE_IDS)} held-out cases to be "
+            f"evaluated, got {report.held_out_total}. A case may have been "
+            f"dropped or double-counted — check held_out_cases() in "
+            f"tests/clinical/holdout.py."
         )
 
     @pytest.mark.asyncio
