@@ -61,6 +61,7 @@ from pacca.api.rbac import (
 from pacca.cli import pacca_cli
 from pacca.config.settings import get_settings
 from pacca.db.models import Base as DomainBase
+from pacca.integrations.vector_store import RetrievalOutcome
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -483,7 +484,17 @@ class TestEndpointMatrix:
             ),
             patch(
                 "pacca.api.routes.authorizations.rag_engine.query",
-                return_value="mock guideline content",
+                # chg-19 changed query() from `str` to RetrievalOutcome. This mock was
+                # authored on a parallel branch that predated that contract, so the two
+                # only collided at merge — neither lane's suite could see it alone.
+                # Non-degraded: this test asserts an RBAC boundary, not RAG behaviour,
+                # so it must take the healthy path.
+                return_value=RetrievalOutcome(
+                    text="mock guideline content",
+                    mode="pipeline",
+                    degraded=False,
+                    reason=None,
+                ),
             ),
         ):
             response = rbac_client.post(
