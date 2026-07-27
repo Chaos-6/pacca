@@ -81,10 +81,21 @@ paths can't silently drift apart) over `held_out_cases()` and reports
 make test-holdout    # requires ANTHROPIC_API_KEY; not a CI gate; ~1 minute
 ```
 
-It skips cleanly (like every other `clinical`-marked test) when
-`ANTHROPIC_API_KEY` is unset, so `make test` stays fast and green.
+Two different behaviors here, both worth stating precisely so neither reads
+as the other. Run the test **directly via pytest** with no key set
+(`pytest tests/clinical/test_clinical_accuracy.py::TestFullClinicalEvaluation::
+test_held_out_accuracy_report -m clinical`) and it **skips cleanly**
+(`1 skipped`), exactly like every other `clinical`-marked test — this is what
+keeps `make test` (the fast, deterministic target, which selects
+`-m "not clinical"` and never reaches this test at all) fast and green. Run
+it via **`make test-holdout`** with no key set, and the *target* **hard-errors
+instead** (`ERROR: ANTHROPIC_API_KEY is not set...`, non-zero exit) before
+pytest ever starts, matching `make test-clinical`'s existing precedent: a
+target whose entire purpose is producing a number fails loud rather than
+silently reporting nothing.
+
 `tests/unit/test_held_out_pipeline_wiring.py` is the fast, fully-mocked
-regression proof that this test genuinely iterates all 32 declared ids and
+regression proof that the test genuinely iterates all 32 declared ids and
 produces a non-empty held-out denominator — it runs in `make test`, with
 zero API calls, and would fail if a future refactor broke the wiring.
 
