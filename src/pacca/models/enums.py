@@ -193,13 +193,18 @@ class EscalationReason(StrEnum):
     RAG_DEGRADED = "rag_degraded"
     """
     ``GuidelineRetriever.query()`` (chg-19) reported a degraded
-    ``RetrievalOutcome`` — the governed RAGPipeline was unavailable or raised,
-    and retrieval fell back to the legacy direct-ChromaDB path. Every
-    degradation is audited (``action="rag.degraded"``) regardless of this
-    setting; this reason fires only when ``settings.rag_degraded_escalates``
-    is True, routing the case to human review rather than letting the
-    DecisionAgent reason over unverified fallback context. Defaults to warn
-    mode (audited, not routed) per the same warn -> enforce rollout precedent
-    as the P-4 scope guard (chg-8 -> chg-9); promote once degradation rates
-    in production are known (chg-20).
+    ``RetrievalOutcome`` on either of two independent axes:
+    ``RetrievalOutcome.mode != "pipeline"`` (the governed RAGPipeline was
+    unavailable or raised, and guideline retrieval fell back to the legacy
+    direct-ChromaDB path), or ``RetrievalOutcome.precedents_degraded`` (the
+    institutional-memory precedents collection itself raised during an
+    otherwise-healthy pipeline call — no guideline fallback occurred at all).
+    Every degradation is audited (``action="rag.degraded"``, details carry
+    both axes) regardless of this setting; this reason fires only when
+    ``settings.rag_degraded_escalates`` is True, routing the case to human
+    review rather than letting the DecisionAgent reason over unverified or
+    incomplete retrieved context. Defaults to warn mode (audited, not
+    routed) per the same warn -> enforce rollout precedent as the P-4 scope
+    guard (chg-8 -> chg-9); promote once degradation rates in production are
+    known (chg-20).
     """
