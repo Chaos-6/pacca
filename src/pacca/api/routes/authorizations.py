@@ -397,6 +397,20 @@ async def submit_authorization(
                 # reads persisted IN_REVIEW rows) can never surface it: a
                 # human review nobody can see. Same fix as any other IN_REVIEW
                 # outcome further down this function.
+                #
+                # db.write_decision, guarded against the run's intent, same
+                # shape/mode as the normal-flow persist below — this is now
+                # the THIRD db.write_decision-class call site, and the P-4
+                # guard's value is the invariant that every one of them is
+                # wrapped, not just the ones that happen to be reachable
+                # today (Validator FIX A).
+                await enforce_scope(
+                    intent,
+                    "db.write_decision",
+                    audit=audit,
+                    mode=get_settings().scope_guard_mode,
+                    request_id=request.request_id,
+                )
                 await DecisionRepository(session).create(
                     escalated_decision,
                     request_id=request.request_id,
