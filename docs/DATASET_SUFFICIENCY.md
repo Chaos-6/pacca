@@ -10,7 +10,7 @@
 > - [`STATISTICAL_POWER.md`](./STATISTICAL_POWER.md) — binomial CI math + per-case regression-detection math.
 > - [`CASE_PROVENANCE.md`](./CASE_PROVENANCE.md) — for each case, the clinical rationale, the failure mode it probes, the iteration that added it.
 > - [`CASE_AUTHORING_GUIDE.md`](./CASE_AUTHORING_GUIDE.md) — the template and SME-review process for adding new cases.
-> - [`EVALUATION.md`](./EVALUATION.md) — the parent evaluation methodology stub (Phase H5 of the v2.3 harness cycle).
+> - [`EVALUATION.md`](./EVALUATION.md) — the parent evaluation methodology stub (Phase H5 of the v2.3 harness cycle); see its "Train-on-test contamination and the held-out split" section for the declared 32-case holdout (`tests/clinical/holdout.py`, enforced by `tests/unit/test_eval_holdout_guard.py`) that keeps the 105-case size this document celebrates from also being read as evidence of clean generalization — some of those cases are named verbatim in the DecisionAgent's prompt/memory.
 
 ## Executive answer
 
