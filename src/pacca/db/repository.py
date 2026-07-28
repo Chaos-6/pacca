@@ -39,6 +39,7 @@ from pacca.db.models import (
     AuthorizationRequestModel,
     GuidelineModel,
 )
+from pacca.db.session import get_independent_session
 from pacca.models.authorization import (
     AuthorizationDecision,
     AuthorizationRequest,
@@ -376,7 +377,56 @@ class AuditRepository:
             token_usage: LLM token usage
 
         Returns:
-            The created audit log entry
+            The created audit log entry. Note this object is populated in
+            Python but is deliberately NOT added to `self.session` — see the
+            durability note below. It is safe to read (entry_id, action,
+            etc.) but is a detached/transient instance, not a row tracked by
+            the caller's own transaction.
+
+        Durability (bugfix, see docs/AGENT_LESSONS.md / harness note): this
+        write commits on an INDEPENDENT session from the SAME engine/pool
+        (`get_independent_session()`, no new engine), not on `self.session`
+        — the request's own, possibly-doomed transaction. Previously this
+        method did `self.session.add(entry); await self.session.flush()`:
+        a flush is visible only inside the still-open transaction, so when
+        `get_session()`'s except-clause ran `await session.rollback()`
+        after an unhandled exception, the flushed-but-uncommitted audit row
+        was rolled back along with the failed business write — a failed
+        request left ZERO audit rows, defeating the point of a pre-write
+        audit trail for the one case (a crash) it exists to cover.
+
+        Ordering guarantee — read precisely, it is weaker than the same-
+        transaction guarantee it replaces: this method awaits COMMIT of the
+        audit row before returning, so "this call returns" happens only
+        after "the audit row is durably in the database" — and therefore
+        before the caller's subsequent business write is even attempted.
+        It does NOT provide snapshot/serializable ordering against a
+        concurrent reader on a third connection, and it does NOT make the
+        audit commit part of the same atomic unit as the business write —
+        that atomicity is exactly what we removed on purpose, since it was
+        the thing letting a business rollback take the audit row down with
+        it. The two writes are now independent, ordered-but-not-atomic:
+        audit-committed-before-business-attempted, never
+        audit-lost-because-business-failed.
+
+        `request_id` carries a DEFERRABLE INITIALLY DEFERRED foreign key to
+        `authorization_requests` (see db/models.py B3) so that, on the
+        request's OWN session, `intent.declared` / `authorization_submitted`
+        can be written before the parent request row exists and still pass
+        at that session's eventual commit. On this independent session the
+        deferred check runs at OUR commit instead, which is immediate — if
+        the parent row has not committed yet (the common case for those two
+        pre-write events), the FK check fails. We retry once with
+        `request_id=None` (the original value preserved in
+        `details["_unlinked_request_id"]`) so the row survives; it is still
+        fully traceable by `correlation_id`, which carries no FK.
+
+        A failure of the independent write (FK retry included) is logged
+        loudly via `logger.error` — never swallowed silently — and does
+        NOT raise: an audit-write problem must never turn a working
+        request into a 500. Connection reuse: `get_independent_session()`
+        draws from the existing shared engine/pool, so no new engine is
+        opened per audit record.
         """
         entry = AuditLogModel(
             entry_id=str(uuid7()),
@@ -395,10 +445,68 @@ class AuditRepository:
             token_usage=token_usage,
         )
 
-        self.session.add(entry)
-        await self.session.flush()
+        await self._persist_independently(entry, action=action, correlation_id=correlation_id)
 
         return entry
+
+    async def _persist_independently(
+        self,
+        entry: AuditLogModel,
+        *,
+        action: str,
+        correlation_id: str | None,
+    ) -> None:
+        """Commit `entry` on its own session; see `log()`'s docstring for the
+        durability/ordering guarantee and the request_id FK fallback."""
+        try:
+            async with get_independent_session() as audit_session:
+                audit_session.add(entry)
+                await audit_session.commit()
+            return
+        except IntegrityError as exc:
+            if entry.request_id is None:
+                logger.error(
+                    "audit_write_failed",
+                    action=action,
+                    correlation_id=correlation_id,
+                    error=str(exc),
+                )
+                return
+
+            # Likely the deferred request_id FK (B3): the parent
+            # authorization_requests row hasn't committed yet on the caller's
+            # own session. Retry once, unlinked, so the row is not lost.
+            original_request_id = entry.request_id
+            entry.request_id = None
+            entry.details = {
+                **(entry.details or {}),
+                "_unlinked_request_id": original_request_id,
+            }
+            logger.warning(
+                "audit_request_id_fk_deferred_retry",
+                action=action,
+                correlation_id=correlation_id,
+                request_id=original_request_id,
+            )
+            try:
+                async with get_independent_session() as retry_session:
+                    retry_session.add(entry)
+                    await retry_session.commit()
+            except Exception as retry_exc:
+                logger.error(
+                    "audit_write_failed",
+                    action=action,
+                    correlation_id=correlation_id,
+                    request_id=original_request_id,
+                    error=str(retry_exc),
+                )
+        except Exception as exc:
+            logger.error(
+                "audit_write_failed",
+                action=action,
+                correlation_id=correlation_id,
+                error=str(exc),
+            )
 
     async def get_by_request_id(
         self,
