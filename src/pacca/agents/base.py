@@ -198,8 +198,21 @@ class BaseAgent(ABC):
         self.config = config or AgentConfig()
         # One client instance per agent — the async client is thread-safe
         # and reuses the underlying HTTP connection pool efficiently.
+        #
+        # max_retries=0 (chg-21): the SDK's own default (max_retries=2, i.e.
+        # up to 3 HTTP attempts per call) retries 408/409/429/5xx internally
+        # in _base_client._should_retry(), BELOW tenacity and invisible to
+        # it — invisible to effective_settings()/PATCH-driven retry tuning,
+        # to _log_retry_attempt's logging, and to the span's attempt_number.
+        # With tenacity now also retrying 5xx (see _call_with_retry below),
+        # leaving the SDK's default would multiply attempts under two
+        # uncoordinated backoff schedules: up to
+        # llm_retry_max_attempts (tenacity) x 3 (SDK) HTTP requests for one
+        # persistent 5xx. Tenacity is the single retry authority; the SDK
+        # must not retry underneath it.
         self.client = AsyncAnthropic(
             api_key=os.getenv("ANTHROPIC_API_KEY") or "",
+            max_retries=0,
         )
         # Get a tracer named after the agent's module — shows up in OTel
         self._tracer = get_tracer(f"pacca.agents.{self.name.lower()}")
