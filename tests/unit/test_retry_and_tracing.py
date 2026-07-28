@@ -497,6 +497,149 @@ class TestSdkInternalRetryDisabled:
         )
 
 
+class _FakeOutcome:
+    """Minimal stand-in for a tenacity Future outcome: only .exception() is used."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def exception(self) -> BaseException:
+        return self._exc
+
+
+class _FakeRetryState:
+    """
+    Minimal duck-typed stand-in for tenacity.RetryCallState.
+
+    _build_retry_wait's returned callable only ever reads `.outcome.exception()`
+    (to inspect the failed attempt's exception for a retry-after header) and,
+    on the fallback path, `.attempt_number` (consumed by the real
+    wait_exponential it delegates to). No sleeping, no asyncio, no real
+    tenacity retry loop involved -- these tests call the wait callable
+    directly and assert on its return value.
+    """
+
+    def __init__(self, exc: BaseException, attempt_number: int = 1) -> None:
+        self.outcome = _FakeOutcome(exc)
+        self.attempt_number = attempt_number
+
+
+class TestRetryAfterHeader:
+    """
+    chg-21 follow-up (Validator round 3): disabling the SDK's own retry loop
+    (max_retries=0) also discarded its retry-after/retry-after-ms handling.
+    _build_retry_wait restores server-directed backoff at the tenacity layer
+    without reintroducing the SDK's second retry loop.
+
+    All assertions are on the wait callable's COMPUTED return value, never
+    on wall-clock time -- these tests call base_module._build_retry_wait(...)
+    directly with a fake retry_state, so nothing here sleeps.
+    """
+
+    @staticmethod
+    def _rate_limit_error_with_headers(headers: dict[str, str]) -> RateLimitError:
+        response = MagicMock(status_code=429)
+        response.headers = headers
+        return RateLimitError(
+            message="Rate limited",
+            response=response,
+            body={"error": {"type": "rate_limit_error"}},
+        )
+
+    def test_retry_after_seconds_is_honored(self) -> None:
+        """A `retry-after: 7` header must produce a computed wait of 7.0s."""
+        exc = self._rate_limit_error_with_headers({"retry-after": "7"})
+        wait_fn = base_module._build_retry_wait(min_seconds=1.0, max_seconds=30.0)
+
+        assert wait_fn(_FakeRetryState(exc)) == 7.0
+
+    def test_retry_after_ms_is_honored(self) -> None:
+        """`retry-after-ms` is more precise than `retry-after` and must be preferred."""
+        exc = self._rate_limit_error_with_headers({"retry-after-ms": "2500"})
+        wait_fn = base_module._build_retry_wait(min_seconds=1.0, max_seconds=30.0)
+
+        assert wait_fn(_FakeRetryState(exc)) == 2.5
+
+    def test_retry_after_exceeding_max_is_clamped(self) -> None:
+        """
+        A hostile/buggy `retry-after: 9999` must be clamped to
+        llm_retry_wait_max_seconds, not honored verbatim -- otherwise a
+        malicious or misconfigured server could hang an agent call for
+        hours.
+        """
+        exc = self._rate_limit_error_with_headers({"retry-after": "9999"})
+        wait_fn = base_module._build_retry_wait(min_seconds=1.0, max_seconds=30.0)
+
+        assert wait_fn(_FakeRetryState(exc)) == 30.0
+
+    def test_clamp_respects_runtime_override_of_max_wait(self) -> None:
+        """
+        The clamp is only meaningful if it tracks settings.llm_retry_wait_max_seconds
+        through effective_settings() AT CALL TIME -- exactly the same guarantee
+        TestRetryRespectsRuntimeOverrides proves for llm_retry_max_attempts.
+        _call_with_retry passes effective_settings().llm_retry_wait_max_seconds
+        straight into _build_retry_wait on every call; this drives that exact
+        override path and confirms the clamp reflects the override, not the
+        construction-time default (30.0).
+        """
+        from pacca.config.settings import apply_overrides, clear_all_overrides, effective_settings
+
+        exc = self._rate_limit_error_with_headers({"retry-after": "9999"})
+        try:
+            apply_overrides({"llm_retry_wait_max_seconds": 2.0, "llm_retry_wait_min_seconds": 0.1})
+            settings = effective_settings()
+            wait_fn = base_module._build_retry_wait(
+                settings.llm_retry_wait_min_seconds, settings.llm_retry_wait_max_seconds
+            )
+            assert wait_fn(_FakeRetryState(exc)) == 2.0, (
+                "Clamp must use the OVERRIDDEN llm_retry_wait_max_seconds (2.0), "
+                "not the default (30.0)."
+            )
+        finally:
+            clear_all_overrides()
+
+    def test_malformed_or_absent_header_falls_back_to_exponential_without_raising(
+        self,
+    ) -> None:
+        """
+        Neither a malformed header value nor a missing header should raise --
+        both must fall back to the same wait_exponential(min, max) the
+        fallback path delegates to.
+        """
+        from tenacity import wait_exponential
+
+        expected = wait_exponential(min=1.0, max=30.0)
+        wait_fn = base_module._build_retry_wait(min_seconds=1.0, max_seconds=30.0)
+
+        malformed_exc = self._rate_limit_error_with_headers({"retry-after": "not-a-number"})
+        state = _FakeRetryState(malformed_exc, attempt_number=2)
+        assert wait_fn(state) == expected(state)
+
+        absent_exc = self._rate_limit_error_with_headers({})
+        state2 = _FakeRetryState(absent_exc, attempt_number=3)
+        assert wait_fn(state2) == expected(state2)
+
+    def test_5xx_without_retry_after_still_uses_exponential(self) -> None:
+        """
+        Non-regression: a 5xx with no retry-after header must behave exactly
+        as before this change -- wait_exponential(min, max), unchanged.
+        """
+        from tenacity import wait_exponential
+
+        response = MagicMock(status_code=500)
+        response.headers = {}
+        server_error = InternalServerError(
+            message="Internal server error",
+            response=response,
+            body={"error": {"type": "api_error"}},
+        )
+        expected = wait_exponential(min=1.0, max=30.0)
+        wait_fn = base_module._build_retry_wait(min_seconds=1.0, max_seconds=30.0)
+        state = _FakeRetryState(server_error, attempt_number=2)
+
+        assert wait_fn(state) == expected(state)
+
+
 class TestRetryRespectsRuntimeOverrides:
     """
     The three llm_retry_* fields are advertised by PATCH /config as
