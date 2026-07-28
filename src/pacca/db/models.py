@@ -97,9 +97,10 @@ class AuthorizationRequestModel(Base):
     decision: Mapped["AuthorizationDecisionModel | None"] = relationship(
         "AuthorizationDecisionModel", back_populates="request", uselist=False
     )
-    audit_logs: Mapped[list["AuditLogModel"]] = relationship(
-        "AuditLogModel", back_populates="request"
-    )
+    # No `audit_logs` relationship here (chg-23, migration 007): it relied on
+    # the request_id FK this model no longer has (see AuditLogModel.request_id
+    # below). Query audit_logs by request_id/correlation_id directly
+    # (AuditRepository.get_by_request_id) rather than via ORM traversal.
 
     def __repr__(self) -> str:
         return f"<AuthorizationRequest(request_id={self.request_id}, status={self.status})>"
@@ -209,19 +210,24 @@ class AuditLogModel(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=func.now(), index=True)
 
     # Context
+    #
+    # chg-23 (migration 007) DROPS the foreign key this column used to carry
+    # to authorization_requests.request_id — superseding migration 003 / B3's
+    # DEFERRABLE INITIALLY DEFERRED fix. B3 made the deferred FK check pass
+    # by relying on the audit write and the parent request row sharing ONE
+    # commit; once AuditRepository.log() commits independently of the
+    # caller's transaction (the chg-23 durability fix), that shared-commit
+    # assumption no longer holds and the deferred check fails on every
+    # request instead of only on failures (verified against real Postgres:
+    # audit rows written = 0 with the FK in place). More fundamentally: an
+    # append-only audit table should not have its rows' survival depend on
+    # referential integrity to a mutable business table it exists to outlive
+    # even when that business row never lands. The column and its index
+    # remain — request_id is still a plain, queryable, indexed value, just
+    # no longer FK-enforced. Correlation is still guaranteed via
+    # correlation_id, which never carried an FK.
     request_id: Mapped[str | None] = mapped_column(
         String(50),
-        # B3: DEFERRABLE INITIALLY DEFERRED so Postgres checks this FK at COMMIT,
-        # not per-statement. The submit route writes two request_id-bearing audit
-        # rows (intent.declared, authorization_submitted) BEFORE the parent
-        # authorization_requests row — because intent.declared must be the first
-        # audit event (pre-write-audit invariant). Deferring the check to commit
-        # keeps both invariants: audit-first ordering AND referential integrity.
-        ForeignKey(
-            "authorization_requests.request_id",
-            deferrable=True,
-            initially="DEFERRED",
-        ),
         nullable=True,
         index=True,
     )
@@ -246,10 +252,8 @@ class AuditLogModel(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     token_usage: Mapped[dict[str, Any] | None] = mapped_column(_JSON_VARIANT, nullable=True)
 
-    # Relationships
-    request: Mapped[AuthorizationRequestModel | None] = relationship(
-        "AuthorizationRequestModel", back_populates="audit_logs"
-    )
+    # No `request` relationship here (chg-23): it relied on the request_id
+    # FK dropped above. See AuthorizationRequestModel for the matching note.
 
     def __repr__(self) -> str:
         return f"<AuditLog(entry_id={self.entry_id}, action={self.action})>"
