@@ -109,6 +109,37 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 @asynccontextmanager
+async def get_independent_session() -> AsyncGenerator[AsyncSession, None]:
+    """
+    A brand-new session bound to the SAME engine/pool as every other session
+    (via `get_session_factory()` — no new engine is created), for callers
+    that need a write to commit on its own, independent of whatever
+    request-scoped transaction the caller is also participating in.
+
+    This exists for `AuditRepository.log()`: an audit row written on the
+    request's own session is rolled back along with the business
+    transaction if the request later fails (see `get_session()` above) —
+    exactly the case an audit trail must survive. A session from this
+    function is a separate DB transaction: committing it here does not
+    depend on, and is not undone by, a rollback anywhere else.
+
+    Unlike `get_session()` / `get_session_context()`, this does NOT
+    commit or roll back on the caller's behalf — the caller must commit
+    explicitly. That's deliberate: the caller (audit write) needs to
+    observe and handle its OWN commit failure without that failure
+    propagating as an uncaught exception out of a `yield`.
+
+    Usage:
+        async with get_independent_session() as session:
+            session.add(entry)
+            await session.commit()
+    """
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        yield session
+
+
+@asynccontextmanager
 async def get_session_context() -> AsyncGenerator[AsyncSession, None]:
     """
     Context manager for database sessions.
