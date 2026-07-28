@@ -88,6 +88,7 @@ from pydantic import BaseModel, Field
 from tenacity import (
     RetryCallState,
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -354,7 +355,15 @@ class BaseAgent(ABC):
                 min=settings.llm_retry_wait_min_seconds,
                 max=settings.llm_retry_wait_max_seconds,
             ),
-            retry=retry_if_exception_type(RETRIABLE_ERRORS),
+            # OR'd predicate (chg-21): retry the original transient-error
+            # tuple (429/connection/timeout) AND any 5xx APIStatusError
+            # (500/502/503/504/529), via the _is_retriable_status_error
+            # helper that previously existed but was referenced nowhere —
+            # a 500/529 used to fail on the first attempt. 4xx errors
+            # (400 BadRequestError, 401 AuthenticationError, etc.) match
+            # neither branch and are still raised on the first attempt.
+            retry=retry_if_exception_type(RETRIABLE_ERRORS)
+            | retry_if_exception(_is_retriable_status_error),
             before_sleep=_log_retry_attempt,
             reraise=True,
         )
