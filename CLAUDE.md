@@ -80,11 +80,12 @@ every PR is one path or the other, never ambiguous.
   `enforce_scope(intent, action, **call_args)`, a fail-closed call-site *wrapper*
   (there is no middleware loader) that denies out-of-scope tool/DB/RAG calls against
   the `IntentRecord` and raises `ScopeViolation` → `EscalationReason.SCOPE_VIOLATION`.
-  **As built (chg-8 → chg-9, +1 call site at chg-20):** wired into the submit route in
-  **enforce** mode at four sites — three identifier-checked DB writes (`db.write_request`;
-  `db.write_decision` at the normal-flow persist; `db.write_decision` again at the
-  RAG-degraded escalation persist) and the RAG query. A cross-case leak fail-closes to
-  human review. In correct operation
+  **As built (chg-8 → chg-9, +1 site at chg-20, +1 at chg-22):** wired into the submit
+  route in **enforce** mode at five sites — four identifier-checked DB writes
+  (`db.write_request`; `db.write_decision` at the normal-flow persist; again at the
+  RAG-degraded escalation persist; again at the scope-violation escalation persist) and
+  the RAG query. `learn_from_feedback` carries a sixth site (`rag.write_precedent`) under
+  its own intent. A cross-case leak fail-closes to human review. In correct operation
   the run always passes its own scope, so it does not deny in normal flow — its value is
   fail-closed defense against a leak/bug. Mode is `settings.scope_guard_mode`.
 - `src/pacca/integrations/vector_store.py` — `GuidelineRetriever`, the **live**
@@ -127,9 +128,20 @@ every PR is one path or the other, never ambiguous.
   (chg-10) also promotes this guard to a **runtime** detector (`evidence_grounding.py`):
   a decision citing an evidence id absent from the submission is forced to human review.
 - **Tool-use forced** for structured output. Don't switch an agent to free-text parsing.
-- **Pre-write audit trail.** Correlation-ID-linked event pairs (`AuditLogModel` carries
-  `correlation_id`) are flushed BEFORE any state change; `tests/unit/test_audit_trail.py`
-  guards the ordering. Don't reorder writes ahead of the audit flush.
+- **Pre-write audit trail — ordering AND durability (chg-23).** Correlation-ID-linked event
+  pairs (`AuditLogModel` carries `correlation_id`) are written BEFORE any state change;
+  `tests/unit/test_audit_trail.py` guards the ordering. Don't reorder writes ahead of the
+  audit write.
+  **Durability is now real, and it was not before.** `AuditRepository.log()` commits on a
+  session bound to the caller's own engine, independently of the business transaction — so
+  a rolled-back request can no longer erase the record that documents it. Two consequences
+  that are load-bearing: (1) `audit_logs.request_id` carries **no foreign key** (migration
+  007 dropped the deferrable FK from migration 003) — an append-only audit row must not
+  depend on a business row it is meant to outlive, and pre-write auditing is structurally
+  incompatible with a parent-row constraint; (2) a non-`AsyncEngine` bind is **refused
+  loudly** (`audit_independent_session_unsupported_bind`) rather than silently degrading to
+  savepoint semantics. Verified on real Postgres: 7/7 route audit rows persist with
+  `request_id` intact, and pre-write rows survive a business rollback.
 - **Append-only policy change log.** The intent is that policy changes are never mutated
   or deleted. **As built** this is a prototype: `PolicyChangeLogEntry` (in
   `agents/evolution.py`) is an in-memory dataclass list, not a DB table

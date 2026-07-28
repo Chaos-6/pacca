@@ -149,6 +149,48 @@ The second one is the trap: the agent *suspected* Postgres would differ, wrote a
 
 ---
 
+### P-011 · `MagicMock` implements `__float__` — an unconfigured mock can impersonate a real header value
+**Symptom.** A test suite silently starts *sleeping*. Nothing fails; wall-clock creeps.
+
+**Cause.** `float(MagicMock())` returns **1.0**. Code that reads a header and coerces it —
+`float(response.headers.get("retry-after"))` — will "successfully" parse an unconfigured
+`MagicMock(status_code=...)` as a genuine 1-second directive. Observed 2026-07-28 while adding
+`retry-after` handling: every pre-existing test in `test_retry_and_tracing.py` builds fake
+Anthropic errors as `response=MagicMock(...)` without setting `.headers`, so the new parser
+would have introduced a real `asyncio.sleep(1.0)` into most of them.
+
+**Rule.** When parsing a value that came from a mockable object, **type-guard before coercing**:
+```python
+if not isinstance(raw, (str, bytes)):
+    continue          # a MagicMock is never str/bytes; real httpx headers are
+```
+Generalises past mocks: `float()`/`int()` on an unvalidated attribute accepts anything with a
+dunder. Assert on the *computed value* rather than wall-clock, so a mock that slips through
+shows up as a wrong number instead of a slow suite.
+
+---
+
+### P-012 · `--ignore-missing-imports` hides a real mypy error — use the canonical `make typecheck` invocation
+**Symptom.** An agent reports "3 pre-existing mypy errors"; the true count is **4**. Happened in
+**all three** parallel lanes on 2026-07-28, independently.
+
+**Cause.** `mypy src/pacca --ignore-missing-imports` (the habitual form) suppresses
+`src/pacca/harness/validate_manifest.py:31: Library stubs not installed for "jsonschema"
+[import-untyped]`. The Makefile's `typecheck` target runs `mypy src/pacca/` with **no flag**, so
+CI sees 4 and a local run sees 3.
+
+**Rule.** Report the count from the canonical target (`make typecheck`, i.e. `mypy src/pacca/`),
+never from an ad-hoc invocation with extra flags. If you must add flags to isolate something,
+say which invocation produced the number. A count that disagrees with CI is worse than no count —
+it trains the reader to discount the numbers that *are* load-bearing.
+
+**Corollary.** The repo runs mypy in **two** environments with different visibility: the project
+venv, and the pre-commit hook's isolated venv (thin `additional_dependencies`, no SQLAlchemy or
+tenacity). An annotation that satisfies one can be flagged as unused in the other — see P-007.
+Fix in-file (`cast()`, a real coercion) rather than suppressing in either.
+
+---
+
 ## Git & PR workflow (PACCA-specific overlay on the global rule L-001)
 
 ### P-006 · PACCA defaults to branch-and-PR. No direct pushes to main.

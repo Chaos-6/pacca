@@ -1,0 +1,173 @@
+{
+  "iteration": 16,
+  "iteration_tag": "harness-iter-16",
+  "iso_date": "2026-07-28",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-15",
+  "summary": "Closes three runtime defects from the 2026-07-27 audit, each found by adversarial validation rather than by the suite. chg-21: 5xx/529 were not retried, and the SDK's hidden retry loop multiplied attempts under a second backoff schedule. chg-22: the scope-guard escalation returned IN_REVIEW but persisted no row, so a case routed to review never reached the queue. chg-23: audit rows rolled back with the transaction they documented. Verified on real Postgres, not the SQLite tier that hid them.",
+  "changes": [
+    {
+      "id": "chg-21",
+      "type": "improvement",
+      "description": "Retry 5xx/529 Anthropic API errors at the tenacity layer, disable the SDK's own retry loop so tenacity is the sole authority, and honour server-directed retry-after/retry-after-ms headers clamped to llm_retry_wait_max_seconds.",
+      "files": [
+        "src/pacca/agents/base.py",
+        "tests/unit/test_retry_and_tracing.py"
+      ],
+      "failure_pattern": "A 500/502/503/504/529 from the Anthropic API surfaced to the caller without any tenacity retry, while 429/connection/timeout errors retried normally. Because the SDK retried 5xx internally, the failure was neither visible in `_log_retry_attempt` nor counted in the OTel span's attempt_number — the system retried, but its own telemetry said it had not.",
+      "root_cause": "RETRIABLE_ERRORS covered only RateLimitError, APIConnectionError and APITimeoutError. A helper written to classify 5xx APIStatusError as retriable existed at base.py:118 and was referenced nowhere — dead code describing the missing behaviour. Separately, AsyncAnthropic was constructed without max_retries, defaulting to 2, so a second retry loop ran below tenacity under its own backoff schedule.",
+      "evidence": [
+        {
+          "source": "adversarial validation, 2026-07-28",
+          "note": "Boundary matrix driven through the real _call_with_retry: 500/503/504/529/599 each retried to llm_retry_max_attempts; 499/400/401/403/404/409/422 each attempted exactly once. Mutation testing showed 3 tests guard the fix."
+        },
+        {
+          "source": "AsyncAnthropic(api_key='sk-test').max_retries",
+          "note": "Returned 2. _base_client._should_retry() retries 408/409/429 and any status >= 500, so a persistent 5xx cost up to 3 x 3 = 9 HTTP requests once tenacity also retried."
+        },
+        {
+          "source": "anthropic 0.98.0 exception hierarchy",
+          "note": "OverloadedError (529) and ServiceUnavailableError exist in _exceptions.py but are not exported at top level, so a 529 reaches callers as APIStatusError with status_code == 529. _is_retriable_status_error is subclass-agnostic and handles both."
+        }
+      ],
+      "predicted_fixes": [
+        "A persistent 5xx now costs exactly llm_retry_max_attempts HTTP requests (default 3) under one visible, PATCH-tunable backoff schedule, instead of up to 9 under two uncoordinated ones.",
+        "A 429 carrying retry-after is honoured rather than discarded: wait = min(server_directed_seconds, llm_retry_wait_max_seconds), so a legitimate retry-after: 15 is respected while a hostile retry-after: 86400 is clamped to 30s and cannot hang an agent call for a day.",
+        "No 4xx is retried. A 400 still fails on the first attempt rather than re-sending the same invalid request."
+      ],
+      "risk_cases": [
+        "Disabling the SDK's retry loop removed its retry-after handling; restoring it at the tenacity layer was required to avoid trading a visibility fix for a rate-limit regression (caught in review, not in test).",
+        "unittest.mock.MagicMock implements __float__ (returns 1.0), so an unconfigured MagicMock header would have parsed as a real 1-second retry-after and introduced actual asyncio.sleep into the suite. Guarded by an isinstance(raw, (str, bytes)) check.",
+        "A failing call now takes longer before surfacing. The ~90-minute worst case via 600s read timeouts is pre-existing — timeouts were already retriable at both layers."
+      ],
+      "constraint_level": "tool_implementation",
+      "why_this_component": "base.py owns the single LLM call path every agent inherits. Retry policy belongs there rather than in each agent, and centralising it is what makes the knobs runtime-tunable through effective_settings().",
+      "phi_impact": "none",
+      "audit_relevant": false,
+      "rollback_plan": "Revert base.py to restore the type-only predicate and drop max_retries=0. The SDK's internal retry resumes, returning to pre-change behaviour."
+    },
+    {
+      "id": "chg-22",
+      "type": "improvement",
+      "description": "Persist the scope-violation escalation decision so it reaches GET /authorizations/review-queue, guarded by enforce_scope, with a failure envelope that audits rather than 500s.",
+      "files": [
+        "src/pacca/api/routes/authorizations.py",
+        "tests/unit/test_escalation_persistence.py"
+      ],
+      "failure_pattern": "A ScopeViolation returned an AuthorizationDecision with status IN_REVIEW and review_tier HUMAN to the caller, but wrote no decision row. GET /review-queue lists persisted IN_REVIEW decisions via list_escalated_for_review(), so the case was routed to a human review no human could see.",
+      "root_cause": "The except ScopeViolation handler in submit_authorization constructed and returned the decision directly, without a DecisionRepository.create() call — the same defect class chg-20 had already fixed for the RAG-degraded escalation path, left unfixed here.",
+      "evidence": [
+        {
+          "source": "adversarial validation of chg-20, 2026-07-28",
+          "note": "Measured on the analogous RAG path before it was fixed: status=IN_REVIEW tier=HUMAN escalations=1, DecisionRepository.create called: 0. The ScopeViolation handler was found to share the flaw."
+        },
+        {
+          "source": "independently re-derived persistence audit across all escalation exits",
+          "note": "Pre-flight, evidence-grounding, confidence branch 3, kill switch, Medical Director (both outcomes) and RAG-degraded all already persisted exactly one row — they return through Orchestrator.process_decision, so the route's unconditional post-orchestrator persist runs. Only the ScopeViolation early-return was broken."
+        }
+      ],
+      "predicted_fixes": [
+        "A scope violation firing after the request row exists now produces exactly one authorization_decisions row with outcome IN_REVIEW, visible via GET /review-queue.",
+        "A violation on db.write_request itself deliberately persists nothing and returns 200 with an IN_REVIEW decision, never a 500 — writing the request row to make the decision persistable would perform the exact write the guard just denied.",
+        "A database failure inside the persist (OperationalError, DBAPIError, or any SQLAlchemyError) is audited as escalation_persist_failed and swallowed; a fail-closed escalation path never ends in a 500."
+      ],
+      "risk_cases": [
+        "The persist runs inside an except handler. If it raised, the route's own except Exception could not catch it (same try statement), so it would escape as an unaudited 500 — the reason the failure envelope was widened from IntegrityError to SQLAlchemyError and get_by_id moved inside the try.",
+        "A ScopeViolation on the db.write_decision action itself still never reaches the queue: the re-guard deterministically re-denies. This is the correct fail-closed choice — persisting would perform the denied action class — and it IS audited (escalation_persist_failed fires exactly once), so the case is recorded, not lost. But 'routed to human review' is not literally true for this sub-case, and that limit is recorded here rather than left in a code comment."
+      ],
+      "constraint_level": "escalation_branch",
+      "why_this_component": "The review queue is the only surface a human reviewer sees. An escalation that does not reach it is indistinguishable from no escalation, which makes the P-4 guard's fail-closed property partly illusory.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Revert authorizations.py. The handler returns the decision without persisting, restoring the prior (defective) behaviour; no schema change to unwind."
+    },
+    {
+      "id": "chg-23",
+      "type": "improvement",
+      "description": "Commit audit writes on a session bound to the caller's own engine, independently of the business transaction, and drop the audit_logs.request_id foreign key (migration 007) that made durable pre-write auditing impossible.",
+      "files": [
+        "src/pacca/db/repository.py",
+        "src/pacca/db/session.py",
+        "src/pacca/db/models.py",
+        "src/pacca/db/migrations/versions/007_drop_audit_request_id_fk.py",
+        "tests/unit/test_audit_durability.py",
+        "tests/unit/test_audit_fk_deferrable.py",
+        "tests/integration/test_submit_postgres.py",
+        "docs/ARCHITECTURE.md"
+      ],
+      "failure_pattern": "AuditRepository.log() flushed on the request's own session, and get_session() rolls back on any exception, so a failed request left zero audit rows. Pre-write ORDERING held; pre-write DURABILITY — what HIPAA 164.312(b) is about, and what the docs claimed — did not.",
+      "root_cause": "Four layers. (a) Audit writes shared the business transaction and were rolled back with it. (b) The fix for (a) — independent commits — broke the DEFERRABLE INITIALLY DEFERRED FK added by migration 003, which resolved only because both writes shared a commit. (c) The stopgap retry for (b) re-added an already-flushed, identity-keyed ORM instance, so SQLAlchemy emitted UPDATE-0-rows instead of INSERT and the row was lost silently. (d) get_independent_session() built from the global settings engine rather than the caller's, so audit writes could target a different database entirely.",
+      "evidence": [
+        {
+          "source": "live Postgres 16 A/B on identical code, 2026-07-28",
+          "note": "At migration 006 (FK present): request_rows=1 audit_rows=0 linked=0, with seven ForeignKeyViolationError events. After alembic upgrade head (007 applied), same code: request_rows=1 audit_rows=7 linked=7, zero errors. Proves both the defect and that migration 007 is necessary rather than convenient."
+        },
+        {
+          "source": "tests/integration/test_submit_postgres.py",
+          "note": "Failed with 'the pre-flight + decision audit rows were not persisted' before the redesign; 3 passed after. The tier that exists to catch SQLite-masked bugs caught this one when 890 unit tests did not."
+        },
+        {
+          "source": "adversarial validation, dialect divergence",
+          "note": "On SQLite the rolled-back instance stays re-insertable and the retry succeeded; on Postgres it is detached with an identity key and the retry silently lost the row. A PRAGMA foreign_keys=ON SQLite test confirmed the wrong thing — recorded as docs/AGENT_LESSONS.md P-009."
+        }
+      ],
+      "predicted_fixes": [
+        "A production Postgres request that fails after intent.declared now leaves that audit row durably committed. Before this change it was dropped on every failure; between the first fix and migration 007 it was dropped on every request, successful or not.",
+        "A normal successful submit persists all 7 route audit rows with request_id intact (measured 7/7, zero NULLs).",
+        "An audit write can never target a database other than the caller's: the independent session binds to self.session.bind, and a non-AsyncEngine bind is refused loudly (audit_independent_session_unsupported_bind) rather than silently degrading to savepoint semantics."
+      ],
+      "risk_cases": [
+        "Dropping the FK supersedes migration 003's B3 deferral. Orphaned request_id values are now produced BY DESIGN — that is what rollback survival means — so migration 007's downgrade fails on the first orphan on Postgres (fails safe: transactional DDL leaves alembic_version at 007). SQLite's batch copy silently accepts the same orphans. Both documented in the migration.",
+        "An append-only audit table should not carry referential integrity to a mutable business table: the FK made a HIPAA record's survival depend on a business row it is meant to outlive.",
+        "Each log() call now takes a second connection checkout — 7 per submit. With db_pool_size=5 and max_overflow=10, saturation begins around 15 concurrent requests, after which audit writes block up to pool_timeout=30s and then fail non-fatally. Documented, not load-tested.",
+        "A connection-bound (rather than engine-bound) caller session would make the independent commit a savepoint and lose durability. No production path constructs one; the guard now refuses it loudly."
+      ],
+      "constraint_level": "audit_schema",
+      "why_this_component": "The audit trail is the one artifact that must survive the failure it records. Its durability cannot depend on the transaction whose failure it exists to document, and it cannot depend on a foreign key to a row that, by design, may never be written.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "alembic downgrade to 006 restores the deferrable FK — but only after NULLing orphaned audit_logs.request_id values, which rollback survival now produces (query and procedure documented in migration 007). Then revert repository.py/session.py to restore in-transaction audit writes. Reverting the code without downgrading the schema is safe; downgrading the schema without reverting the code reintroduces the 0-of-7 loss."
+    }
+  ],
+  "verdicts": [
+    {
+      "change_id": "chg-19",
+      "previous_iteration_tag": "harness-iter-15",
+      "outcome": "keep",
+      "verified_fixes": [
+        "The pipeline-is-None path (the historical iter-14 failure mode) proven visible by execution twice, including a patched _build_pipeline raising ImportError: degraded=True with a meaningful reason.",
+        "Text output byte-identical to 7c6a6c0 under identical mocks across healthy, healthy-with-precedents, and fallback paths.",
+        "Contract change complete: exactly one src call site, all 8 test doubles updated."
+      ],
+      "missed_fixes": [
+        "Precedent-retrieval failure inside the healthy pipeline path still reported mode=pipeline degraded=False. Closed in the same iteration via precedents_degraded/precedents_reason."
+      ],
+      "false_predicted_fixes": [],
+      "verified_risks": [
+        "reason carries the exception TYPE only; a PHI-like exception message did not leak into reason, text, or the audit record."
+      ],
+      "unforeseen_regressions": [],
+      "notes": "Clinical gate passed 10/10 at the merge HEAD (18m33s, 2026-07-28)."
+    },
+    {
+      "change_id": "chg-20",
+      "previous_iteration_tag": "harness-iter-15",
+      "outcome": "keep",
+      "verified_fixes": [
+        "Warn-mode default confirmed; PATCH /admin/config flips rag_degraded_escalates in both directions with effect on the very next request, proving effective_settings() is read per-request rather than cached.",
+        "Escalated decisions persist and are returned by list_escalated_for_review() against a real database.",
+        "Exactly one decision write per request across all four flag/health combinations."
+      ],
+      "missed_fixes": [
+        "The new escalation write was initially the only ungoverned db.write_decision site; wrapped in enforce_scope in the same iteration."
+      ],
+      "false_predicted_fixes": [],
+      "verified_risks": [
+        "Escalating on a precedents-only failure widens what reaches human review. Judged correct — the DecisionAgent prompt weighs precedents — and the warn-mode default means no immediate operational change."
+      ],
+      "unforeseen_regressions": [],
+      "notes": "Adversarial validation of this change surfaced the identical non-persistence defect in the ScopeViolation handler, shipped here as chg-22."
+    }
+  ]
+}
