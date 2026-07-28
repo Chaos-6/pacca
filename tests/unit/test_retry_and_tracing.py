@@ -37,12 +37,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from anthropic import (
     APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
     AuthenticationError,
     BadRequestError,
+    InternalServerError,
     RateLimitError,
 )
 from pydantic import BaseModel
 
+import pacca.agents.base as base_module
 from pacca.agents.base import AgentConfig, BaseAgent
 from pacca.config import tracing as tracing_module
 
@@ -268,6 +272,188 @@ class TestRetryLogic:
 
         assert result.result == "approved"
         assert agent.client.messages.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_is_retried(self, agent: _ConcreteAgent) -> None:
+        """
+        APITimeoutError (part of the original RETRIABLE_ERRORS tuple) must
+        still be retried after the chg-21 5xx predicate is added.
+
+        This is a non-regression check: adding the OR'd status-code predicate
+        must not disturb the existing retry_if_exception_type(RETRIABLE_ERRORS)
+        branch. Nobody had a test for APITimeoutError specifically before this
+        change (RateLimitError and APIConnectionError were covered, this one
+        was not), so it is added now rather than only implied.
+        """
+        success_response = make_mock_response()
+
+        agent.client.messages.create = AsyncMock(
+            side_effect=[
+                APITimeoutError(request=MagicMock()),
+                success_response,
+            ]
+        )
+
+        with patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)):
+            result = await agent.execute("test prompt", _TestOutput)
+
+        assert result.result == "approved"
+        assert agent.client.messages.create.call_count == 2
+
+
+class TestServerErrorRetry:
+    """
+    chg-21: 5xx / 529 server errors must be retried via the OR'd predicate
+    `retry_if_exception_type(RETRIABLE_ERRORS) | retry_if_exception(_is_retriable_status_error)`.
+
+    Before chg-21, `_is_retriable_status_error` existed in base.py but was
+    referenced nowhere — RETRIABLE_ERRORS only covered RateLimitError,
+    APIConnectionError, APITimeoutError. A 500/529 failed on the very first
+    attempt. These tests pin the fixed behavior and (via
+    test_pre_fix_predicate_does_not_retry_5xx) prove the old predicate
+    actually fails this exact assertion.
+    """
+
+    @pytest.fixture
+    def agent(self) -> _ConcreteAgent:
+        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        a = _ConcreteAgent(config=cfg)
+        a._settings = MagicMock()
+        a._settings.llm_retry_max_attempts = 3
+        a._settings.llm_retry_wait_min_seconds = 0.0
+        a._settings.llm_retry_wait_max_seconds = 0.0
+        return a
+
+    @pytest.mark.asyncio
+    async def test_internal_server_error_5xx_is_retried_to_exhaustion(
+        self, agent: _ConcreteAgent
+    ) -> None:
+        """
+        A 500 InternalServerError must be retried up to llm_retry_max_attempts,
+        then the original error re-raised (reraise=True preserved).
+        """
+        server_error = InternalServerError(
+            message="Internal server error",
+            response=MagicMock(status_code=500),
+            body={"error": {"type": "api_error"}},
+        )
+        agent.client.messages.create = AsyncMock(
+            side_effect=[server_error, server_error, server_error]
+        )
+
+        with (
+            patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)),
+            pytest.raises(InternalServerError),
+        ):
+            await agent.execute("test prompt", _TestOutput)
+
+        assert agent.client.messages.create.call_count == 3, (
+            "InternalServerError (500) must be retried up to "
+            "llm_retry_max_attempts (3), not fail on the first attempt."
+        )
+
+    @pytest.mark.asyncio
+    async def test_529_overloaded_is_retried(self, agent: _ConcreteAgent) -> None:
+        """
+        A 529 ("overloaded") response is a raw APIStatusError subclass with
+        status_code=529 in anthropic 0.98.0 (see session verification: the
+        SDK's concrete _make_status_error maps 529 to an internal
+        `_exceptions.OverloadedError`, a class that exists in the package but
+        is NOT re-exported from the top-level `anthropic` namespace/__all__ —
+        so callers, and this test, only ever see it as an APIStatusError with
+        status_code == 529). _is_retriable_status_error must treat it as
+        retriable because 529 >= 500.
+        """
+        overloaded_error = APIStatusError(
+            message="Overloaded",
+            response=MagicMock(status_code=529),
+            body={"error": {"type": "overloaded_error"}},
+        )
+        success_response = make_mock_response()
+        agent.client.messages.create = AsyncMock(side_effect=[overloaded_error, success_response])
+
+        with patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)):
+            result = await agent.execute("test prompt", _TestOutput)
+
+        assert result.result == "approved"
+        assert agent.client.messages.create.call_count == 2, (
+            "A 529 (status_code=529) APIStatusError must be retried — "
+            "529 >= 500, so _is_retriable_status_error must return True."
+        )
+
+    @pytest.mark.asyncio
+    async def test_pre_fix_predicate_does_not_retry_5xx(self, agent: _ConcreteAgent) -> None:
+        """
+        Regression proof: with ONLY the pre-chg-21 predicate
+        (retry_if_exception_type(RETRIABLE_ERRORS), no OR'd status-code
+        check), a 500 is NOT retried — it fails on the first attempt.
+
+        This test inlines the exact pre-fix predicate (rather than relying on
+        git history/stash, which is forbidden in this worktree) so the
+        regression this change fixes stays runnable and visible in CI
+        forever, not just as a one-time manual proof.
+        """
+        from tenacity import retry_if_exception_type
+
+        server_error = InternalServerError(
+            message="Internal server error",
+            response=MagicMock(status_code=500),
+            body={"error": {"type": "api_error"}},
+        )
+        agent.client.messages.create = AsyncMock(
+            side_effect=[server_error, server_error, server_error]
+        )
+
+        pre_fix_predicate = retry_if_exception_type(base_module.RETRIABLE_ERRORS)
+
+        with (
+            patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)),
+            patch(
+                "pacca.agents.base.retry_if_exception_type",
+                return_value=pre_fix_predicate,
+            ),
+            patch(
+                "pacca.agents.base.retry_if_exception", side_effect=lambda _pred: pre_fix_predicate
+            ),
+            pytest.raises(InternalServerError),
+        ):
+            await agent.execute("test prompt", _TestOutput)
+
+        assert agent.client.messages.create.call_count == 1, (
+            "With the pre-fix predicate reinstated, a 500 must fail on the "
+            "first attempt (this is the bug chg-21 fixes)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_retriable_status_error_reachable_from_retry_path(
+        self, agent: _ConcreteAgent
+    ) -> None:
+        """
+        `_is_retriable_status_error` must be actually invoked by the retry
+        path, not merely defined and unreferenced. Spy on it and confirm it
+        is called at least once during a 5xx retry cycle.
+        """
+        server_error = InternalServerError(
+            message="Internal server error",
+            response=MagicMock(status_code=500),
+            body={"error": {"type": "api_error"}},
+        )
+        success_response = make_mock_response()
+        agent.client.messages.create = AsyncMock(side_effect=[server_error, success_response])
+
+        spy = MagicMock(wraps=base_module._is_retriable_status_error)
+
+        with (
+            patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)),
+            patch("pacca.agents.base._is_retriable_status_error", spy),
+        ):
+            result = await agent.execute("test prompt", _TestOutput)
+
+        assert result.result == "approved"
+        assert spy.call_count >= 1, (
+            "_is_retriable_status_error must be reachable from the retry "
+            "predicate — it was dead code before chg-21."
+        )
 
 
 class TestRetryRespectsRuntimeOverrides:
