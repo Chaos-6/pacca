@@ -74,7 +74,7 @@ Teaching note — OpenTelemetry span attributes
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
 from anthropic import (
@@ -127,6 +127,85 @@ def _is_retriable_status_error(exc: BaseException) -> bool:
     if isinstance(exc, APIStatusError):
         return bool(exc.status_code >= 500)
     return False
+
+
+def _parse_retry_after_seconds(exc: BaseException | None) -> float | None:
+    """
+    Extract a server-directed wait time (seconds) from an APIStatusError's
+    response headers, preferring the more precise `retry-after-ms` over
+    `retry-after` -- same precedence as the Anthropic SDK's own
+    _parse_retry_after_header(). Returns None if the exception carries no
+    HTTP response, or neither header is present/well-formed; callers fall
+    back to exponential backoff in that case.
+
+    Only `str`/`bytes` header values are accepted. This matters beyond
+    input hygiene: `unittest.mock.MagicMock` implements `__float__` (default
+    1.0), so an un-configured `MagicMock(status_code=...).headers.get(...)`
+    -- the exact pattern this file's existing tests use to build fake
+    Anthropic errors -- would otherwise "successfully" parse as a 1-second
+    retry-after and cause a REAL asyncio.sleep(1.0) in every test that
+    doesn't explicitly set headers. The isinstance guard makes that
+    impossible: a MagicMock is never a str or bytes, so it is treated as
+    "no header", exactly like real httpx.Headers.get() returning None.
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None or not hasattr(headers, "get"):
+        return None
+
+    for header_name, is_milliseconds in (("retry-after-ms", True), ("retry-after", False)):
+        raw = headers.get(header_name)
+        if not isinstance(raw, (str, bytes)):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        return value / 1000 if is_milliseconds else value
+
+    return None
+
+
+def _build_retry_wait(min_seconds: float, max_seconds: float) -> Callable[[RetryCallState], float]:
+    """
+    Build a tenacity wait strategy that honors the Anthropic API's
+    server-directed `retry-after` / `retry-after-ms` header when the
+    failed attempt's exception carries one, falling back to
+    wait_exponential(min, max) otherwise.
+
+    Rationale (chg-21 follow-up): BaseAgent.__init__ sets max_retries=0 on
+    the Anthropic client so tenacity is the SOLE retry authority (avoiding
+    a double-retry under two uncoordinated backoff schedules -- see that
+    comment). But the SDK's own retry loop also read this header, and
+    honoring server-directed backoff under sustained 429 rate limiting is
+    what keeps a brief throttle from turning into a cascading one.
+    Disabling the SDK loop would have silently discarded that behavior;
+    this restores it at the tenacity layer instead.
+
+    Clamp: a header value is capped to `max_seconds` (settings.
+    llm_retry_wait_max_seconds) -- a hostile or buggy `retry-after: 86400`
+    must not hang an agent call for a day. A non-positive, missing, or
+    malformed header falls back to exponential backoff without raising.
+    """
+    fallback = wait_exponential(min=min_seconds, max=max_seconds)
+
+    def _wait(retry_state: RetryCallState) -> float:
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        seconds = _parse_retry_after_seconds(exc)
+        if seconds is not None and seconds > 0:
+            return min(seconds, max_seconds)
+        # float(...) is an explicit coercion, not a suppression: tenacity's
+        # wait_exponential.__call__ already returns a real float at runtime.
+        # The wrap makes that fact visible to mypy regardless of whether the
+        # checking environment has tenacity's stubs available (the repo's
+        # own .pre-commit-config.yaml mypy hook runs in an isolated venv
+        # whose additional_dependencies list does not include tenacity,
+        # where wait_exponential's return type is otherwise seen as Any and
+        # trips warn_return_any) -- environment-proofing the touched
+        # function in-file rather than adding a suppression.
+        return float(fallback(retry_state))
+
+    return _wait
 
 
 def _log_retry_attempt(retry_state: RetryCallState) -> None:
@@ -364,9 +443,14 @@ class BaseAgent(ABC):
 
         @retry(  # type: ignore[misc,unused-ignore]
             stop=stop_after_attempt(settings.llm_retry_max_attempts),
-            wait=wait_exponential(
-                min=settings.llm_retry_wait_min_seconds,
-                max=settings.llm_retry_wait_max_seconds,
+            # chg-21 follow-up: honor server-directed retry-after /
+            # retry-after-ms (clamped to llm_retry_wait_max_seconds) when
+            # present, else the original wait_exponential(min, max). See
+            # _build_retry_wait's docstring for why this exists now that
+            # the SDK's own retry-after-aware loop is disabled below.
+            wait=_build_retry_wait(
+                settings.llm_retry_wait_min_seconds,
+                settings.llm_retry_wait_max_seconds,
             ),
             # OR'd predicate (chg-21): retry the original transient-error
             # tuple (429/connection/timeout) AND any 5xx APIStatusError
