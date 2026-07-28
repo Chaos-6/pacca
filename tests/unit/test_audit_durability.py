@@ -30,6 +30,16 @@ poisoned-return bug the Validator found in it) with a throwaway FK-enforced
 SQLite table, to prove the no-retry replacement handles a hard persistence
 failure without raising OR corrupting the object handed back to the caller.
 
+`TestBindGuard` covers the second-round Validator finding (FIX 1/2): a
+caller session bound to an `AsyncConnection` (the standard "one shared
+connection, roll everything back" transactional-test pattern) rather than
+an `AsyncEngine` would make `get_independent_session`'s "own connection"
+promise false — a session sharing the caller's connection commits as a
+SAVEPOINT nested in the caller's transaction, so a later rollback erases
+it too, silently. `_persist_independently` now refuses that shape (and a
+bindless session) with a loud, named log event instead of attempting a
+write that reports success without providing durability.
+
 Every test here uses a real SQLite engine + real `AuditLogModel` /
 `AuthorizationRequestModel` rows via `Base.metadata.create_all` — no mocked
 sessions, no patched `AuditRepository.log`.
@@ -42,7 +52,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import StaticPool
 
 from pacca.db.models import AuditLogModel, AuthorizationRequestModel, Base
@@ -505,6 +520,93 @@ class TestEngineMatchesCallerSession:
             "the audit row must land in the SAME database as the caller's "
             "session, not silently vanish into a different (global) engine"
         )
+
+
+# ── Test 6b (FIX 1/2): unsupported bind shapes must fail LOUDLY, not silently ─
+
+
+class TestBindGuard:
+    @pytest.mark.asyncio
+    async def test_connection_bound_session_refuses_loudly_instead_of_silently_losing_the_row(
+        self, monkeypatch
+    ):
+        """chg-23 second-round Validator FIX 1: a caller session bound to an
+        `AsyncConnection` (not an `AsyncEngine`) — the standard
+        transactional-test pattern of one shared connection with everything
+        rolled back at the end — would make a session built from that SAME
+        bind share the caller's one connection. Its `commit()` degrades to
+        a SAVEPOINT nested in the caller's own transaction, so the
+        caller's later rollback erases the "independent" row too — with
+        ZERO errors logged, i.e. `log()` reports success while providing no
+        durability at all. `_persist_independently` must refuse this shape
+        outright and log loudly instead.
+        """
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        capturing_logger = _CapturingLogger()
+        monkeypatch.setattr("pacca.db.repository.logger", capturing_logger)
+
+        async with engine.connect() as conn:
+            await conn.begin()
+            session = AsyncSession(bind=conn, expire_on_commit=False)
+            repo = AuditRepository(session)
+            entry = await repo.log(action="test.connbound", actor="x", actor_type="system")
+            # No exception — the guard returns quietly to the caller ...
+            assert entry.action == "test.connbound"
+            try:
+                raise RuntimeError("simulated business failure")
+            except RuntimeError:
+                await session.rollback()
+
+        async with engine.connect() as check:
+            rows = (await check.execute(select(AuditLogModel))).scalars().all()
+
+        # ... but the row is NOT durable (this bind shape can't provide the
+        # guarantee) AND that fact is loudly, specifically logged — never
+        # "reported fine".
+        assert rows == [], (
+            "a connection-bound session cannot provide independent "
+            "durability — this is the documented, refused case"
+        )
+        unsupported_bind_events = [
+            (event, kw)
+            for level, event, kw in capturing_logger.calls
+            if event == "audit_independent_session_unsupported_bind"
+        ]
+        assert len(unsupported_bind_events) == 1, (
+            "expected exactly one loud, named log event for the unsupported "
+            f"bind shape, got {capturing_logger.calls}"
+        )
+        assert unsupported_bind_events[0][1]["bind_type"] == "AsyncConnection"
+
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_bindless_session_refuses_loudly_with_an_explicit_named_case(self, monkeypatch):
+        """chg-23 second-round Validator FIX 2: a session with NO bind at all
+        (`.bind is None`) used to reach this point only via an incidental
+        `AttributeError` caught by the generic exception handler — correct
+        outcome, accidental mechanism, fragile to a future refactor that
+        moves the `self.session.bind` access. `getattr(..., "bind", None)`
+        + the explicit `isinstance` check makes this a named, intentional
+        case instead."""
+        capturing_logger = _CapturingLogger()
+        monkeypatch.setattr("pacca.db.repository.logger", capturing_logger)
+
+        session = AsyncSession(expire_on_commit=False)
+        repo = AuditRepository(session)
+        entry = await repo.log(action="test.bindless", actor="x", actor_type="system")
+
+        assert entry.action == "test.bindless"
+        unsupported_bind_events = [
+            (event, kw)
+            for level, event, kw in capturing_logger.calls
+            if event == "audit_independent_session_unsupported_bind"
+        ]
+        assert len(unsupported_bind_events) == 1
+        assert unsupported_bind_events[0][1]["bind_type"] == "NoneType"
 
 
 # ── Test 7: the full submit route, real DB, expected audit sequence ────────
