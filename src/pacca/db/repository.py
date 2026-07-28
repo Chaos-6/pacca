@@ -377,18 +377,22 @@ class AuditRepository:
             token_usage: LLM token usage
 
         Returns:
-            The created audit log entry. Note this object is populated in
-            Python but is deliberately NOT added to `self.session` — see the
-            durability note below. It is safe to read (entry_id, action,
-            etc.) but is a detached/transient instance, not a row tracked by
-            the caller's own transaction.
+            The created audit log entry — a plain, transient Python object
+            that is NEVER added to any session (see the durability note
+            below), so every field is always safely readable regardless of
+            whether the underlying database write succeeded. It is not the
+            row an ORM query would return; it is a value snapshot of what
+            `log()` attempted to persist.
 
-        Durability (bugfix, see docs/AGENT_LESSONS.md / harness note): this
-        write commits on an INDEPENDENT session from the SAME engine/pool
-        (`get_independent_session()`, no new engine), not on `self.session`
-        — the request's own, possibly-doomed transaction. Previously this
-        method did `self.session.add(entry); await self.session.flush()`:
-        a flush is visible only inside the still-open transaction, so when
+        Durability (chg-23 bugfix, see docs/AGENT_LESSONS.md / harness
+        note): the write commits on an INDEPENDENT session bound to the
+        SAME engine as the caller's own session (`self.session.bind` — see
+        `get_independent_session()` in db/session.py for why it must be
+        the caller's engine, not the process-global default), not on
+        `self.session` itself — the request's own, possibly-doomed
+        transaction. Previously this method did
+        `self.session.add(entry); await self.session.flush()`: a flush is
+        visible only inside the still-open transaction, so when
         `get_session()`'s except-clause ran `await session.rollback()`
         after an unhandled exception, the flushed-but-uncommitted audit row
         was rolled back along with the failed business write — a failed
@@ -409,24 +413,25 @@ class AuditRepository:
         audit-committed-before-business-attempted, never
         audit-lost-because-business-failed.
 
-        `request_id` carries a DEFERRABLE INITIALLY DEFERRED foreign key to
-        `authorization_requests` (see db/models.py B3) so that, on the
-        request's OWN session, `intent.declared` / `authorization_submitted`
-        can be written before the parent request row exists and still pass
-        at that session's eventual commit. On this independent session the
-        deferred check runs at OUR commit instead, which is immediate — if
-        the parent row has not committed yet (the common case for those two
-        pre-write events), the FK check fails. We retry once with
-        `request_id=None` (the original value preserved in
-        `details["_unlinked_request_id"]`) so the row survives; it is still
-        fully traceable by `correlation_id`, which carries no FK.
+        `request_id` no longer carries a foreign key to
+        `authorization_requests` (chg-23 migration 007 drops the migration
+        003 / B3 deferrable FK — see that migration's docstring for why: a
+        deferred FK only worked because the audit write and the parent row
+        shared one commit, which committing audit rows independently
+        deliberately breaks. An append-only audit table should not have
+        its rows' survival depend on referential integrity to a mutable
+        business table it is meant to outlive). The column and its index
+        remain — `request_id` is still a plain queryable value, just no
+        longer FK-enforced.
 
-        A failure of the independent write (FK retry included) is logged
-        loudly via `logger.error` — never swallowed silently — and does
-        NOT raise: an audit-write problem must never turn a working
-        request into a 500. Connection reuse: `get_independent_session()`
-        draws from the existing shared engine/pool, so no new engine is
-        opened per audit record.
+        A failure of the independent write is logged loudly via
+        `logger.error` — never swallowed silently — and does NOT raise: an
+        audit-write problem must never turn a working request into a 500.
+        Connection reuse: `get_independent_session()` draws from the same
+        engine/pool the caller's own session already uses, so no new
+        engine is opened per audit record — though each call does open one
+        extra pooled connection (see the pool-cost note on
+        `_persist_independently`).
         """
         entry = AuditLogModel(
             entry_id=str(uuid7()),
@@ -445,66 +450,70 @@ class AuditRepository:
             token_usage=token_usage,
         )
 
-        await self._persist_independently(entry, action=action, correlation_id=correlation_id)
+        await self._persist_independently(entry)
 
         return entry
 
-    async def _persist_independently(
-        self,
-        entry: AuditLogModel,
-        *,
-        action: str,
-        correlation_id: str | None,
-    ) -> None:
-        """Commit `entry` on its own session; see `log()`'s docstring for the
-        durability/ordering guarantee and the request_id FK fallback."""
-        try:
-            async with get_independent_session() as audit_session:
-                audit_session.add(entry)
-                await audit_session.commit()
-            return
-        except IntegrityError as exc:
-            if entry.request_id is None:
-                logger.error(
-                    "audit_write_failed",
-                    action=action,
-                    correlation_id=correlation_id,
-                    error=str(exc),
-                )
-                return
+    async def _persist_independently(self, entry: AuditLogModel) -> None:
+        """Commit a DB-bound COPY of `entry` on its own session; see
+        `log()`'s docstring for the durability/ordering guarantee.
 
-            # Likely the deferred request_id FK (B3): the parent
-            # authorization_requests row hasn't committed yet on the caller's
-            # own session. Retry once, unlinked, so the row is not lost.
-            original_request_id = entry.request_id
-            entry.request_id = None
-            entry.details = {
-                **(entry.details or {}),
-                "_unlinked_request_id": original_request_id,
-            }
-            logger.warning(
-                "audit_request_id_fk_deferred_retry",
-                action=action,
-                correlation_id=correlation_id,
-                request_id=original_request_id,
+        Deliberately builds and persists a separate `AuditLogModel`
+        instance rather than adding `entry` itself to a session: once an
+        ORM instance is added to a session and that session's commit fails
+        (e.g. any real DB error) or the session merely closes, SQLAlchemy
+        expires the instance's attributes, and reading them afterward
+        without a live session raises `DetachedInstanceError` — silently
+        turning "log a failure" into "raise a NEW, unrelated exception
+        from the caller's return path" (this was flagged in the chg-23
+        Validator review as the poisoned-return finding, surfaced via the
+        now-removed request_id FK retry, but the same risk exists for
+        ANY commit failure, FK-related or not). `entry`, the object
+        returned to callers, is never added to a session and therefore
+        never expires — it stays a safe-to-read transient object for the
+        lifetime of the process, independent of whether the DB write
+        underneath it ever succeeded.
+
+        Pool cost: this opens one extra pooled connection per audit call
+        (measured: 7 audit calls on the submit route's happy path -> 7
+        extra checkouts per request, on top of the caller's own session's
+        connection). With the default `db_pool_size=5, db_max_overflow=10`
+        (`pacca/config/settings.py`), concurrent load exhausts the pool
+        past roughly ~15 simultaneous requests, and further audit writes
+        block for up to `db_pool_timeout` (30s) waiting for a connection
+        rather than failing fast. This is a known, documented operating
+        constraint, not a latent surprise — if it becomes a real
+        bottleneck, the fix is a dedicated (larger, or separately pooled)
+        connection allowance for audit writes, not attempted here to keep
+        this change to the durability fix it was scoped for.
+        """
+        try:
+            bind = self.session.bind
+            db_entry = AuditLogModel(
+                entry_id=entry.entry_id,
+                request_id=entry.request_id,
+                decision_id=entry.decision_id,
+                correlation_id=entry.correlation_id,
+                action=entry.action,
+                actor=entry.actor,
+                actor_type=entry.actor_type,
+                details=entry.details,
+                input_summary=entry.input_summary,
+                output_summary=entry.output_summary,
+                success=entry.success,
+                error_message=entry.error_message,
+                duration_ms=entry.duration_ms,
+                token_usage=entry.token_usage,
             )
-            try:
-                async with get_independent_session() as retry_session:
-                    retry_session.add(entry)
-                    await retry_session.commit()
-            except Exception as retry_exc:
-                logger.error(
-                    "audit_write_failed",
-                    action=action,
-                    correlation_id=correlation_id,
-                    request_id=original_request_id,
-                    error=str(retry_exc),
-                )
+            async with get_independent_session(bind) as audit_session:
+                audit_session.add(db_entry)
+                await audit_session.commit()
         except Exception as exc:
             logger.error(
                 "audit_write_failed",
-                action=action,
-                correlation_id=correlation_id,
+                action=entry.action,
+                correlation_id=entry.correlation_id,
+                request_id=entry.request_id,
                 error=str(exc),
             )
 
