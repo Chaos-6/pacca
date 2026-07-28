@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # The agents that do the clinical reasoning
@@ -39,6 +39,11 @@ from ...agents.scope_guard import ScopeViolation, enforce_scope
 # scope_guard_mode below still reads get_settings() — a pre-existing pattern
 # in this file, out of scope for chg-20 to change.
 from ...config.settings import effective_settings, get_settings
+
+# Only used for type hints on the duplicate-request_id resolution helpers
+# below (chg-24) — reconstructing the domain AuthorizationDecision from a
+# persisted row, and comparing a persisted row's identifiers to a resubmission.
+from ...db.models import AuthorizationDecisionModel, AuthorizationRequestModel
 
 # The repository that writes audit records.
 # A "repository" is a design pattern that wraps all database operations
@@ -59,6 +64,7 @@ from ...integrations.vector_store import (
     PRECEDENT_COLLECTION,
     RAG_COLLECTIONS,
     GuidelineRetriever,
+    RetrievalOutcome,
 )
 
 # Our domain models (Pydantic schemas for request/response shapes)
@@ -189,6 +195,289 @@ async def get_review_queue(
     return ReviewQueueResponse(items=items)
 
 
+def _same_case(existing: AuthorizationRequestModel, request: AuthorizationRequest) -> bool:
+    """Field-level identity check for a resubmitted `request_id` (spec D4 §3.1,
+    chg-24). Compares the three identifying fields the request row already
+    persists: patient_id, primary_diagnosis_code, treatment_code.
+
+    This is deliberately NOT a cryptographic fingerprint of the full payload —
+    it is the minimum check that catches the failure this system exists to
+    prevent (patient A's decision handed back for patient B's resubmitted
+    request_id). A dedicated hash column over the full payload would be the
+    rigorous upgrade if a narrower same-identifiers-different-narrative
+    resubmission ever needs to be caught too; no migration is added for this
+    change (see D4 spec §3.1's "How to compare, without a migration").
+    """
+    case = request.clinical_case
+    return (
+        existing.patient_id == request.patient_id
+        and existing.primary_diagnosis_code == case.primary_diagnosis_code
+        and existing.treatment_code == case.procedure_code
+    )
+
+
+async def _resolve_duplicate_request_id(
+    session: AsyncSession,
+    audit: AuditRepository,
+    request: AuthorizationRequest,
+    correlation_id: str,
+) -> AuthorizationDecision | None:
+    """Resolve a `request_id` unique-constraint failure (spec D4 §3.1, chg-24).
+
+    Called from `submit_authorization`'s `except IntegrityError:` handler,
+    i.e. only once a row with this `request_id` is already known to exist —
+    the caller has already rolled back the failed insert. Three outcomes:
+
+      * Returns the existing `AuthorizationDecision` (idempotent replay) when
+        a decision already exists for the SAME case (patient_id,
+        primary_diagnosis_code, treatment_code all match the persisted row).
+      * Raises `HTTPException(409)` when those identifiers do NOT match —
+        the one case this route must never do silently: handing back
+        patient A's decision for patient B's resubmitted request_id.
+      * Returns `None` when the request row exists but no decision does yet
+        (a prior attempt died between T1 and T2) — the caller resumes
+        processing against the already-persisted row instead of retrying
+        the insert.
+
+    "Same case" is a field-level check, not a cryptographic fingerprint of
+    the full payload — see `_same_case`'s docstring.
+    """
+    existing_request = await AuthorizationRepository(session).get_by_id(request.request_id)
+    if existing_request is None:
+        # The unique constraint just fired, so a row must exist. Fail safe
+        # rather than silently swallow an unexplained state.
+        raise RuntimeError(f"IntegrityError on request_id={request.request_id!r} but no row exists")
+
+    existing_decision = await DecisionRepository(session).get_by_request_id(request.request_id)
+
+    if not _same_case(existing_request, request):
+        await audit.log(
+            action="submission.id_reused_for_different_case",
+            actor=request.provider_npi,
+            actor_type="provider",
+            request_id=request.request_id,
+            correlation_id=correlation_id,
+            success=False,
+            output_summary="request_id already used for a different case",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"request_id {request.request_id!r} was already used for a different case",
+        )
+
+    if existing_decision is not None:
+        await audit.log(
+            action="submission.idempotent_replay",
+            actor=request.provider_npi,
+            actor_type="provider",
+            request_id=request.request_id,
+            correlation_id=correlation_id,
+            output_summary="returned the existing decision for a repeated request_id",
+        )
+        return _decision_from_model(existing_decision)
+
+    # Request row exists, no decision yet: a prior attempt died between T1
+    # and T2 (spec §3.2). Resume rather than re-inserting (which would raise
+    # the same IntegrityError again).
+    await audit.log(
+        action="submission.resumed_after_failure",
+        actor=request.provider_npi,
+        actor_type="provider",
+        request_id=request.request_id,
+        correlation_id=correlation_id,
+        output_summary="resuming a request whose prior attempt did not reach T2",
+    )
+    return None
+
+
+def _decision_from_model(model: AuthorizationDecisionModel) -> AuthorizationDecision:
+    """Reconstruct the domain AuthorizationDecision for an idempotent replay
+    (spec D4 §3.1, case 1: duplicate request_id, decision exists, same case).
+
+    `cited_evidence_ids` has no persisted column (rationale_data only carries
+    the free-text rationale), so a replayed decision always reports an empty
+    list — the same honest-NULL posture the rest of this module uses for
+    fields the storage layer does not carry.
+    """
+    return AuthorizationDecision(
+        decision_id=model.decision_id,
+        status=AuthorizationStatus(model.outcome),
+        confidence_score=model.confidence_score,
+        rationale=(model.rationale_data or {}).get("text", ""),
+        review_tier_used=ReviewTier(model.decided_by),
+        timestamp=model.decided_at,
+    )
+
+
+async def _persist_scope_violation_escalation(
+    session: AsyncSession,
+    audit: AuditRepository,
+    intent: IntentRecord,
+    request: AuthorizationRequest,
+    correlation_id: str,
+    duration_ms: int,
+    sv: ScopeViolation,
+    escalated_decision: AuthorizationDecision,
+) -> None:
+    """Persist (or honestly skip) the escalated decision for a ScopeViolation
+    caught in `submit_authorization`'s db.write_request/rag.query/db.write_decision
+    sites (chg-22's fix, unchanged in shape by chg-24 — only extracted here to
+    keep the route function's statement count within the repo's ruff budget).
+
+    Why this needs an existence check that other persist sites don't: this
+    handler is reachable from the FIRST guarded write in the route (
+    db.write_request), which runs BEFORE `AuthorizationRepository(session).
+    create(request)`. Every other guarded call site (the rag.query loop, both
+    db.write_decision sites) runs strictly after that create() has already
+    succeeded. `AuthorizationDecisionModel.request_id` FKs to
+    `authorization_requests.request_id`; persisting a decision against a
+    request that was never written is an orphan `list_escalated_for_review()`'s
+    INNER JOIN can never surface — and verified empirically, SQLite silently
+    accepts that orphan insert (no FK enforcement without an explicit PRAGMA
+    this codebase does not set) while Postgres, which does enforce it, raises
+    IntegrityError. A live existence check answers "can this decision be
+    persisted safely" directly, rather than inferring it from which action
+    name denied — so it stays correct even if the guarded call sites are ever
+    reordered.
+
+    Session usability: ScopeViolation is a plain Python exception
+    `enforce_scope` raises before any SQL statement for the denied call, not a
+    DB-layer failure — the session is not "poisoned," so session writes below
+    are safe to call from this handler.
+
+    Everything that can fail here — the existence check itself, the re-guard,
+    and the write — is inside ONE try so the failure envelope matches the
+    claim: a fail-closed escalation path's job is to never end in a 500. Catch
+    the whole SQLAlchemy error hierarchy (SQLAlchemyError covers
+    IntegrityError, OperationalError, DBAPIError, ...), not just
+    IntegrityError, plus a second ScopeViolation (sv.action ==
+    "db.write_decision" itself out of scope — the re-guard denies it
+    deterministically). Every failure is audited and swallowed, never
+    re-raised — this function never raises on the caller's behalf.
+    """
+    try:
+        existing_request = await AuthorizationRepository(session).get_by_id(request.request_id)
+        if existing_request is not None:
+            await enforce_scope(
+                intent,
+                "db.write_decision",
+                audit=audit,
+                mode=get_settings().scope_guard_mode,
+                request_id=request.request_id,
+            )
+            await DecisionRepository(session).create(
+                escalated_decision,
+                request_id=request.request_id,
+                processing_time_ms=duration_ms,
+            )
+            await AuthorizationRepository(session).update_status(
+                request.request_id, escalated_decision.status
+            )
+            # T2-equivalent COMMIT for this escalation exit (spec D4 §2).
+            await session.commit()
+        else:
+            await audit.log(
+                action="escalation_persist_skipped",
+                actor="scope_guard",
+                actor_type="system",
+                request_id=request.request_id,
+                correlation_id=correlation_id,
+                success=False,
+                output_summary=(
+                    "No persisted request row for this scope violation "
+                    "(denied at db.write_request); decision not persisted"
+                ),
+                details={"guarded_action": sv.action},
+            )
+    except (ScopeViolation, SQLAlchemyError) as persist_exc:
+        # Roll back whatever this failed attempt left pending on the session
+        # (e.g. a flush that raised before our own commit ran).
+        await session.rollback()
+        await audit.log(
+            action="escalation_persist_failed",
+            actor="scope_guard",
+            actor_type="system",
+            request_id=request.request_id,
+            correlation_id=correlation_id,
+            success=False,
+            output_summary=(
+                "Escalated decision could not be persisted; it will not appear in /review-queue"
+            ),
+            details={"error_type": type(persist_exc).__name__},
+        )
+
+
+async def _handle_rag_degraded_escalation(
+    session: AsyncSession,
+    audit: AuditRepository,
+    intent: IntentRecord,
+    request: AuthorizationRequest,
+    correlation_id: str,
+    start_time: float,
+    retrieval: RetrievalOutcome,
+) -> AuthorizationDecision:
+    """Build, audit, and persist the escalated decision for a degraded RAG
+    retrieval when `rag_degraded_escalates` is on (chg-19/chg-20 policy,
+    unchanged in shape by chg-24 — only extracted here to keep the route
+    function's statement count within the repo's ruff budget).
+
+    Persisting this decision matters: without it, the case is "routed to
+    human review" but never lands in `authorization_decisions`, so
+    `GET /review-queue` (which reads persisted IN_REVIEW rows via an INNER
+    JOIN to their request) can never surface it — a human review nobody can
+    see. `db.write_decision` here is guarded against the run's intent, same
+    shape/mode as every other db.write_decision-class call site in this
+    route, and closes its own short T2-equivalent transaction (spec D4 §2:
+    "Escalation exits use their own short T2-equivalent") after advancing the
+    request's status off "submitted" (spec D4 §2, decision #3).
+    """
+    duration_ms = int((time.time() - start_time) * 1000)
+    await audit.log(
+        action="escalation_human_review_required",
+        actor="rag",
+        actor_type="system",
+        request_id=request.request_id,
+        correlation_id=correlation_id,
+        duration_ms=duration_ms,
+        success=False,
+        output_summary=f"RAG retrieval degraded (mode={retrieval.mode}); routed to human review",
+        details={
+            "escalation_reason": EscalationReason.RAG_DEGRADED.value,
+            "mode": retrieval.mode,
+            "reason": retrieval.reason,
+            "precedents_degraded": retrieval.precedents_degraded,
+            "precedents_reason": retrieval.precedents_reason,
+        },
+    )
+    escalated_decision = AuthorizationDecision(
+        decision_id=f"RAGDEGRADED-{request.request_id}-{int(time.time())}",
+        status=AuthorizationStatus.IN_REVIEW,
+        confidence_score=0.0,
+        rationale=(
+            "RAG retrieval degraded to the direct-ChromaDB fallback; case routed to "
+            "human review rather than deciding on unverified guideline context."
+        ),
+        review_tier_used=ReviewTier.HUMAN,
+    )
+    await enforce_scope(
+        intent,
+        "db.write_decision",
+        audit=audit,
+        mode=get_settings().scope_guard_mode,
+        request_id=request.request_id,
+    )
+    await DecisionRepository(session).create(
+        escalated_decision,
+        request_id=request.request_id,
+        processing_time_ms=duration_ms,
+    )
+    await AuthorizationRepository(session).update_status(
+        request.request_id, escalated_decision.status
+    )
+    await session.commit()
+    return escalated_decision
+
+
 @router.post("/", response_model=AuthorizationDecision)
 async def submit_authorization(
     request: AuthorizationRequest,
@@ -290,7 +579,29 @@ async def submit_authorization(
             request_id=request.request_id,
             patient_ref=request.patient_id,
         )
-        await AuthorizationRepository(session).create(request)
+        try:
+            await AuthorizationRepository(session).create(request)
+        except IntegrityError:
+            # ── DUPLICATE request_id CONTRACT (spec D4 §3.1, chg-24) ──────────
+            # request_id is unique=True (db/models.py). Before this fix a
+            # duplicate produced an unhandled IntegrityError -> HTTP 500 (there
+            # was no duplicate handling in this route at all — verified by
+            # execution). Resolved on the constraint failure (not an up-front
+            # SELECT), so the overwhelmingly common new-id path never gains a
+            # second query — see `_resolve_duplicate_request_id`'s docstring
+            # for the three outcomes (replay / 409 / resume).
+            await session.rollback()
+            replay = await _resolve_duplicate_request_id(session, audit, request, correlation_id)
+            if replay is not None:
+                return replay
+            # else: resume — fall through to RAG/orchestrator/T2 below,
+            # against the already-persisted request row.
+        else:
+            # Short transaction: COMMIT closes T1 here, before any network
+            # call — see spec D4 §2 target structure. Nothing between here and
+            # T2 touches this session, so no transaction/connection is held
+            # open across the orchestrator's LLM calls.
+            await session.commit()
 
         # ── RAG: Retrieve relevant guidelines from ChromaDB ───────────────────
         # Teaching note: RAG = Retrieval-Augmented Generation.
@@ -359,63 +670,13 @@ async def submit_authorization(
 
             # effective_settings() (not get_settings()) so this flag is
             # genuinely tunable via PATCH /config at runtime, not just an env
-            # var read once at process start.
+            # var read once at process start. Extracted to
+            # `_handle_rag_degraded_escalation` (own docstring has the full
+            # persistence reasoning) to keep this route function's statement
+            # count within the repo's ruff budget (chg-24).
             if effective_settings().rag_degraded_escalates:
-                duration_ms = int((time.time() - start_time) * 1000)
-                await audit.log(
-                    action="escalation_human_review_required",
-                    actor="rag",
-                    actor_type="system",
-                    request_id=request.request_id,
-                    correlation_id=correlation_id,
-                    duration_ms=duration_ms,
-                    success=False,
-                    output_summary=(
-                        f"RAG retrieval degraded (mode={retrieval.mode}); routed to human review"
-                    ),
-                    details={
-                        "escalation_reason": EscalationReason.RAG_DEGRADED.value,
-                        "mode": retrieval.mode,
-                        "reason": retrieval.reason,
-                        "precedents_degraded": retrieval.precedents_degraded,
-                        "precedents_reason": retrieval.precedents_reason,
-                    },
-                )
-                escalated_decision = AuthorizationDecision(
-                    decision_id=f"RAGDEGRADED-{request.request_id}-{int(time.time())}",
-                    status=AuthorizationStatus.IN_REVIEW,
-                    confidence_score=0.0,
-                    rationale=(
-                        "RAG retrieval degraded to the direct-ChromaDB fallback; "
-                        "case routed to human review rather than deciding on "
-                        "unverified guideline context."
-                    ),
-                    review_tier_used=ReviewTier.HUMAN,
-                )
-                # Persist the escalated decision — without this, the case is
-                # routed to human review but never lands in the
-                # authorization_decisions table, so GET /review-queue (which
-                # reads persisted IN_REVIEW rows) can never surface it: a
-                # human review nobody can see. Same fix as any other IN_REVIEW
-                # outcome further down this function.
-                #
-                # db.write_decision, guarded against the run's intent, same
-                # shape/mode as the normal-flow persist below — this is now
-                # the THIRD db.write_decision-class call site, and the P-4
-                # guard's value is the invariant that every one of them is
-                # wrapped, not just the ones that happen to be reachable
-                # today (Validator FIX A).
-                await enforce_scope(
-                    intent,
-                    "db.write_decision",
-                    audit=audit,
-                    mode=get_settings().scope_guard_mode,
-                    request_id=request.request_id,
-                )
-                await DecisionRepository(session).create(
-                    escalated_decision,
-                    request_id=request.request_id,
-                    processing_time_ms=duration_ms,
+                escalated_decision = await _handle_rag_degraded_escalation(
+                    session, audit, intent, request, correlation_id, start_time, retrieval
                 )
                 return escalated_decision
 
@@ -476,8 +737,18 @@ async def submit_authorization(
         await DecisionRepository(session).create(
             decision, request_id=request.request_id, processing_time_ms=duration_ms
         )
+        # T2: advance status off "submitted" (spec D4 §2, decision #3), then
+        # COMMIT — closes the second (and final) short transaction.
+        await AuthorizationRepository(session).update_status(request.request_id, decision.status)
+        await session.commit()
 
         return decision
+
+    except HTTPException:
+        # Deliberate responses raised inside the try above (409 duplicate /
+        # different-case, spec D4 §3.1) must reach the client as-is — not be
+        # reinterpreted as a pipeline failure by `except Exception` below.
+        raise
 
     except ScopeViolation as sv:
         # ── FAIL-CLOSED: minimum-necessary scope violation → human review ─────
@@ -520,88 +791,13 @@ async def submit_authorization(
         # review" that no human could ever see, since GET /review-queue reads
         # persisted IN_REVIEW rows via an INNER JOIN to their request. Same
         # defect chg-20 already fixed for the RAG-degraded escalation above.
-        #
-        # Why this except block needs an existence check that other persist
-        # sites don't: this handler is reachable from the FIRST guarded write
-        # in the try block (db.write_request, above), which runs BEFORE
-        # AuthorizationRepository(session).create(request). Every other
-        # guarded call site in this route (the rag.query loop, both
-        # db.write_decision sites) runs strictly after that create() has
-        # already succeeded. AuthorizationDecisionModel.request_id FKs to
-        # authorization_requests.request_id (db/models.py); persisting a
-        # decision against a request that was never written is an orphan
-        # list_escalated_for_review()'s INNER JOIN can never surface — and
-        # verified empirically, SQLite silently accepts that orphan insert (no
-        # FK enforcement without an explicit PRAGMA this codebase does not
-        # set) while Postgres, which does enforce it, raises IntegrityError.
-        # A live existence check answers "can this decision be persisted
-        # safely" directly, rather than inferring it from which action name
-        # denied — so it stays correct even if the guarded call sites are
-        # ever reordered.
-        #
-        # Session usability: ScopeViolation is a plain Python exception
-        # `enforce_scope` raises before any SQL statement for the denied
-        # call, not a DB-layer failure — the session is not "poisoned," so
-        # session.add()/flush() below are safe to call from this except
-        # block (the same reasoning the RAG-degraded escalation above already
-        # relies on).
-        #
-        # Everything that can fail here — the existence check itself, the
-        # re-guard, and the write — is inside ONE try so the failure envelope
-        # matches the claim: a fail-closed escalation path's job is to never
-        # end in a 500. `except Exception` further down this function sits on
-        # the SAME try statement as this `except ScopeViolation`, so anything
-        # raised from inside this block would NOT be caught there either — it
-        # would escape as an unhandled 500 with no audit record at all. Catch
-        # the whole SQLAlchemy error hierarchy (SQLAlchemyError covers
-        # IntegrityError, OperationalError, DBAPIError, ...), not just
-        # IntegrityError, plus a second ScopeViolation (sv.action ==
-        # "db.write_decision" itself out of scope — the re-guard denies it
-        # deterministically). Every failure is audited and swallowed, never
-        # re-raised.
-        try:
-            existing_request = await AuthorizationRepository(session).get_by_id(request.request_id)
-            if existing_request is not None:
-                await enforce_scope(
-                    intent,
-                    "db.write_decision",
-                    audit=audit,
-                    mode=get_settings().scope_guard_mode,
-                    request_id=request.request_id,
-                )
-                await DecisionRepository(session).create(
-                    escalated_decision,
-                    request_id=request.request_id,
-                    processing_time_ms=duration_ms,
-                )
-            else:
-                await audit.log(
-                    action="escalation_persist_skipped",
-                    actor="scope_guard",
-                    actor_type="system",
-                    request_id=request.request_id,
-                    correlation_id=correlation_id,
-                    success=False,
-                    output_summary=(
-                        "No persisted request row for this scope violation "
-                        "(denied at db.write_request); decision not persisted"
-                    ),
-                    details={"guarded_action": sv.action},
-                )
-        except (ScopeViolation, SQLAlchemyError) as persist_exc:
-            await audit.log(
-                action="escalation_persist_failed",
-                actor="scope_guard",
-                actor_type="system",
-                request_id=request.request_id,
-                correlation_id=correlation_id,
-                success=False,
-                output_summary=(
-                    "Escalated decision could not be persisted; it will not appear in /review-queue"
-                ),
-                details={"error_type": type(persist_exc).__name__},
-            )
-
+        # Extracted to `_persist_scope_violation_escalation` (own docstring
+        # has the full reasoning: the existence check, the failure envelope,
+        # and why nothing here re-raises) to keep this route function's
+        # statement count within the repo's ruff budget (chg-24).
+        await _persist_scope_violation_escalation(
+            session, audit, intent, request, correlation_id, duration_ms, sv, escalated_decision
+        )
         return escalated_decision
 
     except Exception as e:
@@ -610,6 +806,12 @@ async def submit_authorization(
         # This is critical for debugging production failures — you need to know
         # WHICH request failed, WHEN it failed, and WHY.
         duration_ms = int((time.time() - start_time) * 1000)
+        # Roll back any not-yet-committed work on this session. T1's own
+        # commit already closed that transaction if we got past it; this is a
+        # safety net for a failure whose flush() succeeded but never reached
+        # this route's own commit (e.g. the T2 write's flush succeeding but a
+        # step after it raising before `session.commit()` runs).
+        await session.rollback()
         await audit.log(
             action="authorization_processing_failed",
             actor="system",
