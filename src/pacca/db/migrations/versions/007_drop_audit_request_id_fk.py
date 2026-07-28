@@ -51,6 +51,43 @@ imported from `pacca.db.models`) so this migration stays a self-contained,
 historically-accurate snapshot independent of later model changes — matching
 migration 001's inline `sa.Table`/`op.create_table` style.
 
+DOWNGRADE IS A ONE-WAY DOOR ONCE ROLLBACK-SURVIVAL HAS BEEN EXERCISED — READ
+BEFORE RUNNING IT DURING AN INCIDENT.
+
+The whole point of chg-23 is that an audit row can now survive its business
+transaction rolling back — which means it is EXPECTED, by design, to sometimes
+carry a `request_id` for which no `authorization_requests` row exists (the
+request never landed). That is not a bug; it is the durability guarantee
+working. But it means `downgrade()`, which re-adds the FK, will encounter
+exactly the orphans that guarantee produces:
+
+  * Postgres: `downgrade()` fails on the FIRST such orphan with
+    `IntegrityError ... Key (request_id)=(...) is not present in table
+    "authorization_requests"`. This fails SAFE — Postgres DDL is
+    transactional, so the failed `create_foreign_key` rolls back and
+    `alembic_version` stays at `007_drop_audit_request_id_fk`, not
+    half-applied — but it gives no cleanup guidance on its own. Before
+    downgrading a Postgres DB that has been in service since this migration
+    landed, find and clear (or NULL out) the orphans first:
+
+        SELECT a.id, a.request_id, a.action, a.timestamp
+        FROM audit_logs a
+        LEFT JOIN authorization_requests r ON a.request_id = r.request_id
+        WHERE a.request_id IS NOT NULL AND r.request_id IS NULL;
+
+    then either delete those rows (NOT recommended — they're the audit
+    trail of the requests that failed) or `UPDATE audit_logs SET
+    request_id = NULL WHERE id IN (...)` for the orphaned ids only, THEN
+    downgrade.
+
+  * SQLite: `downgrade()` does NOT fail on the same orphans — SQLite never
+    enforces the FK it accepts into the schema (that's the entire reason
+    migration 003 was Postgres-only), so `batch_alter_table`'s table-rebuild
+    copy silently ACCEPTS orphaned request_id values that would reject on
+    Postgres. The two dialects diverge here: a downgrade that fails loudly
+    on Postgres succeeds quietly on SQLite with the same data. Don't infer
+    downgrade safety on Postgres from a clean SQLite downgrade.
+
 Revision ID: 007_drop_audit_request_id_fk
 Revises: 006_add_user_role
 Create Date: 2026-07-28
@@ -152,6 +189,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """ONE-WAY DOOR once rollback-survival has fired in production — see the
+    module docstring for the full explanation, the exact orphan-finding
+    query, and the SQLite/Postgres asymmetry (SQLite accepts the same
+    orphans this rejects on Postgres). Short version: this re-adds the
+    request_id FK, and any audit row whose business transaction rolled back
+    (the durability guarantee working as intended) now has an orphaned
+    request_id that will raise IntegrityError HERE on Postgres — fails safe
+    (transactional DDL, no half-applied state) but with no cleanup
+    guidance unless you've read the module docstring first. Clear/NULL the
+    orphans (query above) before downgrading a Postgres DB that has been
+    live since this migration.
+    """
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
         # Restore the migration-003 shape: DEFERRABLE INITIALLY DEFERRED.
