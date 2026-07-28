@@ -26,6 +26,10 @@ from sqlalchemy import create_engine, inspect, text
 # import's side effect (populating AuthBase.metadata.tables) is required
 # before create_all(AuthBase.metadata) below, or `users` silently isn't built.
 import pacca.api.models.user  # noqa: F401
+
+# Imported as a module (not `from ... import`) so the fixture can reset the
+# process-global engine/session-factory singletons after repointing DATABASE_URL.
+import pacca.db.session as db_session_module
 from pacca.api.auth import ALGORITHM, SECRET_KEY
 from pacca.api.database import Base as AuthBase
 from pacca.api.main import app
@@ -101,14 +105,22 @@ def _ensure_users_role_column(sync_engine) -> None:
     `create_all(checkfirst=True)` — used by the `client` fixture below to
     build schema — CANNOT add a column to an ALREADY-EXISTING `users` table:
     checkfirst only skips tables that already exist wholesale, it never
-    diffs columns against the current model. The common case the `client`
-    fixture runs against is a developer's persistent local `./pacca.db`,
-    built long before RBAC and never migrated via `alembic upgrade head`
-    (this repo's own dev DB has no `alembic_version` table at all —
-    confirmed by inspection, not assumed, when this function was written).
-    Left unrepaired, the very next `SELECT ... FROM users` (which implicitly
-    selects every column) fails with "no such column: users.role" — a
-    confusing crash, not a graceful skip.
+    diffs columns against the current model. Left unrepaired against such a
+    table, the very next `SELECT ... FROM users` (which implicitly selects
+    every column) fails with "no such column: users.role" — a confusing
+    crash, not a graceful skip.
+
+    STATUS: defence in depth, not the live path. The `client` fixture now
+    builds a fresh per-run temp database, where `create_all` always creates
+    `role` and this function is a verified no-op. It was written when that
+    fixture ran against a developer's persistent `./pacca.db` (built long
+    before RBAC, never migrated — this repo's own dev DB has no
+    `alembic_version` table at all, confirmed by inspection). It is kept
+    because the fixture is one edit away from being repointed at a
+    persistent database, and because a repair that is wrong is worse than
+    a repair that is unused: the DDL below matches migration 006 exactly
+    (String(30) NOT NULL DEFAULT 'clinician'), verified column-for-column
+    against a migration-built table.
 
     This repairs exactly that column gap, matching migration 006's own DDL
     exactly (String(30) NOT NULL DEFAULT 'clinician'). Deliberately NOT
@@ -132,11 +144,28 @@ def _ensure_users_role_column(sync_engine) -> None:
 
 
 @pytest.fixture(scope="module")
-def client():
+def client(tmp_path_factory: pytest.TempPathFactory):
     """
     Context-managed so the app lifespan runs. A bare `TestClient(app)` never
     enters it, so `init_database()` never ran and the first audit write failed
     with "no such table: audit_logs".
+
+    EPHEMERAL DATABASE. This fixture used to build schema against whatever
+    `settings.database_url` named — in practice a developer's persistent
+    `./pacca.db`. Running the clinical gate therefore performed DDL on a real
+    database outside Alembic and left a seeded `test-user` row behind, with no
+    prompt and no announcement. It now repoints `DATABASE_URL` at a per-run
+    temp file, mirroring the `rbac_client` fixture in
+    tests/unit/test_rbac.py — one isolation pattern for the whole repo rather
+    than two. Consequences that make the repointing actually take effect:
+      - `get_settings` is `lru_cache`d, so its cache must be cleared both on
+        entry and on exit, or the new URL is ignored / leaks into later modules.
+      - `pacca.db.session` memoises `_engine` / `_session_factory` at process
+        level; both are reset on entry and exit so the app's own sessions bind
+        to the temp DB and later tests are not left holding a disposed engine
+        pointed at a deleted file.
+    Nothing here writes to `./pacca.db`; `make test-clinical` is now
+    side-effect-free with respect to developer state.
 
     Schema creation (C5): as of the Alembic-single-source-of-truth change,
     `init_database()` in the app lifespan no longer calls `create_all` — it
@@ -148,15 +177,26 @@ def client():
     engine (L-025): this fixture is plain `def`, not `async def`, so there is
     no running event loop to hand an async engine to — a sync engine pointed
     at the same sqlite file sidesteps any "attached to a different loop"
-    failure. `create_all` is idempotent (`checkfirst=True` by default), so
-    this is safe whether or not the app/Alembic has already built the schema.
+    failure.
     """
-    settings = get_settings()
-    sync_url = settings.database_url.replace("+aiosqlite", "")
-    sync_engine = create_engine(sync_url)
+    # A module-scoped fixture cannot request the function-scoped `monkeypatch`
+    # fixture, so drive MonkeyPatch directly and undo it in teardown.
+    mp = pytest.MonkeyPatch()
+    db_path = tmp_path_factory.mktemp("level5_flow") / "level5_flow.db"
+    mp.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    get_settings.cache_clear()
+    db_session_module._engine = None
+    db_session_module._session_factory = None
+
+    sync_engine = create_engine(f"sqlite:///{db_path}")
     try:
         DomainBase.metadata.create_all(sync_engine)
         AuthBase.metadata.create_all(sync_engine)
+        # Defence in depth only: on this fresh temp DB `create_all` always
+        # builds `role`, so the repair is a verified no-op here. It stays
+        # because the fixture is one edit away from being pointed at a
+        # pre-006 database again, and the failure mode it prevents is a
+        # confusing "no such column" crash in the anti-hallucination gate.
         _ensure_users_role_column(sync_engine)
 
         # RBAC (see pacca.api.rbac): the router-wide guards on both routers
@@ -165,33 +205,29 @@ def client():
         # and this module's tests exercise /feedback (medical_director floor)
         # and /admin/optimize_policies (admin floor) too. "test-user" (the
         # identity `auth_headers` signs a token for) needs the highest rank
-        # to clear every floor exercised here. Upserted, not inserted blindly
-        # — this fixture runs against the persistent dev DB file, so a second
-        # run of this module must not violate the username unique index.
+        # to clear every floor exercised here. A plain insert is safe now that
+        # the database is created fresh per run — the upsert this replaced
+        # existed only to survive re-runs against the persistent dev DB.
         users_table = AuthBase.metadata.tables["users"]
         with sync_engine.begin() as conn:
-            existing = conn.execute(
-                users_table.select().where(users_table.c.username == "test-user")
-            ).first()
-            if existing is None:
-                conn.execute(
-                    users_table.insert().values(
-                        username="test-user",
-                        hashed_password="unused-hash-for-clinical-test-fixture",
-                        role="admin",
-                    )
+            conn.execute(
+                users_table.insert().values(
+                    username="test-user",
+                    hashed_password="unused-hash-for-clinical-test-fixture",
+                    role="admin",
                 )
-            elif existing.role != "admin":
-                conn.execute(
-                    users_table.update()
-                    .where(users_table.c.username == "test-user")
-                    .values(role="admin")
-                )
+            )
     finally:
         sync_engine.dispose()
 
-    with TestClient(app) as test_client:
-        yield test_client
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        db_session_module._engine = None
+        db_session_module._session_factory = None
+        mp.undo()
+        get_settings.cache_clear()
 
 
 def auth_headers() -> dict[str, str]:
