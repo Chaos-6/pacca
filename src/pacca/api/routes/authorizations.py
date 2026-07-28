@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # The agents that do the clinical reasoning
@@ -544,13 +544,24 @@ async def submit_authorization(
         # call, not a DB-layer failure — the session is not "poisoned," so
         # session.add()/flush() below are safe to call from this except
         # block (the same reasoning the RAG-degraded escalation above already
-        # relies on). The persist is still wrapped in its own try/except: a
-        # fail-closed escalation path's job is to never end in a 500, so a
-        # second denial (sv.action == "db.write_decision" itself out of
-        # scope) or a write failure is audited and swallowed, not re-raised.
-        existing_request = await AuthorizationRepository(session).get_by_id(request.request_id)
-        if existing_request is not None:
-            try:
+        # relies on).
+        #
+        # Everything that can fail here — the existence check itself, the
+        # re-guard, and the write — is inside ONE try so the failure envelope
+        # matches the claim: a fail-closed escalation path's job is to never
+        # end in a 500. `except Exception` further down this function sits on
+        # the SAME try statement as this `except ScopeViolation`, so anything
+        # raised from inside this block would NOT be caught there either — it
+        # would escape as an unhandled 500 with no audit record at all. Catch
+        # the whole SQLAlchemy error hierarchy (SQLAlchemyError covers
+        # IntegrityError, OperationalError, DBAPIError, ...), not just
+        # IntegrityError, plus a second ScopeViolation (sv.action ==
+        # "db.write_decision" itself out of scope — the re-guard denies it
+        # deterministically). Every failure is audited and swallowed, never
+        # re-raised.
+        try:
+            existing_request = await AuthorizationRepository(session).get_by_id(request.request_id)
+            if existing_request is not None:
                 await enforce_scope(
                     intent,
                     "db.write_decision",
@@ -563,33 +574,32 @@ async def submit_authorization(
                     request_id=request.request_id,
                     processing_time_ms=duration_ms,
                 )
-            except (ScopeViolation, IntegrityError) as persist_exc:
+            else:
                 await audit.log(
-                    action="escalation_persist_failed",
+                    action="escalation_persist_skipped",
                     actor="scope_guard",
                     actor_type="system",
                     request_id=request.request_id,
                     correlation_id=correlation_id,
                     success=False,
                     output_summary=(
-                        "Escalated decision could not be persisted; it will "
-                        "not appear in /review-queue"
+                        "No persisted request row for this scope violation "
+                        "(denied at db.write_request); decision not persisted"
                     ),
-                    details={"error_type": type(persist_exc).__name__},
+                    details={"guarded_action": sv.action},
                 )
-        else:
+        except (ScopeViolation, SQLAlchemyError) as persist_exc:
             await audit.log(
-                action="escalation_persist_skipped",
+                action="escalation_persist_failed",
                 actor="scope_guard",
                 actor_type="system",
                 request_id=request.request_id,
                 correlation_id=correlation_id,
                 success=False,
                 output_summary=(
-                    "No persisted request row for this scope violation "
-                    "(denied at db.write_request); decision not persisted"
+                    "Escalated decision could not be persisted; it will not appear in /review-queue"
                 ),
-                details={"guarded_action": sv.action},
+                details={"error_type": type(persist_exc).__name__},
             )
 
         return escalated_decision
