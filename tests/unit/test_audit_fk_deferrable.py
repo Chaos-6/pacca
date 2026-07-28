@@ -1,22 +1,35 @@
 """
-Deferrable audit FK — PRODUCTION_READINESS B3.
+audit_logs.request_id has no foreign key (chg-23, migration 007) — was B3.
 
-The submit route flushes two ``request_id``-bearing audit rows
+History (why this file used to assert the opposite): B3's original fix made
+``audit_logs.request_id``'s FK ``DEFERRABLE INITIALLY DEFERRED`` on Postgres,
+because the submit route flushes two ``request_id``-bearing audit rows
 (``intent.declared``, ``authorization_submitted``) BEFORE the parent
-``authorization_requests`` row is created — because ``intent.declared`` must be
-the first audit event (the pre-write-audit safety invariant), and audit writes
-flush immediately. On Postgres a non-deferrable FK is checked at statement time,
-so that first flush raises ``ForeignKeyViolationError: audit_logs_request_id_fkey``
-before the parent exists. SQLite doesn't enforce FKs, which is why the unit suite
-never caught it.
+``authorization_requests`` row exists, and a non-deferrable FK is checked at
+statement time. Deferring the check to COMMIT worked ONLY because the audit
+write and the parent row shared one transaction/commit.
 
-The fix keeps both invariants: make ``audit_logs.request_id`` FK
-``DEFERRABLE INITIALLY DEFERRED`` so it is checked at COMMIT (a single commit per
-request), by which point the parent row — flushed mid-transaction — exists.
+chg-23 made ``AuditRepository.log()`` commit each audit row on an INDEPENDENT
+session, specifically so a business-transaction rollback can no longer erase
+an already-logged audit row (see ``db/repository.py`` and migration 007's
+docstring for the full mechanism). That breaks the shared-commit assumption
+B3 depended on: the deferred check now runs at the audit write's OWN,
+immediate commit, before the parent row has committed — on EVERY request,
+not just failures. Verified against a real Postgres 16 container running the
+production-shaped submit path: with the FK still in place, 0 of 7 audit rows
+persisted per request.
 
-This test compiles the DDL under the Postgres dialect, so it verifies the
-constraint's deferral WITHOUT a live Postgres (the SQLite suite structurally
-cannot). A live-Postgres reproduction is done separately at implementation time.
+Migration 007 drops the FK entirely (column and index unchanged) rather than
+retry-and-unlink around it: an append-only, HIPAA-relevant audit table should
+not have its rows' survival depend on referential integrity to a mutable
+business table it exists to outlive.
+
+This test compiles the DDL under the Postgres dialect (no live Postgres
+needed to check DDL shape — that verification is done separately, in
+``tests/integration/test_submit_postgres.py::test_audit_request_id_has_no_fk_but_keeps_its_index``,
+against a real migrated container) and asserts the FK clause is GONE while
+the column and its index remain — a contract change, not a weakening of the
+original B3 test.
 """
 
 from __future__ import annotations
@@ -31,21 +44,30 @@ def _audit_ddl_postgres() -> str:
     return str(CreateTable(AuditLogModel.__table__).compile(dialect=postgresql.dialect()))
 
 
-def test_audit_request_id_fk_is_deferrable_initially_deferred() -> None:
+def test_audit_request_id_has_no_foreign_key() -> None:
+    """Before (B3): this asserted 'REFERENCES authorization_requests' IS
+    present with DEFERRABLE INITIALLY DEFERRED. After (chg-23): no FOREIGN
+    KEY clause referencing authorization_requests exists at all — dropped by
+    migration 007, which this DDL compilation reflects because it's built
+    from `AuditLogModel.__table__`, the same model migration 007 keeps in
+    sync with."""
     ddl = _audit_ddl_postgres()
-    # audit_logs has exactly one FK (request_id → authorization_requests);
-    # decision_id carries no FK. So this clause can only be that FK.
-    assert "REFERENCES authorization_requests" in ddl, "the request_id FK vanished"
-    assert "DEFERRABLE INITIALLY DEFERRED" in ddl, (
-        "audit_logs.request_id FK is not DEFERRABLE INITIALLY DEFERRED — on "
-        "Postgres it will be checked at statement time and reject the pre-flight "
-        "audit writes before the parent row exists (B3)"
+    assert "REFERENCES authorization_requests" not in ddl, (
+        "audit_logs.request_id still carries a foreign key to "
+        "authorization_requests — migration 007 / chg-23 should have "
+        "removed it (see that migration's docstring for why)"
     )
+    assert "FOREIGN KEY" not in ddl, "audit_logs should carry no foreign key at all"
 
 
-def test_the_deferral_is_on_the_request_id_fk() -> None:
-    """Pin the deferral to the request_id FK specifically, not some other clause."""
-    ddl = _audit_ddl_postgres()
-    fk_lines = [line for line in ddl.splitlines() if "FOREIGN KEY" in line and "request_id" in line]
-    assert fk_lines, "no request_id FOREIGN KEY clause found in the compiled DDL"
-    assert all("DEFERRABLE INITIALLY DEFERRED" in line for line in fk_lines)
+def test_audit_request_id_column_and_index_are_unchanged() -> None:
+    """Dropping the FK must not take the column or its index down with it —
+    request_id remains a plain, queryable, indexed value; only the
+    referential-integrity constraint is gone."""
+    table = AuditLogModel.__table__
+    assert "request_id" in table.columns, "the request_id column vanished"
+    column = table.columns["request_id"]
+    assert column.type.length == 50
+    assert column.nullable is True
+    assert column.index is True, "request_id must remain indexed"
+    assert not column.foreign_keys, "request_id must carry no ForeignKey at the model level"

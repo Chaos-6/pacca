@@ -1,24 +1,40 @@
 """
-Real-Postgres integration test for the submit path (B2/B3 masking guard).
+Real-Postgres integration test for the submit path (B2/B3/chg-23 masking guard).
 
-The entire unit suite runs on SQLite, which cannot catch two whole classes of
+The entire unit suite runs on SQLite, which cannot catch three whole classes of
 production bug:
 
   * B2 — `postgresql.JSONB` columns that don't compile under SQLite.
-  * B3 — foreign keys, which SQLite does not enforce at all.
+  * B3 (superseded, see below) — foreign keys, which SQLite does not enforce.
+  * chg-23 — commit-vs-flush durability: a single-process, single-connection
+    SQLite test cannot distinguish "flushed on the caller's own transaction"
+    from "committed on a genuinely independent connection" the way a second
+    real Postgres connection can.
 
-B3 in particular was invisible to 712 green tests: the submit route writes two
-`request_id`-bearing audit rows (`intent.declared`, `authorization_submitted`)
-before the parent `authorization_requests` row, and on Postgres a non-deferrable
-FK rejects that first flush. The fix (deferrable FK) can only be *verified* on
-real Postgres.
+History: B3 was invisible to 712 green tests because the submit route writes
+two `request_id`-bearing audit rows (`intent.declared`, `authorization_submitted`)
+before the parent `authorization_requests` row exists, and a non-deferrable FK
+rejects that first flush on Postgres. The original fix made the FK DEFERRABLE
+INITIALLY DEFERRED (migration 003) — verified here.
+
+chg-23 changed `AuditRepository.log()` to commit each audit row on an
+INDEPENDENT session, specifically so a business-transaction rollback can no
+longer erase an already-logged audit row (the actual defect this file's tests
+now also cover). That broke the migration-003 deferred FK: the deferred check
+now runs at the audit write's OWN immediate commit, before the parent row has
+committed, on every request — measured live against this container as 0 of 7
+audit rows persisted with the FK still in place. Migration 007 drops that FK
+entirely (see its docstring for the full reasoning); this file's
+`test_audit_request_id_has_no_fk_but_keeps_its_index` replaces the old
+`test_audit_fk_is_deferrable_in_the_live_catalog`, which asserted the removed
+constraint.
 
 This test drives the actual submit handler against a migration-built Postgres
 (schema from `alembic upgrade head`, so it is production-shaped and
 migration-tracked, not `create_all`). The LLM and RAG are patched — this test is
 about persistence and referential integrity, not clinical accuracy (the clinical
 gate covers that) — but the audit writes, the parent/decision persistence, and
-the FK all hit real Postgres.
+the schema all hit real Postgres.
 
 Gated on `POSTGRES_TEST_URL`: it skips when unset (local SQLite dev), and the CI
 `test-postgres` job / `make test-postgres` provide a Postgres 16 and set it.
@@ -111,10 +127,21 @@ def _sample_request() -> dict:
 @pytest.mark.asyncio
 async def test_submit_commits_with_zero_orphaned_audit_rows(pg_session: AsyncSession) -> None:
     """
-    The B3 guard. Driving the real submit handler against real Postgres, the
-    whole transaction must COMMIT and leave no audit row referencing a
-    non-existent request. On a non-deferrable FK this raises at the first audit
-    flush; SQLite would silently pass either way.
+    The B3 / chg-23 guard. Driving the real submit handler against real
+    Postgres, the whole transaction must COMMIT and every audit row the
+    happy path writes must actually persist, correctly linked by
+    request_id.
+
+    This test is the live proof of the chg-23 durability fix AND of the
+    migration 007 FK removal it required: with the pre-chg-23
+    `AuditRepository.log()` (flush-on-caller's-session) and the migration
+    003 deferrable FK both still in place, this reproduced as 0 of 7 audit
+    rows persisting per request — the deferred FK check, now running on an
+    independently-committing session, rejected every one (see migration
+    007's docstring and the chg-23 harness note for the full mechanism).
+    SQLite cannot catch either half of this: it doesn't enforce FKs, and a
+    single-process `:memory:` test can't distinguish "flushed" from
+    "committed" the way a real, independent connection can.
     """
     from unittest.mock import AsyncMock, patch
 
@@ -156,6 +183,12 @@ async def test_submit_commits_with_zero_orphaned_audit_rows(pg_session: AsyncSes
         await pg_session.execute(text("SELECT count(*) FROM authorization_decisions"))
     ).scalar_one()
     audit_rows = (await pg_session.execute(text("SELECT count(*) FROM audit_logs"))).scalar_one()
+    audit_rows_linked = (
+        await pg_session.execute(
+            text("SELECT count(*) FROM audit_logs WHERE request_id = :rid"),
+            {"rid": req.request_id},
+        )
+    ).scalar_one()
     orphans = (
         await pg_session.execute(
             text(
@@ -168,24 +201,119 @@ async def test_submit_commits_with_zero_orphaned_audit_rows(pg_session: AsyncSes
 
     assert request_rows == 1, "the parent authorization_requests row was not persisted"
     assert decision_rows == 1, "the decision row was not persisted"
-    assert audit_rows >= 2, "the pre-flight + decision audit rows were not persisted"
-    assert orphans == 0, "an audit row references a non-existent request (B3)"
+    # The happy path writes exactly 7 audit.log() calls: intent.declared,
+    # authorization_submitted, scope.allow (db.write_request), scope.allow x2
+    # (rag.query x nccn_guidelines/case_precedents), authorization_decision_made,
+    # scope.allow (db.write_decision) — all 7 must persist, not just "some".
+    assert audit_rows == 7, f"expected exactly 7 audit rows on the happy path, got {audit_rows}"
+    assert audit_rows_linked == 7, (
+        f"expected all 7 audit rows to carry request_id={req.request_id!r} intact, "
+        f"only {audit_rows_linked} did"
+    )
+    assert orphans == 0, "an audit row references a non-existent request"
 
 
 @_SKIP
 @pytest.mark.asyncio
-async def test_audit_fk_is_deferrable_in_the_live_catalog(_migrated_url: str) -> None:
-    """The migration produced a genuinely deferrable FK in the real Postgres catalog."""
+async def test_audit_row_survives_business_rollback_on_real_postgres(_migrated_url: str) -> None:
+    """The chg-23 HEADLINE durability guarantee, proven on REAL Postgres.
+
+    `tests/unit/test_audit_durability.py` proves the same property against
+    SQLite (fast, run on every commit), but SQLite cannot fully stand in
+    for this: it's a single-process, single-connection-pool test that
+    cannot distinguish "flushed on the caller's own transaction" from
+    "committed on a genuinely independent connection" the way a second
+    real Postgres connection, with its own MVCC snapshot, can. This test
+    uses two separate sessions against real Postgres: one that writes an
+    audit row and then simulates a business failure + rollback, and a
+    second, independent one that reads the result back.
+    """
+    from pacca.db.repository import AuditRepository
+
+    engine = create_async_engine(_migrated_url)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    correlation_id = "corr-pg-rollback-headline"
+
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE"))
+
+    try:
+        async with maker() as business_session:
+            repo = AuditRepository(business_session)
+            await repo.log(
+                action="test.postgres.rollback",
+                actor="x",
+                actor_type="system",
+                correlation_id=correlation_id,
+            )
+            try:
+                raise RuntimeError("simulated business failure")
+            except RuntimeError:
+                await business_session.rollback()
+
+        async with maker() as reader_session:
+            rows = (
+                await reader_session.execute(
+                    text("SELECT action FROM audit_logs WHERE correlation_id = :cid"),
+                    {"cid": correlation_id},
+                )
+            ).all()
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(text(f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE"))
+        await engine.dispose()
+
+    assert len(rows) == 1, (
+        f"expected the audit row to survive the Postgres business rollback, found {len(rows)}"
+    )
+    assert rows[0].action == "test.postgres.rollback"
+
+
+@_SKIP
+@pytest.mark.asyncio
+async def test_audit_request_id_has_no_fk_but_keeps_its_index(_migrated_url: str) -> None:
+    """chg-23 (migration 007) DROPS the deferrable FK the previous version of
+    this test asserted — a contract change, not a weakening.
+
+    Before (migration 003, B3): `audit_logs.request_id` carried a
+    DEFERRABLE INITIALLY DEFERRED FK to `authorization_requests`, checked
+    at commit. That worked only because the audit write and the parent
+    row shared one transaction/commit. Once `AuditRepository.log()`
+    commits independently of the caller's transaction (chg-23's
+    durability fix — see `db/repository.py` and migration 007's
+    docstring), the deferred check runs at the audit write's OWN,
+    immediate commit, before the parent row exists — and rejects every
+    request, not just failed ones (reproduced against this same
+    container: 0 of 7 audit rows persisted per request with the FK still
+    in place; see `test_submit_commits_with_zero_orphaned_audit_rows`
+    above, which is the live proof the FK is gone and rows now persist).
+
+    After: no FK constraint at all on `audit_logs.request_id`. The column
+    and its index (`ix_audit_logs_request_id`) are unchanged — request_id
+    remains a plain, queryable, indexed value; audit-row survival no
+    longer depends on referential integrity to a business table it must
+    be able to outlive.
+    """
     engine = create_async_engine(_migrated_url)
     async with engine.connect() as conn:
-        row = (
+        fk_row = (
             await conn.execute(
                 text(
-                    "SELECT condeferrable, condeferred FROM pg_constraint "
-                    "WHERE conname = 'audit_logs_request_id_fkey' AND contype = 'f'"
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid = 'audit_logs'::regclass AND contype = 'f'"
+                )
+            )
+        ).first()
+        index_row = (
+            await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE tablename = 'audit_logs' AND indexname = 'ix_audit_logs_request_id'"
                 )
             )
         ).first()
     await engine.dispose()
-    assert row is not None, "audit_logs_request_id_fkey is missing on the live DB"
-    assert row.condeferrable and row.condeferred, "the FK is not DEFERRABLE INITIALLY DEFERRED"
+    assert fk_row is None, (
+        f"audit_logs still has a foreign key ({fk_row}); migration 007 should have dropped it"
+    )
+    assert index_row is not None, "ix_audit_logs_request_id is missing — the index must survive"
