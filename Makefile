@@ -70,7 +70,7 @@ test-all:
 	pytest tests/ -m "not clinical" -v
 
 test-clinical:
-	@echo "Running full clinical evaluation (requires ANTHROPIC_API_KEY, ~3-5 minutes)..."
+	@echo "Running full clinical evaluation (requires ANTHROPIC_API_KEY, ~20 minutes)..."
 	@if [ -z "$$ANTHROPIC_API_KEY" ]; then \
 		echo "ERROR: ANTHROPIC_API_KEY is not set. Export it before running clinical tests."; \
 		exit 1; \
@@ -78,7 +78,13 @@ test-clinical:
 	# tests/, not tests/clinical/: the marker is the selector, and
 	# tests/test_level5_flow.py carries it too. Scoping to the directory would
 	# leave that module running in no target at all.
-	pytest tests/ -m clinical -v
+	#
+	# -s for the same reason test-holdout uses it: the golden-set and held-out
+	# accuracy figures are print()ed, and pytest captures stdout on PASSING
+	# tests. Without this the target costs ~20 minutes of live API calls and
+	# then throws away the only numbers it exists to produce -- a green tick
+	# tells you accuracy cleared 80%, not what it was. Observed 2026-07-28.
+	pytest tests/ -m clinical -v -s
 
 test-holdout:
 	@echo "Running held-out (out-of-sample) accuracy report (requires ANTHROPIC_API_KEY, ~1 minute)..."

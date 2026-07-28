@@ -148,9 +148,13 @@ Use the Makefile targets (they encode the correct markers):
 - **Coverage:** `make test-cov`.
 - **Clinical / LLM-as-judge gate:** `make test-clinical` (`pytest tests/ -m clinical` —
   the marker is the selector, and `tests/test_level5_flow.py` carries it too).
-  Makes real Claude calls (~3–5 min); requires `ANTHROPIC_API_KEY` in the shell env —
+  Makes real Claude calls (**~20 min** as of iter-15 — measured 18m33s on 2026-07-28;
+  the estimate was ~3–5 min before the 32-case held-out report joined this marker);
+  requires `ANTHROPIC_API_KEY` in the shell env —
   source it from the gitignored `.env`, never hardcode or print it. This is the golden-set
   accuracy gate (incl. GC-018/019); run it at the final merge HEAD for any behavior change.
+  Runs with `-s`: the accuracy figures are printed, and pytest captures stdout on passing
+  tests, so without it the target discards the numbers it exists to produce.
 
 > **Do not infer clinical accuracy from `make test`.** The deterministic suite deselects
 > the live LLM tests — they cover different things (see `docs/AGENT_LESSONS.md` P-008).
