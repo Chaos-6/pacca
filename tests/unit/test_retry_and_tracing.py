@@ -45,6 +45,7 @@ from anthropic import (
     RateLimitError,
 )
 from pydantic import BaseModel
+from tenacity import wait_fixed
 
 import pacca.agents.base as base_module
 from pacca.agents.base import AgentConfig, BaseAgent
@@ -294,7 +295,7 @@ class TestRetryLogic:
             ]
         )
 
-        with patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)):
+        with patch("pacca.agents.base.wait_exponential", return_value=wait_fixed(0)):
             result = await agent.execute("test prompt", _TestOutput)
 
         assert result.result == "approved"
@@ -316,13 +317,29 @@ class TestServerErrorRetry:
 
     @pytest.fixture
     def agent(self) -> _ConcreteAgent:
+        """
+        A real agent with no `_settings` stub.
+
+        _call_with_retry() reads settings.llm_retry_max_attempts from
+        effective_settings() at CALL TIME (see TestRetryRespectsRuntimeOverrides
+        above) — it never consults self._settings. Stubbing
+        `a._settings.llm_retry_max_attempts = 3` here would be silently
+        ignored, and the "3" in these tests' assertions would actually come
+        from the global default (settings.llm_retry_max_attempts default=3),
+        making a CI env override of that default change these tests' expected
+        counts without the fixture reflecting why. Assert the real default is
+        in effect instead of stubbing a value nothing reads.
+        """
+        from pacca.config.settings import active_overrides, get_settings
+
+        assert active_overrides() == {}, "no overrides should leak from another test"
+        assert get_settings().llm_retry_max_attempts == 3, (
+            "These tests assume the real settings.llm_retry_max_attempts "
+            "default (3); if that default changes, update the expected "
+            "attempt counts below rather than silently drifting."
+        )
         cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
-        a = _ConcreteAgent(config=cfg)
-        a._settings = MagicMock()
-        a._settings.llm_retry_max_attempts = 3
-        a._settings.llm_retry_wait_min_seconds = 0.0
-        a._settings.llm_retry_wait_max_seconds = 0.0
-        return a
+        return _ConcreteAgent(config=cfg)
 
     @pytest.mark.asyncio
     async def test_internal_server_error_5xx_is_retried_to_exhaustion(
@@ -342,7 +359,7 @@ class TestServerErrorRetry:
         )
 
         with (
-            patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)),
+            patch("pacca.agents.base.wait_exponential", return_value=wait_fixed(0)),
             pytest.raises(InternalServerError),
         ):
             await agent.execute("test prompt", _TestOutput)
@@ -372,7 +389,7 @@ class TestServerErrorRetry:
         success_response = make_mock_response()
         agent.client.messages.create = AsyncMock(side_effect=[overloaded_error, success_response])
 
-        with patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)):
+        with patch("pacca.agents.base.wait_exponential", return_value=wait_fixed(0)):
             result = await agent.execute("test prompt", _TestOutput)
 
         assert result.result == "approved"
@@ -407,7 +424,7 @@ class TestServerErrorRetry:
         pre_fix_predicate = retry_if_exception_type(base_module.RETRIABLE_ERRORS)
 
         with (
-            patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)),
+            patch("pacca.agents.base.wait_exponential", return_value=wait_fixed(0)),
             patch(
                 "pacca.agents.base.retry_if_exception_type",
                 return_value=pre_fix_predicate,
@@ -444,7 +461,7 @@ class TestServerErrorRetry:
         spy = MagicMock(wraps=base_module._is_retriable_status_error)
 
         with (
-            patch("pacca.agents.base.wait_exponential", return_value=MagicMock(sleep=0)),
+            patch("pacca.agents.base.wait_exponential", return_value=wait_fixed(0)),
             patch("pacca.agents.base._is_retriable_status_error", spy),
         ):
             result = await agent.execute("test prompt", _TestOutput)
@@ -453,6 +470,30 @@ class TestServerErrorRetry:
         assert spy.call_count >= 1, (
             "_is_retriable_status_error must be reachable from the retry "
             "predicate — it was dead code before chg-21."
+        )
+
+
+class TestSdkInternalRetryDisabled:
+    """
+    chg-21: tenacity must be the SOLE retry authority for LLM calls.
+
+    The Anthropic SDK's AsyncAnthropic client retries 408/409/429/5xx
+    internally by default (max_retries=2, i.e. up to 3 HTTP attempts per
+    call) BELOW tenacity — invisible to effective_settings()-driven retry
+    tuning, to _log_retry_attempt's logging, and to the span's
+    attempt_number. Once tenacity also retries 5xx (this change), leaving
+    the SDK default would silently multiply attempts under two
+    uncoordinated backoff schedules: up to llm_retry_max_attempts (tenacity)
+    x 3 (SDK) HTTP requests for one persistent 5xx. BaseAgent must construct
+    the client with max_retries=0 so nobody reintroduces that multiplication.
+    """
+
+    def test_client_constructed_with_max_retries_zero(self) -> None:
+        agent = _ConcreteAgent(config=AgentConfig(model="claude-test"))
+        assert agent.client.max_retries == 0, (
+            "AsyncAnthropic must be constructed with max_retries=0. The SDK "
+            "default (max_retries=2) retries 5xx/429 internally, which would "
+            "multiply attempts on top of tenacity's own 5xx retry (chg-21)."
         )
 
 
