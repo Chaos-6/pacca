@@ -109,6 +109,46 @@ Don't infer live clinical accuracy from the deterministic suite — they cover d
 
 ---
 
+### P-009 · SQLite proves nothing about FK behaviour — a whole bug class is invisible to `make test`
+**Symptom.** A change is green across the entire deterministic suite (890+ tests), green on SQLite-with-`PRAGMA foreign_keys=ON`, and **catastrophically broken on Postgres**. Observed 2026-07-28: moving audit writes onto an independently-committing session passed every local test, then on a real Postgres container a normal successful request persisted **0 of its 7 audit rows** while returning 200.
+
+**Cause.** Two independent dialect divergences, both silent:
+1. **SQLite disables FK enforcement by default.** `audit_logs.request_id` carries a `DEFERRABLE INITIALLY DEFERRED` FK (migration 003, Postgres-only); nothing local exercises it.
+2. **Even with `PRAGMA foreign_keys=ON`, SQLAlchemy session state after a failed commit differs.** On SQLite a rolled-back instance stays re-insertable; on Postgres it is stamped with an identity key and left `detached=True`, so re-`add()`ing it emits an **UPDATE matching 0 rows** instead of an INSERT — silently swallowed by a blanket `except Exception`.
+
+The second one is the trap: the agent *suspected* Postgres would differ, wrote a `PRAGMA`-forced SQLite test to check, and that test confirmed the wrong thing. A proxy for the production engine is not the production engine.
+
+**Rule.** For **any** change touching transactions, sessions, commit boundaries, or FK-bearing tables:
+- SQLite results are a smoke test, never evidence. Do not accept "I forced `PRAGMA foreign_keys=ON`" as a substitute.
+- Run `tests/integration/ -m postgres` with `POSTGRES_TEST_URL` set, or stand up an ephemeral container:
+  ```bash
+  docker run -d --rm -e POSTGRES_PASSWORD=x -p 5433:5432 postgres:16
+  DATABASE_URL=postgresql+asyncpg://postgres:x@localhost:5433/postgres alembic upgrade head
+  ```
+- That tier (2 tests, 187 lines) exists precisely for this and **it caught this bug when 890 unit tests did not**. It is the least-loved part of the suite and the highest-leverage.
+- Also verify `alembic revision --autogenerate` is empty on Postgres — the `migration-drift` gate only runs there.
+
+**Related.** P-008 (deterministic ≠ clinical) is the same shape one layer up: green on the cheap tier says nothing about the expensive one.
+
+---
+
+### P-010 · A regression test that has only ever passed is an assumption, not a test
+**Symptom.** A guard, detector, or regression test ships green and is trusted — but nobody has ever seen it fail, so there is no evidence it *can*.
+
+**Cause.** Tests are written after the fix, against the fixed code. A test that asserts the correct behaviour and a test that asserts nothing both pass on correct code.
+
+**Real instances, all 2026-07-28:**
+- An eval contamination guard was only believed once an adversarial reviewer injected a held-out case id into `src/` and watched it go red on both `.py` and `.md`.
+- A route-enumeration probe reported "zero unguarded routes"; its detector had never been observed failing. Stripping the RBAC dependency from a real route in memory proved it goes red — *then* the zero meant something.
+- A retry fix's guard set was assumed to be 4 tests; mutation testing showed only **3** actually fail when the predicate is reverted.
+
+**Rule.** Before trusting any guard or regression test, **watch it fail**:
+- Mutate the production code (revert the fix inline, strip the dependency, inject the contamination), confirm RED, restore, confirm GREEN — and paste both.
+- **Never `git stash`** to do it (L-021: the stash list is shared across worktrees). Use `git show <sha>:<path> > <path>` with a backup, or patch in memory.
+- Prefer a *permanent* mutation-style test (e.g. one that pins the old predicate via `patch()`) so the property stays checkable rather than being a one-time demonstration.
+
+---
+
 ## Git & PR workflow (PACCA-specific overlay on the global rule L-001)
 
 ### P-006 · PACCA defaults to branch-and-PR. No direct pushes to main.
@@ -136,4 +176,4 @@ Keep entries terse. The file is meant to be re-readable in two minutes at sessio
 
 ---
 
-*Last updated: 2026-06-02.*
+*Last updated: 2026-07-28.*
