@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from pacca.api.routes.authorizations import orchestrator, rag_engine, submit_authorization
 from pacca.config.settings import apply_overrides, clear_all_overrides
 from pacca.db.models import Base
-from pacca.db.repository import AuthorizationRepository, DecisionRepository
+from pacca.db.repository import AuditRepository, AuthorizationRepository, DecisionRepository
 from pacca.integrations.vector_store import RetrievalOutcome
 from pacca.models import ClassificationOutput, EvidenceOutput, UrgencyLevel
 from pacca.models.authorization import AuthorizationDecision, AuthorizationRequest
@@ -179,15 +179,7 @@ async def test_scope_violation_after_request_persisted_is_persisted_and_queued(
     scope.allow), so this is not a db.write_request-time violation.
     """
 
-    def _narrowed(*, correlation_id, request_id, subject_ref):
-        return IntentRecord(
-            correlation_id=correlation_id,
-            request_id=request_id,
-            subject_ref=subject_ref,
-            allowed_collections=["nccn_guidelines"],  # drops case_precedents
-        )
-
-    monkeypatch.setattr(IntentRecord, "for_prior_auth", staticmethod(_narrowed))
+    monkeypatch.setattr(IntentRecord, "for_prior_auth", staticmethod(_narrowed_intent))
     monkeypatch.setattr(rag_engine, "query", lambda *a, **k: _healthy_outcome())
 
     req = _request("AUTH-SV-1")
@@ -207,6 +199,90 @@ async def test_scope_violation_after_request_persisted_is_persisted_and_queued(
     all_decisions_for_request = [d for d, r in rows if r.request_id == "AUTH-SV-1"]
     assert len(all_decisions_for_request) == 1
     assert decision.decision_id.startswith("SCOPE-AUTH-SV-1-")
+
+
+def _narrowed_intent(*, correlation_id, request_id, subject_ref):
+    """An IntentRecord that will deny the SECOND rag.query call
+    (case_precedents), by which point db.write_request has already
+    succeeded -- used to force a ScopeViolation AFTER the request row
+    exists, without touching db.write_request itself."""
+    return IntentRecord(
+        correlation_id=correlation_id,
+        request_id=request_id,
+        subject_ref=subject_ref,
+        allowed_collections=["nccn_guidelines"],  # drops case_precedents
+    )
+
+
+@pytest.mark.asyncio
+async def test_scope_violation_persist_check_operational_error_is_audited_not_500(
+    session, monkeypatch
+):
+    """
+    F1 (Validator): before this widening, `AuthorizationRepository.get_by_id`
+    sat OUTSIDE the inner try, so a DB-layer failure there (e.g. a dropped
+    connection -- OperationalError) would escape this except-ScopeViolation
+    handler entirely. `except Exception` further down sits on the SAME try
+    statement as `except ScopeViolation`, so it can NEVER catch something
+    raised from inside this handler -- the failure would propagate all the
+    way out of submit_authorization as an unhandled 500 with zero audit
+    record. Proves the widened try now covers the existence check itself.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    async def _raise(self, request_id):
+        raise OperationalError("SELECT 1", {}, Exception("simulated connection drop"))
+
+    monkeypatch.setattr(IntentRecord, "for_prior_auth", staticmethod(_narrowed_intent))
+    monkeypatch.setattr(rag_engine, "query", lambda *a, **k: _healthy_outcome())
+    monkeypatch.setattr(AuthorizationRepository, "get_by_id", _raise)
+
+    req = _request("AUTH-SV-OE-1")
+    result = await submit_authorization(request=req, session=session)
+    await session.commit()
+
+    # No 500: the route still returns the fail-closed escalation decision.
+    assert result.status == AuthorizationStatus.IN_REVIEW
+    assert result.review_tier_used == ReviewTier.HUMAN
+
+    audit_rows = await AuditRepository(session).get_by_request_id("AUTH-SV-OE-1")
+    failed = [a for a in audit_rows if a.action == "escalation_persist_failed"]
+    assert len(failed) == 1, "the get_by_id failure must be audited, not swallowed silently"
+    assert failed[0].success is False
+    assert failed[0].details["error_type"] == "OperationalError"
+
+
+@pytest.mark.asyncio
+async def test_scope_violation_persist_create_operational_error_is_audited_not_500(
+    session, monkeypatch
+):
+    """Same as above, but the DB-layer failure happens one step later: the
+    existence check succeeds (request row is real), but
+    DecisionRepository.create() itself hits an OperationalError. Must still
+    be caught by the widened except, audited, and never surfaced as a 500 --
+    and the row must NOT appear in the queue, since the write never landed."""
+    from sqlalchemy.exc import OperationalError
+
+    async def _raise(self, decision, request_id, processing_time_ms=None, total_tokens=None):
+        raise OperationalError("INSERT INTO authorization_decisions", {}, Exception("db down"))
+
+    monkeypatch.setattr(IntentRecord, "for_prior_auth", staticmethod(_narrowed_intent))
+    monkeypatch.setattr(rag_engine, "query", lambda *a, **k: _healthy_outcome())
+    monkeypatch.setattr(DecisionRepository, "create", _raise)
+
+    req = _request("AUTH-SV-OE-2")
+    result = await submit_authorization(request=req, session=session)
+    await session.commit()
+
+    assert result.status == AuthorizationStatus.IN_REVIEW
+    assert result.review_tier_used == ReviewTier.HUMAN
+    assert await _queue(session) == []
+
+    audit_rows = await AuditRepository(session).get_by_request_id("AUTH-SV-OE-2")
+    failed = [a for a in audit_rows if a.action == "escalation_persist_failed"]
+    assert len(failed) == 1
+    assert failed[0].success is False
+    assert failed[0].details["error_type"] == "OperationalError"
 
 
 @pytest.mark.asyncio
