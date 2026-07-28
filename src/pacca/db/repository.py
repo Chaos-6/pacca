@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from sqlalchemy import and_, desc, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 
 def uuid7() -> str:
@@ -400,18 +400,33 @@ class AuditRepository:
         audit trail for the one case (a crash) it exists to cover.
 
         Ordering guarantee — read precisely, it is weaker than the same-
-        transaction guarantee it replaces: this method awaits COMMIT of the
-        audit row before returning, so "this call returns" happens only
-        after "the audit row is durably in the database" — and therefore
-        before the caller's subsequent business write is even attempted.
-        It does NOT provide snapshot/serializable ordering against a
-        concurrent reader on a third connection, and it does NOT make the
-        audit commit part of the same atomic unit as the business write —
-        that atomicity is exactly what we removed on purpose, since it was
-        the thing letting a business rollback take the audit row down with
-        it. The two writes are now independent, ordered-but-not-atomic:
+        transaction guarantee it replaces, and it is CONDITIONAL on the
+        caller's session shape: this method awaits COMMIT of the audit
+        row before returning, so "this call returns" happens only after
+        "the audit row is durably in the database" — and therefore before
+        the caller's subsequent business write is even attempted. It does
+        NOT provide snapshot/serializable ordering against a concurrent
+        reader on a third connection, and it does NOT make the audit
+        commit part of the same atomic unit as the business write — that
+        atomicity is exactly what we removed on purpose, since it was the
+        thing letting a business rollback take the audit row down with
+        it. The two writes are ordered-but-not-atomic:
         audit-committed-before-business-attempted, never
-        audit-lost-because-business-failed.
+        audit-lost-because-business-failed —
+        PROVIDED `self.session` is bound to an `AsyncEngine` (true for
+        every production call site: `get_session()` / `get_session_context()`
+        both build sessions from `async_sessionmaker(bind=engine, ...)`).
+        If `self.session` is instead bound to an `AsyncConnection` directly
+        (a connection-bound session — the standard "one shared connection,
+        roll everything back at the end" transactional-test pattern) or has
+        no bind at all, `_persist_independently` REFUSES the write and logs
+        `audit_independent_session_unsupported_bind` loudly rather than
+        silently degrading: a session built from a shared connection would
+        commit as a SAVEPOINT nested in the caller's own transaction, so a
+        later rollback on the caller's session would erase the "independent"
+        row too — the exact silent-fallback failure mode (plausible success,
+        real work didn't happen) this fix exists to eliminate, not
+        reintroduce. See `_persist_independently`'s docstring.
 
         `request_id` no longer carries a foreign key to
         `authorization_requests` (chg-23 migration 007 drops the migration
@@ -486,9 +501,34 @@ class AuditRepository:
         bottleneck, the fix is a dedicated (larger, or separately pooled)
         connection allowance for audit writes, not attempted here to keep
         this change to the durability fix it was scoped for.
+
+        Bind guard (chg-23 Validator FIX 1/2): `get_independent_session`
+        needs `self.session`'s bind to be an `AsyncEngine` — a session
+        built from an `AsyncConnection` bind instead shares that ONE
+        connection with the caller, so its `commit()` degrades to a
+        SAVEPOINT nested inside the caller's own transaction, and a later
+        rollback on the caller's session erases it too. Silently
+        attempting the write in that shape would return normally with the
+        row gone and zero errors logged — a fallback that reports success
+        while the real work didn't happen, the exact pattern this fix
+        exists to remove, not reintroduce. `getattr(..., "bind", None)`
+        (rather than direct attribute access) also makes a bindless
+        session (`.bind is None`, e.g. `async_sessionmaker()` with no
+        engine at all) an explicit, named case instead of an incidental
+        `AttributeError` caught by the generic handler below.
         """
+        bind = getattr(self.session, "bind", None)
+        if not isinstance(bind, AsyncEngine):
+            logger.error(
+                "audit_independent_session_unsupported_bind",
+                action=entry.action,
+                correlation_id=entry.correlation_id,
+                request_id=entry.request_id,
+                bind_type=type(bind).__name__,
+            )
+            return
+
         try:
-            bind = self.session.bind
             db_entry = AuditLogModel(
                 entry_id=entry.entry_id,
                 request_id=entry.request_id,
