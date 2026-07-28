@@ -22,6 +22,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # The agents that do the clinical reasoning
@@ -502,7 +503,7 @@ async def submit_authorization(
                 "violations": sv.violations,
             },
         )
-        return AuthorizationDecision(
+        escalated_decision = AuthorizationDecision(
             decision_id=f"SCOPE-{request.request_id}-{int(time.time())}",
             status=AuthorizationStatus.IN_REVIEW,
             confidence_score=0.0,
@@ -512,6 +513,86 @@ async def submit_authorization(
             ),
             review_tier_used=ReviewTier.HUMAN,
         )
+
+        # ── PERSIST so the escalation surfaces in /review-queue ────────────────
+        # This except block used to return without ever calling
+        # DecisionRepository.create(): a scope violation was "routed to human
+        # review" that no human could ever see, since GET /review-queue reads
+        # persisted IN_REVIEW rows via an INNER JOIN to their request. Same
+        # defect chg-20 already fixed for the RAG-degraded escalation above.
+        #
+        # Why this except block needs an existence check that other persist
+        # sites don't: this handler is reachable from the FIRST guarded write
+        # in the try block (db.write_request, above), which runs BEFORE
+        # AuthorizationRepository(session).create(request). Every other
+        # guarded call site in this route (the rag.query loop, both
+        # db.write_decision sites) runs strictly after that create() has
+        # already succeeded. AuthorizationDecisionModel.request_id FKs to
+        # authorization_requests.request_id (db/models.py); persisting a
+        # decision against a request that was never written is an orphan
+        # list_escalated_for_review()'s INNER JOIN can never surface — and
+        # verified empirically, SQLite silently accepts that orphan insert (no
+        # FK enforcement without an explicit PRAGMA this codebase does not
+        # set) while Postgres, which does enforce it, raises IntegrityError.
+        # A live existence check answers "can this decision be persisted
+        # safely" directly, rather than inferring it from which action name
+        # denied — so it stays correct even if the guarded call sites are
+        # ever reordered.
+        #
+        # Session usability: ScopeViolation is a plain Python exception
+        # `enforce_scope` raises before any SQL statement for the denied
+        # call, not a DB-layer failure — the session is not "poisoned," so
+        # session.add()/flush() below are safe to call from this except
+        # block (the same reasoning the RAG-degraded escalation above already
+        # relies on). The persist is still wrapped in its own try/except: a
+        # fail-closed escalation path's job is to never end in a 500, so a
+        # second denial (sv.action == "db.write_decision" itself out of
+        # scope) or a write failure is audited and swallowed, not re-raised.
+        existing_request = await AuthorizationRepository(session).get_by_id(request.request_id)
+        if existing_request is not None:
+            try:
+                await enforce_scope(
+                    intent,
+                    "db.write_decision",
+                    audit=audit,
+                    mode=get_settings().scope_guard_mode,
+                    request_id=request.request_id,
+                )
+                await DecisionRepository(session).create(
+                    escalated_decision,
+                    request_id=request.request_id,
+                    processing_time_ms=duration_ms,
+                )
+            except (ScopeViolation, IntegrityError) as persist_exc:
+                await audit.log(
+                    action="escalation_persist_failed",
+                    actor="scope_guard",
+                    actor_type="system",
+                    request_id=request.request_id,
+                    correlation_id=correlation_id,
+                    success=False,
+                    output_summary=(
+                        "Escalated decision could not be persisted; it will "
+                        "not appear in /review-queue"
+                    ),
+                    details={"error_type": type(persist_exc).__name__},
+                )
+        else:
+            await audit.log(
+                action="escalation_persist_skipped",
+                actor="scope_guard",
+                actor_type="system",
+                request_id=request.request_id,
+                correlation_id=correlation_id,
+                success=False,
+                output_summary=(
+                    "No persisted request row for this scope violation "
+                    "(denied at db.write_request); decision not persisted"
+                ),
+                details={"guarded_action": sv.action},
+            )
+
+        return escalated_decision
 
     except Exception as e:
         # ── AUDIT RECORD 3: Log failures ─────────────────────────────────────
