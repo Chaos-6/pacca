@@ -144,7 +144,16 @@ class AuthorizationRepository:
             .values(**update_data)
         )
 
-        if result.rowcount > 0:
+        # Type-guard before the ordering comparison (P-011, docs/AGENT_LESSONS.md):
+        # an unconfigured mock session's `.execute(...)` return has a `.rowcount`
+        # attribute that is itself a Mock, not an int, and `Mock() > 0` raises
+        # TypeError rather than returning a sane truthy/falsy value the way
+        # `float(Mock())` deceptively does. Callers that pass a mocked session
+        # (chg-24 wired a real caller — submit_authorization's T2 status
+        # advance — that unit tests exercise against AsyncMock) now get an
+        # honest `False` instead of a crash.
+        rowcount = result.rowcount
+        if isinstance(rowcount, int) and rowcount > 0:
             logger.info(
                 "authorization_status_updated",
                 request_id=request_id,
