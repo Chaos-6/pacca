@@ -70,24 +70,66 @@ over whatever verdicts a run produces. This is reporting only: the existing
 still computed over every verdict exactly as before, byte-for-byte.
 
 **The held-out cases are now actually evaluated.** A dedicated
-`@pytest.mark.clinical` test, `test_held_out_accuracy_report`
-(`tests/clinical/test_clinical_accuracy.py::TestFullClinicalEvaluation`),
+`@pytest.mark.holdout` test, `test_held_out_accuracy_report`
+(`tests/clinical/test_clinical_accuracy.py::TestHeldOutEvaluation`),
 runs the real pipeline (pre-flight → Decision Agent → LLM judge — the same
 `_run_cases_through_pipeline()` helper the golden-set gate uses, so the two
 paths can't silently drift apart) over `held_out_cases()` and reports
 `accuracy_held_out`. Run it with:
 
 ```bash
-make test-holdout    # requires ANTHROPIC_API_KEY; not a CI gate; ~1 minute
+make test-holdout    # requires ANTHROPIC_API_KEY; not a CI gate; ~7.5 minutes
 ```
 
-Two different behaviors here, both worth stating precisely so neither reads
+### Why `holdout` is its own marker, not `clinical`
+
+It began under `@pytest.mark.clinical`, which put it inside the per-merge gate.
+It was moved out on 2026-07-28 for three reasons, in ascending importance:
+
+1. **It is not a gate.** Its only assertion is a wiring check, so it could
+   never block a merge — it was pure cost on every qualifying PR.
+2. **It is the wrong instrument for regression detection.** That job belongs to
+   per-case baseline comparison (`regression_gate.py`). Aggregate accuracy over
+   32 cases has poor power for small drops — per `STATISTICAL_POWER.md`, n≈13
+   detects a *20-point* drop.
+3. **Running a holdout per-merge destroys it.** Every behavioural PR would print
+   exactly which held-out cases failed, and the natural, well-intentioned
+   response is to tune a prompt until they pass. That is contamination — the
+   precise thing this holdout exists to measure — arriving through the one
+   channel `tests/unit/test_eval_holdout_guard.py` structurally cannot see: a
+   human reading CI output. A holdout is worth exactly what its isolation is
+   worth.
+
+It now runs on the nightly `holdout-report` CI job (`continue-on-error`, never
+blocking) or deliberately via `make test-holdout`.
+
+> **Invariant:** every `-m "not clinical"` selector must also say
+> `not holdout`. Verified 2026-07-28 — a bare `-m "not clinical"` *does* select
+> this test, which would silently turn `make test` into a billable 32-case live
+> run. The Makefile and `ci.yml` selectors were widened accordingly.
+
+### First recorded reading (2026-07-28)
+
+**87.5% (28/32)**, Wilson 95% CI **71.9%–95.0%**. Failures: GC-037, GC-044,
+GC-048, GC-065. Score distribution 27×5, 1×3, 4×2, **zero score-1** — the
+anti-hallucination property holds out-of-sample, not only on GC-018/019.
+
+Two cautions on reading it. First, **it is not directly comparable to the
+golden-set figure**: the 39-case gate includes 5 pre-flight cases (GC-006, 007,
+008, 009, 011) decided deterministically with no model call, and the holdout has
+none — the honest comparison is holdout-32 against the gate's LLM-decided-34.
+Second, at n=32 the interval is wide enough that 87.5% is not statistically
+distinguishable from ~95%; treat this as the first data point establishing a
+baseline, not a verdict. **GC-065 is the one to look at first** — it was wrongly
+AUTO_APPROVED, the only failure in the unsafe direction; the other three
+over-escalated to IN_REVIEW.
+
+Two different key-absent behaviors, both worth stating precisely so neither reads
 as the other. Run the test **directly via pytest** with no key set
-(`pytest tests/clinical/test_clinical_accuracy.py::TestFullClinicalEvaluation::
-test_held_out_accuracy_report -m clinical`) and it **skips cleanly**
-(`1 skipped`), exactly like every other `clinical`-marked test — this is what
-keeps `make test` (the fast, deterministic target, which selects
-`-m "not clinical"` and never reaches this test at all) fast and green. Run
+(`pytest tests/ -m holdout`) and it **skips cleanly** (`1 skipped`) — this is
+what keeps `make test` (the fast, deterministic target, which selects
+`-m "not clinical and not holdout"` and never reaches this test at all) fast and
+green. Run
 it via **`make test-holdout`** with no key set, and the *target* **hard-errors
 instead** (`ERROR: ANTHROPIC_API_KEY is not set...`, non-zero exit) before
 pytest ever starts, matching `make test-clinical`'s existing precedent: a

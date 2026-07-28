@@ -303,6 +303,7 @@ markers = [
     "unit: Unit tests (fast, no API calls)",
     "integration: Integration tests (requires running services)",
     "clinical: Clinical validation tests (slow, requires ANTHROPIC_API_KEY — run nightly)",
+    "holdout: Out-of-sample held-out accuracy report (live API, ~7.5 min). DELIBERATELY NOT `clinical`: it is not a gate, and running a holdout per-merge invites tuning against it, which contaminates the very thing it measures. Never add to a per-merge selector; every `not clinical` selector must also say `not holdout`.",
     "postgres: Real-Postgres integration tests (requires POSTGRES_TEST_URL — catches SQLite-masked bugs like B2/B3)",
     "slow: Slow running tests",
 ]

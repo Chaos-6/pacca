@@ -141,20 +141,36 @@ every PR is one path or the other, never ambiguous.
 Use the Makefile targets (they encode the correct markers):
 
 - **Deterministic suite (routine):** `make test` — runs `pytest tests/unit/` plus the
-  non-clinical part of the clinical accuracy test, with `-m "not clinical"`. Fast (~25s).
-  Run before every commit; expect 0 failures. (Sizes drift — `pytest --collect-only -q`
-  reports the current count rather than a number baked into this doc.)
-- **Everything non-clinical:** `make test-all` (`pytest tests/ -m "not clinical"`).
+  non-clinical part of the clinical accuracy test, with `-m "not clinical and not holdout"`.
+  Fast (~25s). Run before every commit; expect 0 failures. (Sizes drift —
+  `pytest --collect-only -q` reports the current count rather than a number baked in here.)
+- **Everything non-clinical:** `make test-all`
+  (`pytest tests/ -m "not clinical and not holdout"`).
 - **Coverage:** `make test-cov`.
 - **Clinical / LLM-as-judge gate:** `make test-clinical` (`pytest tests/ -m clinical` —
   the marker is the selector, and `tests/test_level5_flow.py` carries it too).
-  Makes real Claude calls (**~20 min** as of iter-15 — measured 18m33s on 2026-07-28;
-  the estimate was ~3–5 min before the 32-case held-out report joined this marker);
-  requires `ANTHROPIC_API_KEY` in the shell env —
-  source it from the gitignored `.env`, never hardcode or print it. This is the golden-set
-  accuracy gate (incl. GC-018/019); run it at the final merge HEAD for any behavior change.
-  Runs with `-s`: the accuracy figures are printed, and pytest captures stdout on passing
-  tests, so without it the target discards the numbers it exists to produce.
+  Makes real Claude calls (**~11 min** — the full target measured 18m33s on 2026-07-28
+  including the held-out report, which was 7m25s of it and has since moved to its own
+  marker); requires `ANTHROPIC_API_KEY` in the shell env — source it from the gitignored
+  `.env`, never hardcode or print it. This is the golden-set accuracy gate (incl.
+  GC-018/019); run it at the final merge HEAD for any behavior change. Runs with `-s`:
+  the accuracy figures are printed, and pytest captures stdout on passing tests, so
+  without it the target discards the numbers it exists to produce.
+- **Held-out (out-of-sample) report:** `make test-holdout` (`pytest tests/ -m holdout`).
+  ~7.5 min of live calls over the 32-case declared holdout. **Not a gate** — its only
+  assertion is a wiring check. First reading 2026-07-28: **87.5% (28/32)**, Wilson 95%
+  CI 71.9–95.0%, zero score-1. Not directly comparable to the golden-set figure: that
+  set includes 5 pre-flight cases decided deterministically with no model call, this
+  one has none.
+
+> **`holdout` is a separate marker from `clinical` on purpose, and the reason is not
+> runtime.** A holdout run per-merge prints which held-out cases failed, and the natural
+> response is to tune a prompt until they pass — contaminating the holdout through the one
+> channel `tests/unit/test_eval_holdout_guard.py` cannot see: a human reading CI output.
+> It runs on the nightly `holdout-report` job (non-blocking) or deliberately by hand.
+> **Every `not clinical` selector must also say `not holdout`** — otherwise `make test`
+> silently becomes a billable 32-case live run. Verified 2026-07-28: bare `-m "not clinical"`
+> does select it.
 
 > **Do not infer clinical accuracy from `make test`.** The deterministic suite deselects
 > the live LLM tests — they cover different things (see `docs/AGENT_LESSONS.md` P-008).

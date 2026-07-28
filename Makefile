@@ -54,11 +54,11 @@ seed:
 
 test:
 	@echo "Running fast unit tests (no API calls)..."
-	pytest tests/unit/ tests/clinical/test_clinical_accuracy.py -m "not clinical" -v
+	pytest tests/unit/ tests/clinical/test_clinical_accuracy.py -m "not clinical and not holdout" -v
 
 test-cov:
 	@echo "Running unit tests with coverage report..."
-	pytest tests/unit/ -m "not clinical" \
+	pytest tests/unit/ -m "not clinical and not holdout" \
 		--cov=pacca \
 		--cov-report=html:htmlcov \
 		--cov-report=term-missing \
@@ -67,7 +67,7 @@ test-cov:
 
 test-all:
 	@echo "Running all fast tests (unit + dataset integrity)..."
-	pytest tests/ -m "not clinical" -v
+	pytest tests/ -m "not clinical and not holdout" -v
 
 test-clinical:
 	@echo "Running full clinical evaluation (requires ANTHROPIC_API_KEY, ~20 minutes)..."
@@ -95,8 +95,7 @@ test-holdout:
 	fi
 	# -s so the printed accuracy_held_out summary is visible even on a pass --
 	# the whole point of this target is to obtain that number in one command.
-	pytest tests/clinical/test_clinical_accuracy.py::TestFullClinicalEvaluation::test_held_out_accuracy_report \
-		-m clinical -v -s
+	pytest tests/ -m holdout -v -s
 
 test-postgres:
 	@echo "Real-Postgres integration tests (catches SQLite-masked bugs like B2/B3)..."

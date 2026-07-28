@@ -62,7 +62,7 @@ jobs:
   # tests/integration were never executed in CI and tests/test_level5_flow.py's
   # collection errors stayed invisible: the badge could be green while
   # `make test-all` was red locally. The scope here now matches `make test-all`
-  # exactly (`pytest tests/ -m "not clinical"`), which is what makes that
+  # exactly (`pytest tests/ -m "not clinical and not holdout"`), which is what makes that
   # divergence impossible. Live-LLM tests carry the `clinical` marker and are
   # deselected here — they run in the separate, opt-in clinical-gate job.
   # ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ jobs:
           APP_ENV: "development"
           DEBUG: "true"
         run: |
-          pytest tests/ -m "not clinical" --tb=short
+          pytest tests/ -m "not clinical and not holdout" --tb=short
 
       - name: Run tests with coverage
         env:
@@ -100,7 +100,7 @@ jobs:
           APP_ENV: "development"
           DEBUG: "true"
         run: |
-          pytest tests/ -m "not clinical" --cov=pacca --cov-report=xml --cov-report=term-missing
+          pytest tests/ -m "not clinical and not holdout" --cov=pacca --cov-report=xml --cov-report=term-missing
         continue-on-error: true
 
       - name: Upload coverage to Codecov
@@ -257,6 +257,67 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: make test-clinical
+
+  # ---------------------------------------------------------------------------
+  # Held-out (out-of-sample) accuracy report — SCHEDULE / MANUAL ONLY
+  #
+  # Deliberately NOT a pull_request job, and deliberately not part of
+  # clinical-gate. Two reasons, the second being the important one:
+  #
+  #   1. It is not a gate. Its only assertion is a wiring check, so on a PR it
+  #      would spend ~7.5 min of live API calls (measured 2026-07-28) and could
+  #      never block a merge.
+  #   2. Running a holdout on every behavioural PR destroys it. The job output
+  #      names the failing held-out cases; the natural response is to tune a
+  #      prompt until they pass, which contaminates the holdout through the one
+  #      channel tests/unit/test_eval_holdout_guard.py cannot see — a human
+  #      reading CI logs. A holdout is only worth what its isolation is worth.
+  #
+  # Reports a number on a cadence; never blocks. See docs/EVALUATION.md.
+  # ---------------------------------------------------------------------------
+  holdout-report:
+    name: Held-out accuracy report (out-of-sample, non-blocking)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for API key (opt-in by secret)
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ANTHROPIC_API_KEY not set — holdout report is inert until it is added"
+          fi
+
+      - name: Set up Python
+        if: steps.key.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        if: steps.key.outputs.present == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # continue-on-error: this reports, it does not gate. A dip in the
+      # out-of-sample number is information to act on deliberately, not a red
+      # build — promoting it to blocking is the warn->enforce decision
+      # documented in docs/EVALUATION.md, taken by a human, not inherited here.
+      - name: Run held-out accuracy report
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: make test-holdout
 
   test-postgres:
     name: Postgres integration (SQLite-masked bugs — B2/B3)

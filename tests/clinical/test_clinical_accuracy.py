@@ -761,59 +761,6 @@ class TestFullClinicalEvaluation:
         )
 
     @pytest.mark.asyncio
-    async def test_held_out_accuracy_report(self) -> None:
-        """
-        NOT A CI GATE. Runs PACCA's real pipeline over the 32-case declared
-        holdout (`tests/clinical/holdout.py::HELD_OUT_CASE_IDS`) and reports
-        `accuracy_held_out` — the first live, out-of-sample accuracy number
-        for this system, since none of these 32 cases are referenced under
-        `src/pacca/` or part of the golden-set gate above.
-
-        Deliberately UNTHRESHOLDED: there is no established out-of-sample
-        baseline yet to gate against, and picking a threshold on this test's
-        first-ever run (with zero prior data points) would be a unilateral
-        policy decision this test shouldn't make on its own. This mirrors
-        the repo's own warn-then-enforce precedent — the P-4 scope guard
-        shipped in warn mode (iter-8) before enforce mode (iter-9); see
-        `docs/EVALUATION.md` for why promoting this to a blocking gate is a
-        deliberate follow-up decision, not taken here.
-
-        The only assertion below is a wiring sanity check (every declared
-        held-out case was actually evaluated, none dropped or
-        double-counted) — it is not an accuracy-quality gate.
-
-        Reachable via `make test-holdout` (see Makefile).
-        """
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            pytest.skip("ANTHROPIC_API_KEY not set — skipping live evaluation")
-
-        from pacca.agents.clinical_risk_detector import ClinicalRiskDetector
-        from pacca.agents.decision import DecisionAgent
-
-        detector = ClinicalRiskDetector()
-        agent = DecisionAgent()
-        evaluator = ClinicalEvaluator()
-
-        verdicts = await _run_cases_through_pipeline(held_out_cases(), detector, agent, evaluator)
-        report = evaluator.compile_report(verdicts)
-
-        print(f"\n{report.summary()}")
-        print(
-            f"\nHeld-out accuracy (out-of-sample, NOT a CI gate): "
-            f"{report.accuracy_held_out:.1%} "
-            f"({report.held_out_passed}/{report.held_out_total} cases)"
-        )
-
-        # Wiring sanity check ONLY — confirms every declared held-out case
-        # was actually evaluated. NOT an accuracy threshold; see docstring.
-        assert report.held_out_total == len(HELD_OUT_CASE_IDS), (
-            f"Expected all {len(HELD_OUT_CASE_IDS)} held-out cases to be "
-            f"evaluated, got {report.held_out_total}. A case may have been "
-            f"dropped or double-counted — check held_out_cases() in "
-            f"tests/clinical/holdout.py."
-        )
-
-    @pytest.mark.asyncio
     async def test_zero_hallucinations_on_sparse_cases(self) -> None:
         """
         Hallucination trap cases must produce zero hallucinations.
@@ -882,4 +829,93 @@ class TestFullClinicalEvaluation:
             f"safety issue and must be fixed before any production deployment.\n"
             f"Review agents/decision.py system prompt — add explicit instruction: "
             f"'Only reference clinical information explicitly present in the notes.'"
+        )
+
+
+# =============================================================================
+# Held-out (out-of-sample) evaluation — @pytest.mark.holdout, NOT clinical
+# =============================================================================
+
+
+@pytest.mark.holdout
+class TestHeldOutEvaluation:
+    """
+    Out-of-sample accuracy reporting. Its own class with its own marker, and
+    that separation is deliberate — three reasons, in ascending importance:
+
+    1. It is not a gate. The only assertion below is a wiring sanity check,
+       so under `-m clinical` it cost ~7.5 min of live API calls on every
+       qualifying PR and could never block one. Measured 2026-07-28: the
+       full clinical target ran 18m33s, of which this test was 7m25s (40%).
+
+    2. It is the wrong instrument for regression detection. A merge gate
+       answers "did this change break something" — that is per-case
+       comparison against a baseline (`regression_gate.py`). Aggregate
+       accuracy over 32 cases has poor power for small drops; per
+       `docs/STATISTICAL_POWER.md`, n≈13 detects a *20-point* drop.
+
+    3. THE REAL REASON: running a holdout per-merge destroys it. Every
+       behavioural PR would print exactly which held-out cases failed, and
+       the natural, well-intentioned response is to tune a prompt until they
+       pass. That is contamination — the precise failure this holdout exists
+       to measure — arriving through the one channel the contamination guard
+       (`tests/unit/test_eval_holdout_guard.py`) structurally cannot see: a
+       human reading CI output. A holdout's value comes from being consulted
+       rarely.
+
+    Run deliberately via `make test-holdout`, or on the nightly schedule.
+    NEVER add this marker to a per-merge selector.
+    """
+
+    @pytest.mark.asyncio
+    async def test_held_out_accuracy_report(self) -> None:
+        """
+        NOT A CI GATE. Runs PACCA's real pipeline over the 32-case declared
+        holdout (`tests/clinical/holdout.py::HELD_OUT_CASE_IDS`) and reports
+        `accuracy_held_out` — the live, out-of-sample accuracy number, since
+        none of these 32 cases are referenced under `src/pacca/` or included
+        in the golden-set gate.
+
+        Deliberately UNTHRESHOLDED: promoting this to a blocking gate is a
+        policy decision taken deliberately, not by this test. Mirrors the
+        repo's warn-then-enforce precedent (P-4 scope guard: warn at iter-8,
+        enforce at iter-9). See `docs/EVALUATION.md`.
+
+        First recorded reading, 2026-07-28: 87.5% (28/32); Wilson 95% CI
+        71.9%–95.0%; failures GC-037, GC-044, GC-048, GC-065; zero score-1
+        (no hallucination out-of-sample). Not directly comparable to the
+        golden-set figure — that set includes 5 pre-flight cases decided
+        deterministically with no model call, this one has none.
+
+        The only assertion below is a wiring sanity check (every declared
+        held-out case was actually evaluated, none dropped or
+        double-counted) — it is not an accuracy-quality gate.
+        """
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            pytest.skip("ANTHROPIC_API_KEY not set — skipping live evaluation")
+
+        from pacca.agents.clinical_risk_detector import ClinicalRiskDetector
+        from pacca.agents.decision import DecisionAgent
+
+        detector = ClinicalRiskDetector()
+        agent = DecisionAgent()
+        evaluator = ClinicalEvaluator()
+
+        verdicts = await _run_cases_through_pipeline(held_out_cases(), detector, agent, evaluator)
+        report = evaluator.compile_report(verdicts)
+
+        print(f"\n{report.summary()}")
+        print(
+            f"\nHeld-out accuracy (out-of-sample, NOT a CI gate): "
+            f"{report.accuracy_held_out:.1%} "
+            f"({report.held_out_passed}/{report.held_out_total} cases)"
+        )
+
+        # Wiring sanity check ONLY — confirms every declared held-out case
+        # was actually evaluated. NOT an accuracy threshold; see docstring.
+        assert report.held_out_total == len(HELD_OUT_CASE_IDS), (
+            f"Expected all {len(HELD_OUT_CASE_IDS)} held-out cases to be "
+            f"evaluated, got {report.held_out_total}. A case may have been "
+            f"dropped or double-counted — check held_out_cases() in "
+            f"tests/clinical/holdout.py."
         )
