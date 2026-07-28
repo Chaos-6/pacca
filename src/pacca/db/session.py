@@ -109,19 +109,34 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 @asynccontextmanager
-async def get_independent_session() -> AsyncGenerator[AsyncSession, None]:
+async def get_independent_session(bind: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
     """
-    A brand-new session bound to the SAME engine/pool as every other session
-    (via `get_session_factory()` — no new engine is created), for callers
-    that need a write to commit on its own, independent of whatever
-    request-scoped transaction the caller is also participating in.
+    A brand-new session bound to `bind`, for callers that need a write to
+    commit on its own, independent of whatever request-scoped transaction
+    the caller is also participating in.
+
+    `bind` MUST be the engine backing the CALLER's own session — pass
+    `caller_session.bind`, never the process-global default-settings
+    engine from `get_engine()` / `get_session_factory()`. Those return
+    whatever `settings.database_url` points at; the caller's own session
+    may be bound to a *different* engine (a dedicated test engine, a
+    future read replica, any multi-engine context). Deriving the bind
+    from the caller is what guarantees the independent write lands in the
+    SAME database as the business write it accompanies — using the global
+    engine instead would silently split them across two databases. (This
+    was CRITICAL 2 in the chg-23 Validator review: an earlier version of
+    this function always called `get_session_factory()`, so in any
+    context where the caller's session used a non-default engine, audit
+    writes went to `settings.database_url` while the business write went
+    wherever the caller's session actually pointed.)
 
     This exists for `AuditRepository.log()`: an audit row written on the
     request's own session is rolled back along with the business
     transaction if the request later fails (see `get_session()` above) —
     exactly the case an audit trail must survive. A session from this
-    function is a separate DB transaction: committing it here does not
-    depend on, and is not undone by, a rollback anywhere else.
+    function is bound to the same engine/pool as the caller but opens its
+    own connection and transaction: committing it here does not depend
+    on, and is not undone by, a rollback on the caller's session.
 
     Unlike `get_session()` / `get_session_context()`, this does NOT
     commit or roll back on the caller's behalf — the caller must commit
@@ -130,11 +145,16 @@ async def get_independent_session() -> AsyncGenerator[AsyncSession, None]:
     propagating as an uncaught exception out of a `yield`.
 
     Usage:
-        async with get_independent_session() as session:
+        async with get_independent_session(caller_session.bind) as session:
             session.add(entry)
             await session.commit()
     """
-    session_factory = get_session_factory()
+    session_factory = async_sessionmaker(
+        bind=bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
     async with session_factory() as session:
         yield session
 
