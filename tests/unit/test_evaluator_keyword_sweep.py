@@ -101,19 +101,28 @@ def _all_forbidden_keywords() -> set[str]:
     return keywords
 
 
-def test_dataset_has_102_unique_forbidden_keywords() -> None:
+def test_dataset_has_101_unique_forbidden_keywords() -> None:
     """
-    Pins the sweep's denominator. Was 95 at first review; now 102 after the
+    Pins the sweep's denominator. Was 95 at first review; 102 after the
     F2 backfill (chg-25 second review) added 7 morphological variants to
     existing forbidden lists: "escalated", "escalates" (pediatric_cases.py
     GC-023), "biologics" (depth_extension_cases.py GC-089), "denying"
     (ob_cases.py GC-068, pulmonology_adult_cases.py GC-052),
     "appropriately", "appropriateness" (denial_cases.py GC-034,
     oncology_breadth_cases.py GC-105), and "electing" (expansion_cases.py
-    GC-033). If this drifts further, it means cases were added/removed/
-    edited -- expected over time, not itself a failure signal.
+    GC-033).
+
+    Now 101: chg-26 removed "PD-L1 TPS" from GC-018. It was a bare criterion
+    NAME rather than an assertion, so it also matched correct rationales
+    reporting the result as ABSENT -- and GC-018's own guidelines_context
+    hands the agent that exact phrase. Measured false positive on 1 of 6 live
+    runs; see test_evaluator_constraint_checks.py::
+    test_naming_an_absent_criterion_is_not_a_fabrication.
+
+    If this drifts further, it means cases were added/removed/edited --
+    expected over time, not itself a failure signal.
     """
-    assert len(_all_forbidden_keywords()) == 102
+    assert len(_all_forbidden_keywords()) == 101
 
 
 def test_whole_word_hits_never_exceed_substring_hits() -> None:
