@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -317,3 +318,265 @@ async def test_audit_request_id_has_no_fk_but_keeps_its_index(_migrated_url: str
         f"audit_logs still has a foreign key ({fk_row}); migration 007 should have dropped it"
     )
     assert index_row is not None, "ix_audit_logs_request_id is missing — the index must survive"
+
+
+# =============================================================================
+# chg-24 FIX 1 (Validator's D4 review, HIGH) -- the in-flight-duplicate race,
+# on REAL Postgres. The Validator's specific worry: Postgres aborts the
+# WHOLE transaction on an IntegrityError (`current transaction is aborted,
+# commands ignored until end of transaction block`), so the resolver's own
+# SELECTs would fail unless the route's `session.rollback()` (authorizations.
+# py, right after catching IntegrityError) genuinely clears that state before
+# the resolver runs. `tests/unit/test_duplicate_request_id_race.py` proves
+# the same two properties on SQLite; these are the Postgres counterparts.
+# =============================================================================
+
+_RACE_TABLES = ["audit_logs", "authorization_decisions", "authorization_requests"]
+
+
+async def _assert_race_outcome_and_third_duplicate_replays(
+    maker, request_id: str, patient_id: str, expected_decision_id: str
+) -> None:
+    """Shared tail for the in-flight-race test: exactly one decision row,
+    the in-flight-conflict audit action present, and a THIRD (later)
+    duplicate submission still never 500s -- idempotent replay of the same
+    decision, no new orchestrator call. Extracted out of the race test
+    itself to stay within ruff's statement budget."""
+    from unittest.mock import AsyncMock, patch
+
+    from pacca.api.routes.authorizations import submit_authorization
+    from pacca.db.repository import AuditRepository, DecisionRepository
+    from pacca.models.authorization import AuthorizationDecision, AuthorizationRequest
+    from pacca.models.enums import AuthorizationStatus, ReviewTier
+
+    async with maker() as verify:
+        decisions = await DecisionRepository(verify).list_by_request_id(request_id)
+        assert len(decisions) == 1, (
+            f"expected exactly 1 decision row after the Postgres race, got {len(decisions)}"
+        )
+        audit_rows = await AuditRepository(verify).get_by_request_id(request_id)
+        assert any(r.action == "submission.in_flight_conflict" for r in audit_rows)
+
+    async with maker() as session_c:
+        third_pd = AsyncMock(
+            return_value=AuthorizationDecision(
+                status=AuthorizationStatus.AUTO_APPROVED,
+                confidence_score=0.97,
+                rationale="test",
+                review_tier_used=ReviewTier.AUTOMATED,
+                cited_evidence_ids=["e1"],
+            )
+        )
+        with patch("pacca.api.routes.authorizations.orchestrator.process_decision", third_pd):
+            result_c = await submit_authorization(
+                request=AuthorizationRequest(**_race_request(request_id, patient_id)),
+                session=session_c,
+            )
+    assert isinstance(result_c, AuthorizationDecision)
+    assert result_c.decision_id == expected_decision_id
+    assert third_pd.call_count == 0
+
+
+def _race_request(request_id: str, patient_id: str) -> dict:
+    return {
+        "request_id": request_id,
+        "patient_id": patient_id,
+        "provider_npi": "1234567890",
+        "clinical_case": {
+            "patient_id": patient_id,
+            "primary_diagnosis_code": "C34.1",
+            "procedure_code": "J9271",
+            "evidence": [
+                {
+                    "id": "e1",
+                    "source_type": "CLINICAL_NOTE",
+                    "description": "Stage IIIA NSCLC",
+                    "original_text": "Patient presents with stage IIIA NSCLC.",
+                    "confidence": 0.95,
+                }
+            ],
+        },
+    }
+
+
+@_SKIP
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_while_first_in_flight_gets_409_on_postgres(
+    _migrated_url: str,
+) -> None:
+    """The race itself, on real Postgres: submit A, and once A is confirmedly
+    inside its own orchestrator call (T1 committed, no decision yet), submit
+    the SAME request_id concurrently. B must get 409, not a second decision
+    row, and not the `current transaction is aborted` PG-specific failure
+    the Validator flagged as the thing most likely to break here.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from pacca.integrations.vector_store import RetrievalOutcome
+    from pacca.models.authorization import AuthorizationDecision, AuthorizationRequest
+    from pacca.models.enums import AuthorizationStatus, ReviewTier
+
+    request_id = "AUTH-PG-RACE-1"
+    patient_id = "P-PG-RACE-1"
+
+    engine = create_async_engine(_migrated_url)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {', '.join(_RACE_TABLES)} RESTART IDENTITY CASCADE"))
+
+    a_reached_llm = asyncio.Event()
+    b_may_release_a = asyncio.Event()
+    orchestrator_call_count = 0
+
+    def _decision() -> AuthorizationDecision:
+        return AuthorizationDecision(
+            status=AuthorizationStatus.AUTO_APPROVED,
+            confidence_score=0.97,
+            rationale="test",
+            review_tier_used=ReviewTier.AUTOMATED,
+            cited_evidence_ids=["e1"],
+        )
+
+    async def mock_process_decision(decision_ctx, *, audit, correlation_id):
+        nonlocal orchestrator_call_count
+        orchestrator_call_count += 1
+        a_reached_llm.set()
+        await b_may_release_a.wait()
+        return _decision()
+
+    with (
+        patch(
+            "pacca.api.routes.authorizations.orchestrator.process_decision",
+            mock_process_decision,
+        ),
+        patch(
+            "pacca.api.routes.authorizations.rag_engine.query",
+            return_value=RetrievalOutcome(
+                text="Mock guideline content", mode="pipeline", degraded=False, reason=None
+            ),
+        ),
+    ):
+        from pacca.api.routes.authorizations import submit_authorization
+
+        async def run_a():
+            session_a = maker()
+            try:
+                return await submit_authorization(
+                    request=AuthorizationRequest(**_race_request(request_id, patient_id)),
+                    session=session_a,
+                )
+            finally:
+                await session_a.close()
+
+        async def run_b():
+            await a_reached_llm.wait()
+            session_b = maker()
+            try:
+                return await submit_authorization(
+                    request=AuthorizationRequest(**_race_request(request_id, patient_id)),
+                    session=session_b,
+                )
+            except Exception as e:
+                return e
+            finally:
+                b_may_release_a.set()
+                await session_b.close()
+
+        result_a, result_b = await asyncio.gather(run_a(), run_b())
+
+    assert isinstance(result_a, AuthorizationDecision)
+    assert isinstance(result_b, HTTPException), (
+        f"expected B to be refused with an HTTPException on real Postgres, got {result_b!r}"
+    )
+    assert result_b.status_code == 409
+    assert orchestrator_call_count == 1
+
+    await _assert_race_outcome_and_third_duplicate_replays(
+        maker, request_id, patient_id, result_a.decision_id
+    )
+
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {', '.join(_RACE_TABLES)} RESTART IDENTITY CASCADE"))
+    await engine.dispose()
+
+
+@_SKIP
+@pytest.mark.asyncio
+async def test_pre_existing_two_decision_state_returns_defined_answer_on_postgres(
+    _migrated_url: str,
+) -> None:
+    """A pre-existing two-decision anomaly (the state the race above could
+    have produced before FIX 1) must return a defined answer -- the earliest
+    decision, replayed -- not `MultipleResultsFound` -> 500, on real
+    Postgres."""
+    from unittest.mock import AsyncMock, patch
+
+    from pacca.db.repository import AuditRepository, AuthorizationRepository, DecisionRepository
+    from pacca.integrations.vector_store import RetrievalOutcome
+    from pacca.models.authorization import AuthorizationDecision, AuthorizationRequest
+    from pacca.models.enums import AuthorizationStatus, ReviewTier
+
+    request_id = "AUTH-PG-ANOMALY-1"
+    patient_id = "P-PG-ANOMALY-1"
+
+    engine = create_async_engine(_migrated_url)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {', '.join(_RACE_TABLES)} RESTART IDENTITY CASCADE"))
+
+    async with maker() as session:
+        req = AuthorizationRequest(**_race_request(request_id, patient_id))
+        await AuthorizationRepository(session).create(req)
+        await session.commit()
+
+        first = AuthorizationDecision(
+            decision_id="PA-pgfirst000000000",
+            status=AuthorizationStatus.AUTO_APPROVED,
+            confidence_score=0.97,
+            rationale="first decision (earliest)",
+            review_tier_used=ReviewTier.AUTOMATED,
+        )
+        second = AuthorizationDecision(
+            decision_id="PA-pgsecond0000000",
+            status=AuthorizationStatus.IN_REVIEW,
+            confidence_score=0.5,
+            rationale="second decision (anomalous duplicate)",
+            review_tier_used=ReviewTier.AUTOMATED,
+        )
+        await DecisionRepository(session).create(first, request_id=request_id)
+        await session.commit()
+        await DecisionRepository(session).create(second, request_id=request_id)
+        await session.commit()
+
+    with (
+        patch(
+            "pacca.api.routes.authorizations.orchestrator.process_decision",
+            new_callable=AsyncMock,
+        ) as no_call_pd,
+        patch(
+            "pacca.api.routes.authorizations.rag_engine.query",
+            return_value=RetrievalOutcome(
+                text="Mock guideline content", mode="pipeline", degraded=False, reason=None
+            ),
+        ),
+    ):
+        from pacca.api.routes.authorizations import submit_authorization
+
+        async with maker() as session2:
+            result = await submit_authorization(
+                request=AuthorizationRequest(**_race_request(request_id, patient_id)),
+                session=session2,
+            )
+
+    assert isinstance(result, AuthorizationDecision)
+    assert result.decision_id == "PA-pgfirst000000000"
+    assert no_call_pd.call_count == 0
+
+    async with maker() as verify:
+        audit_rows = await AuditRepository(verify).get_by_request_id(request_id)
+        assert any(r.action == "submission.multiple_decisions_anomaly" for r in audit_rows)
+
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {', '.join(_RACE_TABLES)} RESTART IDENTITY CASCADE"))
+    await engine.dispose()
