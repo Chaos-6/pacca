@@ -66,6 +66,8 @@ def test_held_out_pipeline_wiring_covers_all_32_cases_with_no_api_calls() -> Non
         system_decision_status: str,
         system_rationale: str,
         system_confidence: float,
+        decision: object | None = None,
+        clinical_case: object | None = None,
     ) -> JudgeVerdict:
         return JudgeVerdict(
             case_id=case.case_id,  # type: ignore[attr-defined]
@@ -73,7 +75,7 @@ def test_held_out_pipeline_wiring_covers_all_32_cases_with_no_api_calls() -> Non
             passed=True,
             judge_reasoning="synthetic verdict for wiring proof — no live API call",
             correct_outcome=True,
-            hallucination_detected=False,
+            fabrication_detected=False,
             missing_citations=[],
         )
 
