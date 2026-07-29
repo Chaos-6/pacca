@@ -62,7 +62,10 @@ DENIAL_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.DENIED,
         expected_branch=EscalationBranch.NONE,
         reasoning_must_include=["off-label", "compendia", "NCCN"],
-        reasoning_must_not_include=["approved", "appropriate"],
+        # chg-25 review (F2): "appropriately"/"appropriateness" backfilled --
+        # whole-word matching no longer catches them implicitly from
+        # "appropriate".
+        reasoning_must_not_include=["approved", "appropriate", "appropriately", "appropriateness"],
         clinical_rationale=(
             "Off-label oncology immunotherapy in a tumor type without NCCN "
             "compendia support and without MSI-high / TMB-high status that "
