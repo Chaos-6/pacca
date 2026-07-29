@@ -60,6 +60,12 @@ Path to the manifest entry: `harness/manifests/iter-N.json`
        time is itself notable — call it out explicitly here rather than picking a stand-in. -->
 
 - **Failure pattern targeted:** one sentence
+- **Baseline claim:** required if this change is `improvement` or `rollback` at
+  iteration >= 18 (D6, forward-only cutover — see docs/HARNESS.md). What did the system do
+  BEFORE this change, how did you verify it (a reproducible command or procedure), and what
+  did that verification produce? Mechanises AGENT_LESSONS.md P-013 — a claim about existing
+  behavior must be measured, not asserted. `new`/`instrumentation` changes, and any change at
+  iteration < 18, are exempt.
 - **Predicted impact:** what should the next eval round show that the previous one did not?
 - **PHI impact:** `none | logged | persisted`
 - **Audit-relevant:** `true | false`
