@@ -101,14 +101,19 @@ def _all_forbidden_keywords() -> set[str]:
     return keywords
 
 
-def test_dataset_has_95_unique_forbidden_keywords() -> None:
+def test_dataset_has_102_unique_forbidden_keywords() -> None:
     """
-    Pins the sweep's denominator so a future reader knows exactly what
-    universe "the other 95 forbidden keywords" (coordinator's phrasing)
-    refers to. If this drifts, it means cases were added/removed/edited --
-    expected over time, not itself a failure signal.
+    Pins the sweep's denominator. Was 95 at first review; now 102 after the
+    F2 backfill (chg-25 second review) added 7 morphological variants to
+    existing forbidden lists: "escalated", "escalates" (pediatric_cases.py
+    GC-023), "biologics" (depth_extension_cases.py GC-089), "denying"
+    (ob_cases.py GC-068, pulmonology_adult_cases.py GC-052),
+    "appropriately", "appropriateness" (denial_cases.py GC-034,
+    oncology_breadth_cases.py GC-105), and "electing" (expansion_cases.py
+    GC-033). If this drifts further, it means cases were added/removed/
+    edited -- expected over time, not itself a failure signal.
     """
-    assert len(_all_forbidden_keywords()) == 95
+    assert len(_all_forbidden_keywords()) == 102
 
 
 def test_whole_word_hits_never_exceed_substring_hits() -> None:
@@ -128,20 +133,26 @@ def test_whole_word_hits_never_exceed_substring_hits() -> None:
 
 def test_exact_set_of_keywords_with_false_positive_exposure_in_current_dataset() -> None:
     """
-    The full sweep result at chg-25 review time: these are the forbidden
-    keywords whose substring-vs-whole-word hit count actually differs across
-    the dataset's own clinical/guideline/rationale text -- i.e. the keywords
-    that had real false-positive exposure under the old (buggy) substring
-    rule. "age" (GC-028/046/048) is the one found by manual review; this
-    sweep additionally surfaces 7 more the manual review did not catch:
-    "appropriate", "approved", "biologic", "complete documentation", "deny",
-    "elective", "escalate".
+    The full sweep result as of the F2 backfill (second review): these are
+    the forbidden keywords whose substring-vs-whole-word hit count actually
+    differs across the dataset's own clinical/guideline/rationale text --
+    i.e. the keywords that had real false-positive exposure under the old
+    (buggy) substring rule. "age" (GC-028/046/048) is the one found by
+    manual review; the first sweep surfaced 7 more: "appropriate",
+    "approved", "biologic", "complete documentation", "deny", "elective",
+    "escalate". After backfilling morphological variants for those (F2),
+    two of the NEW backfilled keywords -- "appropriately" and
+    "appropriateness" -- turn out to have the identical substring-vs-
+    whole-word property themselves (e.g. "inappropriately" substring-
+    contains "appropriately" but is correctly excluded by whole-word
+    matching) -- a recursive confirmation the fix is doing its job on the
+    newly-added keywords too, not just the original 8.
 
-    If this test fails because the SET changed: a new/edited case introduced
-    (or removed) false-positive exposure for some keyword. Inspect which
-    keyword changed and whether it represents a genuine new exposure (fix
-    the case's keyword choice) or is incidental dataset growth (update this
-    pinned set with the new sweep result).
+    If this test fails because the SET changed: a new/edited case
+    introduced (or removed) false-positive exposure for some keyword.
+    Inspect which keyword changed and whether it represents a genuine new
+    exposure (fix the case's keyword choice) or is incidental dataset
+    growth (update this pinned set with the new sweep result).
     """
     corpus = _corpus()
     changed = {
@@ -152,6 +163,8 @@ def test_exact_set_of_keywords_with_false_positive_exposure_in_current_dataset()
     assert changed == {
         "age",
         "appropriate",
+        "appropriately",
+        "appropriateness",
         "approved",
         "biologic",
         "complete documentation",
@@ -169,3 +182,31 @@ def test_age_keyword_hit_counts_before_and_after() -> None:
     corpus = _corpus()
     assert _substring_hits("age", corpus) == 152
     assert _whole_word_hits("age", corpus) == 42
+
+
+def test_f2_backfilled_variants_are_now_real_forbidden_keywords() -> None:
+    """
+    F2 (second review): whole-word matching removes false positives, but it
+    also stops matching genuine morphological variants of a forbidden
+    keyword implicitly -- "escalated" is no longer caught by forbidding
+    "escalate". This sweep only measures the CASE-AUTHORED corpus text
+    (clinical_notes/guidelines_context/clinical_rationale/judge_scoring_
+    criteria), not arbitrary agent output, so it cannot prove a variant
+    catches a real rationale -- that is what
+    test_evaluator_constraint_checks.py's dedicated backfill tests do. This
+    test only pins that the 7 backfilled keywords were actually added to
+    the dataset (present in the forbidden-keyword universe) after F2.
+    """
+    forbidden = _all_forbidden_keywords()
+    for variant in (
+        "escalated",
+        "escalates",
+        "biologics",
+        "denying",
+        "appropriately",
+        "appropriateness",
+        "electing",
+    ):
+        assert variant in forbidden, (
+            f"{variant!r} was not found in any case's reasoning_must_not_include"
+        )
