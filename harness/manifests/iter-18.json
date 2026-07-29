@@ -30,10 +30,6 @@
       "root_cause": "The judge prompt rendered each case's reasoning_must_not_include list under the header 'Keywords that must NOT appear (hallucination markers)', and the metric was the judge's own self-reported hallucination_detected boolean. correct_outcome was likewise judge-reported.",
       "evidence": [
         {
-          "source": "git show fa71251:tests/clinical/evaluator.py | grep -n 'must_include\\|must_not_include\\|correct_outcome'",
-          "note": "BASELINE CLAIM: At fa71251 the evaluator performed no Python keyword containment; the check was judge-semantic only, and correct_outcome was judge-self-reported. RESULT: Only lines 359 and 362 (both inside the judge-prompt template) and line 449 correct_outcome=bool(verdict_data.get(...)). No containment check existed in code. (This belongs in a dedicated `baseline` field; the schema addition is spec'd as D6 and awaits a grandfathering decision, so it is recorded here as evidence.)"
-        },
-        {
           "source": "clinical gate logs, iter-16 vs iter-17 (same GC-028, adjacent HEADs)",
           "note": "Identical system behaviour: AUTO_APPROVED both runs, same criteria cited, accuracy 87.2% (34/39) and an identical failed-case list. The judge scored it 2 ('anti-pattern') then 1 ('hallucination'), flipping the headline count 0 to 1. correct_outcome also flipped True to False."
         },
@@ -66,7 +62,12 @@
       "why_this_component": "The evaluator is the instrument every other number depends on. A metric that moves without the system moving is not a measurement, and it defeats audit: a reviewer asking 'how many hallucinations' got a number that differed between two runs of unchanged code.",
       "phi_impact": "none",
       "audit_relevant": true,
-      "rollback_plan": "Revert the chg-25 commits. No src/ file is touched and no schema changes, so the runtime is unaffected; the evaluator returns to a single judge-reported counter. The backfilled keyword variants in the case files would need reverting separately if the matcher reverts to substring."
+      "rollback_plan": "Revert the chg-25 commits. No src/ file is touched and no schema changes, so the runtime is unaffected; the evaluator returns to a single judge-reported counter. The backfilled keyword variants in the case files would need reverting separately if the matcher reverts to substring.",
+      "baseline": {
+        "claim": "At fa71251 the evaluator performed no Python keyword containment; the check was judge-semantic only, and correct_outcome was judge-self-reported.",
+        "verified_by": "git show fa71251:tests/clinical/evaluator.py | grep -n 'must_include\\|must_not_include\\|correct_outcome'",
+        "result": "Only lines 359 and 362 (both inside the judge-prompt template) and line 449 correct_outcome=bool(verdict_data.get(...)). No containment check existed in code."
+      }
     }
   ],
   "verdicts": [
