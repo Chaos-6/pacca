@@ -265,7 +265,10 @@ ONCOLOGY_BREADTH_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.DENIED,
         expected_branch=EscalationBranch.NONE,
         reasoning_must_include=["first-line", "monotherapy", "sequenc"],
-        reasoning_must_not_include=["approved", "appropriate"],
+        # chg-25 review (F2): "appropriately"/"appropriateness" backfilled --
+        # whole-word matching no longer catches them implicitly from
+        # "appropriate".
+        reasoning_must_not_include=["approved", "appropriate", "appropriately", "appropriateness"],
         clinical_rationale=(
             "This is a line-of-therapy (sequencing) error, not an off-label "
             "or formulary issue. Enfortumab vedotin is an on-label, "
