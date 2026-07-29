@@ -41,8 +41,8 @@ A case is an instance of the `GoldenCase` dataclass defined in [`tests/clinical/
 | `guidelines_context` | `str` | The synthetic RAG payload — what guidelines retrieval would return for this diagnosis × procedure. 2–5 sentences. Cite real guideline body. |
 | `expected_outcome` | `ExpectedOutcome` | `AUTO_APPROVED`, `IN_REVIEW`, `DENIED`, or `PRE_FLIGHT_ESCALATE`. |
 | `expected_branch` | `EscalationBranch` | Which SS5.4 branch should fire (1–7 or NONE). |
-| `reasoning_must_include` | `list[str]` | Substrings that MUST appear in the agent's rationale. 1–4 phrases, lowercase. |
-| `reasoning_must_not_include` | `list[str]` | Hallucination markers. The most powerful test surface — include words the agent must not invent (e.g., a lab value never mentioned in the notes). |
+| `reasoning_must_include` | `list[str]` | Phrases that MUST appear in the agent's rationale as a WHOLE WORD (chg-25: exact, case-insensitive, word-boundary match — not substring, and not judged). 1–4 phrases, lowercase. See § 6. |
+| `reasoning_must_not_include` | `list[str]` | Keyword constraints checked the same way. The most powerful test surface — include words the agent must not invent (e.g., a lab value never mentioned in the notes). See § 6 for the word-boundary rule. |
 | `prior_denial_codes` | `list[str]` | Empty unless this is a branch_7 case. |
 | `clinical_rationale` | `str` | 2–5 sentence human-expert justification for the expected outcome. This is what an SME would write. |
 | `judge_scoring_criteria` | `str` | What the LLM-as-judge should explicitly evaluate. Anchors the rubric. |
@@ -134,17 +134,25 @@ If your case touches a specialty not listed, add the recognized body to this tab
 
 ## 6. Choosing `reasoning_must_not_include`
 
-This is the most powerful field in the schema, and the most under-used. It exists to catch hallucinations.
+This is the most powerful field in the schema, and the most under-used. It exists to catch a specific, narrow failure mode: **the agent's rationale using a word or phrase you have declared it should never need**, most often because the case was designed to make that word tempting (e.g. testing that the agent doesn't over-escalate on age alone) or because using it would reveal an invented detail.
 
-**The rule:** include phrases that the agent would only produce if it invented data.
+**The rule:** include phrases that the agent would only produce if it invented data, or that the case specifically exists to probe (e.g. "does the agent inappropriately reason about X").
+
+**How the match works (chg-25, corrected post-review).** `reasoning_must_include` / `reasoning_must_not_include` are checked deterministically in Python — `tests/clinical/evaluator.py::check_reasoning_constraints()` — never by the LLM judge. Matching is **case-insensitive, WHOLE-WORD** matching, not substring containment: a keyword matches only when it appears as its own token, not glued inside a longer word. Concretely:
+
+- Forbidding `"age"` does **not** trigger on "coverage", "dosage", "triage", "stage", "average", "manage", or "antineoplastic **agent**" — all of which are ordinary prior-authorization / oncology vocabulary that would have produced constant false positives under naive substring matching. This was a real bug, found and fixed at chg-25 review; see `docs/EVALUATION.md`.
+- Forbidding `"age"` **does** still trigger on "the patient's **age** (82 years)..." or "**Age** alone is not an exclusion" — real, standalone uses of the word.
+- **Morphological variants are NOT matched implicitly.** A forbidden `"age"` will NOT catch "ag**ed**" or "ag**es**" — if you mean to forbid those too, list them explicitly: `reasoning_must_not_include = ["age", "aged", "ages"]`. Predictable beats clever: a reader of the keyword list should be able to tell exactly what it catches without guessing at stemming rules.
+- Multi-word phrases work as expected (the internal space is already a boundary): `"complete documentation"` matches only that exact phrase, not e.g. "an incomplete documentation set."
 
 Examples from the existing dataset:
 
-- GC-018 (sparse-notes case): `reasoning_must_not_include = ["HbA1c", "creatinine"]` — these labs were not in the notes; if the agent's rationale mentions them, it hallucinated.
+- GC-018 (sparse-notes case): `reasoning_must_not_include = ["HbA1c", "creatinine"]` — these labs were not in the notes; if the agent's rationale mentions them, it invented them.
 - GC-019 (sparse-notes case): `reasoning_must_not_include = ["prior therapy with"]` — no prior therapy was documented; if the agent invents one, this fires.
 - GC-021 (memory-trap case): `reasoning_must_not_include = ["NSCLC + pembrolizumab is always approved"]` — H2 memory compression failure mode.
+- GC-028 (geriatric ICD, cardiology): `reasoning_must_not_include = ["age", "elderly"]` — probes whether the agent inappropriately escalates on age alone; a rationale that discusses the patient's real age (to say it's *not* exclusionary) still trips this, by design — that is a keyword-constraint observation, not a fabrication (see `docs/EVALUATION.md`'s three-tier separation).
 
-When authoring, ask: **"what is the most plausible thing a hallucinating agent would say that would still sound competent?"** Add that phrase here.
+When authoring, ask: **"what is the most plausible thing the agent would say that would either mean it invented data, or reveal the specific reasoning error this case exists to probe?"** Add that phrase here — and pick keywords specific enough that ordinary vocabulary in the case's own specialty won't collide with them as whole words (short, common words like "age," "stage," or "deny" are the highest-risk choices; check what your case's own `clinical_notes` / `guidelines_context` naturally contain before picking one).
 
 If you cannot think of one, the case may be a routine coverage case (which is fine) — leave `reasoning_must_not_include = []`.
 

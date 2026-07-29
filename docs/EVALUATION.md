@@ -55,9 +55,11 @@ rationale lives in the chg-25 design spec; this section states the outcome):
 
 1. **Tier 1 (deterministic, exact, zero variance).** `reasoning_must_include`
    / `reasoning_must_not_include` are checked by
-   `check_reasoning_constraints()` in plain Python. The judge is no longer
-   shown these lists **at all** — it cannot mislabel what it is never shown.
-   Reported as `EvaluationReport.constraint_violations`: a list of
+   `check_reasoning_constraints()` in plain Python, using **case-insensitive
+   whole-word matching** (not substring containment — see the correction
+   below). The judge is no longer shown these lists **at all** — it cannot
+   mislabel what it is never shown. Reported as
+   `EvaluationReport.constraint_violations`: a list of
    `(case_id, missing, forbidden_present)`.
 2. **Tier 2 (deterministic, exact).** Outcome correctness
    (`outcome_matches_expected()`) and evidence grounding
@@ -73,6 +75,32 @@ rationale lives in the chg-25 design spec; this section states the outcome):
    the prompt: discussing a fact that *is* in the notes (e.g. the patient's
    age) is never fabrication, even if a keyword constraint elsewhere flags it
    as an unwanted topic. Reported as `EvaluationReport.fabrications`.
+
+**Correction, same review (Tier 1 matching rule).** The first version of this
+change implemented Tier 1 as case-insensitive SUBSTRING containment, with a
+docstring claiming it "reproduces exactly" the pre-chg-25 judge behavior. That
+claim was checked against `fa71251` and was **false**: the pre-chg-25 judge
+prompt contained no Python containment check anywhere — it rendered the
+keyword list as text for the judge to apply SEMANTIC judgment to. A judge
+would never have flagged "coverage" or "average" as containing "age";
+substring matching does. Measured against the full ~105-case dataset's own
+clinical/guideline/rationale text: forbidding `"age"` produced **152**
+substring hits and only **42** whole-word hits — the other **110** were
+false positives on ordinary prior-authorization/oncology vocabulary
+("coverage", "dosage", "stage", "average", "antineoplastic **agent**", etc.),
+exactly the vocabulary this system reasons over daily. A sweep of all 95
+forbidden keywords in the dataset found 7 more with the same exposure:
+`"appropriate"`, `"approved"`, `"biologic"`, `"complete documentation"`,
+`"deny"`, `"elective"`, `"escalate"`. The check now uses whole-word matching
+(`(?<!\w)keyword(?!\w)`, not plain `\bkeyword\b` — several real forbidden
+keywords start/end in non-word characters, e.g. `"$100,000"`, `"62%"`, which
+`\b` alone fails to match at all). This is still a genuinely different rule
+from the old judge-semantic one — not a restoration of it — and that
+trade-off (exactness and zero variance, in exchange for no semantic
+latitude) is stated in `ConstraintCheck`'s docstring rather than claimed
+equivalent to what it replaced. See `docs/CASE_AUTHORING_GUIDE.md` § 6 for
+the case-authoring guidance this implies (pick specific keywords; list
+morphological variants explicitly — they are not matched implicitly).
 
 **`EvaluationReport.hallucinations` is removed, not aliased.** A field whose
 meaning changed must not keep its old name — code that still reads
