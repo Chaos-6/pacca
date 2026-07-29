@@ -478,7 +478,15 @@ class EvaluationReport:
     def summary(self) -> str:
         """Return a human-readable summary for test output."""
         status = "PASSED" if self.passed_ci_gate else "FAILED"
-        constraint_ids = [cv.case_id for cv in self.constraint_violations]
+        # Reported SEPARATELY, never merged. Omitting a required keyword is a
+        # completeness signal; stating a forbidden one is a safety/bias signal and,
+        # on the GC-018/019 traps, a fabrication signature. A single merged count
+        # reproduces one level down the exact conflation chg-25 removed from
+        # `hallucinations` -- and did: the first live run reported "20 cases"
+        # including GC-018/019, which read as though the traps had fired when the
+        # entries were merely missing keywords.
+        missing_ids = [cv.case_id for cv in self.constraint_violations if cv.missing]
+        forbidden_ids = [cv.case_id for cv in self.constraint_violations if cv.forbidden_present]
         return (
             f"Clinical Evaluation: {status}\n"
             f"  Accuracy: {self.accuracy:.1%} "
@@ -487,7 +495,10 @@ class EvaluationReport:
             f"  Accuracy (in-sample):  {_render_subset_accuracy(self.accuracy_in_sample, self.in_sample_passed, self.in_sample_total)}\n"
             f"  Accuracy (held-out):   {_render_subset_accuracy(self.accuracy_held_out, self.held_out_passed, self.held_out_total)}\n"
             f"  Fabrications (judge):            {len(self.fabrications)} cases{_render_case_list(self.fabrications)}\n"
-            f"  Constraint violations (exact):   {len(constraint_ids)} cases{_render_case_list(constraint_ids)}\n"
+            f"  Missing required keywords (exact): {len(missing_ids)} cases"
+            f"{_render_case_list(missing_ids)}\n"
+            f"  Forbidden keywords present (exact): {len(forbidden_ids)} cases"
+            f"{_render_case_list(forbidden_ids)}\n"
             f"  Ungrounded citations (exact):    {len(self.ungrounded_citations)} cases{_render_case_list(self.ungrounded_citations)}\n"
             f"  Outcome mismatches (exact):      {len(self.outcome_mismatches)} cases{_render_case_list(self.outcome_mismatches)}\n"
             f"  Failed cases: {', '.join(self.failed_cases) if self.failed_cases else 'none'}"
