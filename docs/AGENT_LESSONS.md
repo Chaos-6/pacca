@@ -273,6 +273,23 @@ Run against the three above, each premise dies in about a minute:
 
 ---
 
+### P-017 · Counting unique KEYS is not counting THINGS — and a collision makes both counts look right
+**Symptom.** The clinical dataset was reported as **105 cases** everywhere — `holdout.all_dataset_case_ids()`, `DATASET_SUFFICIENCY.md`, the PRD, the CHANGELOG. It held **108 case objects**. Three ids (GC-101/102/103) each identified two entirely different clinical cases.
+
+**Cause.** Every measurement counted unique *ids*: `all_dataset_case_ids()` returns `frozenset[str]`, and the sufficiency doc said "verified by unique-ID count". A set collapses a collision to one entry, so the count is self-consistent, plausible, and wrong. The guard that should have caught it — `test_holdout_and_in_sample_partition_the_full_dataset`, whose docstring promises "No case may be silently dropped" — compares id sets too, so it passed while three cases were dropped.
+
+Worth noting that **neither authoring PR was careless**. `RUNBOOK_iter6.md:514` records "dataset is at GC-100; these are GC-101..GC-103", correct on 2026-05-31. The 2026-06-06 PR checked independently, reached the same answer, and was wrong — because the only check available to it counted ids, and the three new cases were invisible to an id count that had already absorbed them. Two careful people, the same broken instrument.
+
+**Rules.**
+1. **Count objects, then assert `len(objects) == len({keys})`.** The difference *is* the collision census. Any collection whose elements carry a natural key needs this, and it is one line.
+2. **De-duplicate by object identity, not by key**, when the key's uniqueness is what you are testing. `tests/unit/test_dataset_integrity.py::_distinct_cases` uses `id(obj)`; keying by `case_id` would have hidden exactly what it exists to find.
+3. **Before allocating a new id range, enumerate — do not trust a documented high-water mark.** "The dataset is at GC-100" was true when written and stale a week later, and nothing recomputed it.
+4. **Authored ≠ evaluated. Keep a reachability census.** Correcting the count exposed the bigger fact: only **71 of 108** case objects are executed by any run (39 in-sample gate, 32 held-out). The other 37 are imported and statically keyword-swept, so they *look* wired. A dataset-size claim that does not distinguish authored from evaluated overstates coverage by a third.
+
+**Related.** P-016 (assert the denominator) is the same instinct one level down: there, a scan examined nothing; here, a count measured the wrong noun. Both produce a green, plausible number.
+
+---
+
 ## Git & PR workflow (PACCA-specific overlay on the global rule L-001)
 
 ### P-006 · PACCA defaults to branch-and-PR. No direct pushes to main.
