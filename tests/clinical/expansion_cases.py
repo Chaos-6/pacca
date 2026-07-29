@@ -476,7 +476,10 @@ EXPANSION_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.AUTO_APPROVED,
         expected_branch=EscalationBranch.BRANCH_1_AUTO_APPROVE,
         reasoning_must_include=["fertility", "chemotherapy", "ASCO"],
-        reasoning_must_not_include=["elective", "cosmetic"],
+        # chg-25 review (F2): "electing" backfilled -- same low-risk gerund
+        # pattern as "denying"/"escalating" (a positive claim, not prone to
+        # the negation false-positive risk of e.g. "denied"/"approval").
+        reasoning_must_not_include=["elective", "electing", "cosmetic"],
         clinical_rationale=(
             "Medically-indicated fertility preservation prior to "
             "gonadotoxic chemotherapy in a 29-year-old who desires future "
