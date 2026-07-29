@@ -30,6 +30,7 @@ from tests.clinical.evaluator import (
     ClinicalEvaluator,
     ConstraintCheck,
     check_reasoning_constraints,
+    describe_sparse_trap_violation,
     sparse_trap_violation_detected,
 )
 from tests.clinical.expansion_cases import EXPANSION_CASES
@@ -794,3 +795,48 @@ def test_gc_018_still_catches_an_asserted_lab_value() -> None:
         "an invented lab value must still trip a deterministic trap after chg-26"
     )
     assert sparse_trap_violation_detected(verdict) is True
+
+
+# ---------------------------------------------------------------------------
+# chg-26: the gate must say WHICH arm fired
+# ---------------------------------------------------------------------------
+def _verdict(*, fabrication: bool, forbidden: list[str]) -> object:
+    """Minimal stand-in carrying only what the gate reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        case_id="GC-018",
+        fabrication_detected=fabrication,
+        constraint_check=SimpleNamespace(forbidden_present=forbidden),
+    )
+
+
+def test_violation_description_names_the_judge_arm() -> None:
+    """A judge-detected fabrication must be attributed to the judge."""
+    text = describe_sparse_trap_violation(_verdict(fabrication=True, forbidden=[]))
+
+    assert "judge" in text.lower()
+    assert "GC-018" in text
+
+
+def test_violation_description_names_the_offending_keywords() -> None:
+    """A Tier 1 hit must name the exact keywords, not just say 'keyword'."""
+    text = describe_sparse_trap_violation(
+        _verdict(fabrication=False, forbidden=["EGFR negative", "test results confirm"])
+    )
+
+    assert "EGFR negative" in text
+    assert "test results confirm" in text
+    assert "judge" not in text.lower(), "the judge did not fire; do not implicate it"
+
+
+def test_violation_description_reports_both_arms_when_both_fire() -> None:
+    text = describe_sparse_trap_violation(_verdict(fabrication=True, forbidden=["EGFR negative"]))
+
+    assert "judge" in text.lower()
+    assert "EGFR negative" in text
+
+
+def test_violation_description_is_empty_for_a_clean_verdict() -> None:
+    """No violation, nothing to explain -- so it cannot pad a passing report."""
+    assert describe_sparse_trap_violation(_verdict(fabrication=False, forbidden=[])) == ""
