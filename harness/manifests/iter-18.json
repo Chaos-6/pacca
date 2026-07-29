@@ -1,0 +1,95 @@
+{
+  "iteration": 18,
+  "iteration_tag": "harness-iter-18",
+  "iso_date": "2026-07-28",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-17",
+  "summary": "chg-25 separates what is checkable from what is judged. PACCA's headline anti-hallucination metric was an LLM's self-reported boolean, from a prompt that labelled keyword constraints as 'hallucination markers'. GC-028 produced the same violation and the same decision across two runs; the judge called it an anti-pattern once and a hallucination the next, flipping the count 0 to 1 with no system change. correct_outcome flipped too.",
+  "changes": [
+    {
+      "id": "chg-25",
+      "type": "improvement",
+      "description": "Three-tier evaluator: Tier 1 deterministic keyword checks (whole-word), Tier 2 deterministic outcome and evidence grounding reusing the runtime detector, Tier 3 judge for reasoning quality and fabrication only. Removes the keyword lists from the judge prompt, replaces the single 'hallucinations' counter with three independent ones, and adds a judge stability harness.",
+      "files": [
+        "tests/clinical/evaluator.py",
+        "tests/clinical/judge_stability.py",
+        "tests/clinical/test_clinical_accuracy.py",
+        "tests/clinical/investigate_case.py",
+        "tests/unit/test_evaluator_constraint_checks.py",
+        "tests/unit/test_evaluator_judge_prompt.py",
+        "tests/unit/test_evaluator_report_separation.py",
+        "tests/unit/test_evaluator_evidence_grounding.py",
+        "tests/unit/test_evaluator_keyword_sweep.py",
+        "tests/unit/test_judge_stability_harness.py",
+        "docs/EVALUATION.md",
+        "docs/CASE_AUTHORING_GUIDE.md",
+        "Makefile"
+      ],
+      "failure_pattern": "The project's most safety-critical published number moved without the system moving. A deterministic string-containment check was delegated to a nondeterministic judge, and its result was conflated with genuine fabrication under one counter.",
+      "root_cause": "The judge prompt rendered each case's reasoning_must_not_include list under the header 'Keywords that must NOT appear (hallucination markers)', and the metric was the judge's own self-reported hallucination_detected boolean. correct_outcome was likewise judge-reported.",
+      "evidence": [
+        {
+          "source": "git show fa71251:tests/clinical/evaluator.py | grep -n 'must_include\\|must_not_include\\|correct_outcome'",
+          "note": "BASELINE CLAIM: At fa71251 the evaluator performed no Python keyword containment; the check was judge-semantic only, and correct_outcome was judge-self-reported. RESULT: Only lines 359 and 362 (both inside the judge-prompt template) and line 449 correct_outcome=bool(verdict_data.get(...)). No containment check existed in code. (This belongs in a dedicated `baseline` field; the schema addition is spec'd as D6 and awaits a grandfathering decision, so it is recorded here as evidence.)"
+        },
+        {
+          "source": "clinical gate logs, iter-16 vs iter-17 (same GC-028, adjacent HEADs)",
+          "note": "Identical system behaviour: AUTO_APPROVED both runs, same criteria cited, accuracy 87.2% (34/39) and an identical failed-case list. The judge scored it 2 ('anti-pattern') then 1 ('hallucination'), flipping the headline count 0 to 1. correct_outcome also flipped True to False."
+        },
+        {
+          "source": "git show fa71251:tests/clinical/evaluator.py | grep must_include",
+          "note": "Returns only the two prompt-template lines, disproving the first implementation's claim that substring matching reproduced an existing Python check. Recorded as AGENT_LESSONS P-013."
+        },
+        {
+          "source": "whole-word matcher comparison, executed",
+          "note": "Forbidden 'age' under substring also matched coverage, dosage, triage, manage, management, damage, average, stage, usage, percentage, agent, agenda. Across the dataset 'age' fell from 152 hits to 42; 8 of 95 forbidden keywords changed behaviour."
+        },
+        {
+          "source": "adversarial validation, PROBE 0",
+          "note": "Re-measured the base suite at 940, not the 939 the spec asserted and the executor carried forward unmeasured."
+        }
+      ],
+      "predicted_fixes": [
+        "constraint_violations, ungrounded_citations and correct_outcome can move only when the system's actual output moves. Verified deterministic with zero variance; the GC-028 flip is impossible for these counters.",
+        "GC-046 and GC-048 stop reporting a false constraint violation on rationales containing 'coverage' and 'average'; GC-028 still violates, now for the right reason.",
+        "The GC-018/GC-019 sparse-fabrication gate fires when EITHER the judge reports fabrication OR a Tier-1 trap keyword is present, so it no longer rests solely on an LLM boolean."
+      ],
+      "risk_cases": [
+        "The first implementation used naive substring matching, justified by a false claim about the base. It would have reported deterministic false positives on GC-028/046/048 for any rationale containing 'coverage', 'dosage' or 'stage' -- common vocabulary in a prior-authorisation oncology system. Corrected to whole-word.",
+        "A word-boundary (\\b) matcher would have failed silently on keywords with non-word edges: '$100,000' and '62%' drop to zero hits. The dataset authors such keywords in reasoning_must_include, so \\b would have produced permanent false 'missing' violations. Lookarounds used instead.",
+        "Whole-word matching removes genuine true positives as well as false ones -- 'escalated', 'biologics', 'appropriately' no longer match their stems. Backfilled into the affected cases; 'denied'/'approval' deliberately not backfilled because a correct rationale can say 'should not be denied'.",
+        "fabrications remains a judge boolean by design -- the genuinely judgmental residue. It is narrowed by definition and counter-example, instrumented with provenance and a stability harness, and can still move without the system moving. That is stated rather than hidden.",
+        "PRE-EXISTING, not introduced here: GC-101/102/103 are duplicated across adult_complexity_cases.py and oncology_breadth_cases.py -- 108 case objects, 105 unique ids. Counters keyed by case_id are ambiguous for those three. The holdout is uncontaminated (all in-sample) but holdout.py's partition guard passes only because it compares id sets, not case objects. Needs its own change."
+      ],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "The evaluator is the instrument every other number depends on. A metric that moves without the system moving is not a measurement, and it defeats audit: a reviewer asking 'how many hallucinations' got a number that differed between two runs of unchanged code.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Revert the chg-25 commits. No src/ file is touched and no schema changes, so the runtime is unaffected; the evaluator returns to a single judge-reported counter. The backfilled keyword variants in the case files would need reverting separately if the matcher reverts to substring."
+    }
+  ],
+  "verdicts": [
+    {
+      "change_id": "chg-24",
+      "previous_iteration_tag": "harness-iter-17",
+      "outcome": "keep",
+      "verified_fixes": [
+        "Lock hold 0.5095s to 0.0013s (SQLite) and 0.5436s to 0.0026s (Postgres); engine.pool.checkedout() == 0 during the LLM window, independently reproduced.",
+        "SQLite concurrent completions 1/10 to 10/10; Postgres 15/20 to 20/20 on a pool of 15; audit_write_failed 30 to 0 and 65 to 0.",
+        "Confirmed in the live clinical gate at merge HEAD: audit_write_failed 55 to 0, 'database is locked' 55 to 0, accuracy unchanged at 87.2%.",
+        "The duplicate-request_id contract holds identically on real Postgres 16, including the cross-patient 409 with no decision content in the body."
+      ],
+      "missed_fixes": [
+        "A duplicate arriving while the first submission was in flight produced two decisions and then a permanent 500 for that request_id. The spec named two states where three existed. Fixed in the same iteration with an age-vs-agent_timeout heuristic and a decision lookup that cannot raise on multiplicity.",
+        "The resume path re-pinned a connection across the LLM call -- the exact defect the change removes, alive on one path. Fixed with a path-specific commit."
+      ],
+      "false_predicted_fixes": [],
+      "verified_risks": [
+        "Keeping the injected session rather than a session factory was a deliberate deviation forced by a contradiction in the spec (a factory AND ~24 unmodified tests). It is materially equivalent on the normal path and was NOT on the resume path -- recorded as lessons L-032."
+      ],
+      "unforeseen_regressions": [],
+      "notes": "The in-flight heuristic is a heuristic, not a lease; a request exceeding agent_timeout is misclassified as dead. A claimed_at/worker_id lease and a UNIQUE constraint on authorization_decisions.request_id are the rigorous fixes and both need migrations."
+    }
+  ]
+}
