@@ -50,7 +50,9 @@ DEPTH_EXTENSION_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.AUTO_APPROVED,
         expected_branch=EscalationBranch.BRANCH_1_AUTO_APPROVE,
         reasoning_must_include=["pediatric", "UC", "mesalamine"],
-        reasoning_must_not_include=["biologic", "experimental"],
+        # chg-25 review (F2): "biologics" (plural) backfilled -- whole-word
+        # matching no longer catches it implicitly from "biologic".
+        reasoning_must_not_include=["biologic", "biologics", "experimental"],
         clinical_rationale="Mild pediatric UC — 5-ASA first-line per ESPGHAN. Clean approve.",
         judge_scoring_criteria="Score highly if rationale cites PUCAI + ESPGHAN. Should NOT over-escalate on pediatric age alone since severity is mild.",
     ),
