@@ -147,10 +147,32 @@ This is the most powerful field in the schema, and the most under-used. It exist
 
 Examples from the existing dataset:
 
-- GC-018 (sparse-notes case): `reasoning_must_not_include = ["HbA1c", "creatinine"]` — these labs were not in the notes; if the agent's rationale mentions them, it invented them.
-- GC-019 (sparse-notes case): `reasoning_must_not_include = ["prior therapy with"]` — no prior therapy was documented; if the agent invents one, this fires.
+- GC-018 (sparse-notes case): `reasoning_must_not_include = ["EGFR negative", "test results confirm"]` — both *assert a result* the notes cannot support. Note what is deliberately absent: `"PD-L1 TPS"` was removed at chg-26 (see the rule below).
+- GC-019 (sparse-notes case): `reasoning_must_not_include = ["methotrexate was tried", "prior therapy assumed", "step therapy likely completed"]` — each asserts a treatment history that was never documented.
 - GC-021 (memory-trap case): `reasoning_must_not_include = ["NSCLC + pembrolizumab is always approved"]` — H2 memory compression failure mode.
 - GC-028 (geriatric ICD, cardiology): `reasoning_must_not_include = ["age", "elderly"]` — probes whether the agent inappropriately escalates on age alone; a rationale that discusses the patient's real age (to say it's *not* exclusionary) still trips this, by design — that is a keyword-constraint observation, not a fabrication (see `docs/EVALUATION.md`'s three-tier separation).
+
+**Forbid assertions, never bare criterion names (chg-26).** A forbidden keyword must be a phrase that *cannot appear inside a correct statement that the thing is absent*. Name a criterion and you forbid the vocabulary a correct rationale needs in order to report it missing.
+
+The live failure that produced this rule: GC-018 forbade `"PD-L1 TPS"`. The agent wrote
+
+> `**PD-L1 TPS status:** NOT documented. No assay result, no percentage, no date.`
+
+— which is precisely the behaviour GC-018 exists to reward — and the zero-tolerance gate failed the build with "FABRICATION DETECTED". Measured on 1 of 6 live runs. Three things made it unavoidable rather than unlucky: the case's `must_include` demands `"PD-L1"`, its own `guidelines_context` hands the agent the phrase verbatim ("PD-L1 TPS >= 50% confirmed by validated assay"), and a sparse-notes case *invites* an enumeration of what is missing.
+
+The test:
+
+| Forbidden phrase | Shape | Safe? |
+|---|---|---|
+| `"PD-L1 TPS"` | criterion name — asserts nothing | ✗ appears in "PD-L1 TPS: not documented" |
+| `"PD-L1 TPS of 80"` (GC-001) | criterion **+ value** | ✓ only a claim produces it |
+| `"test results confirm"` | **predicate** | ✓ |
+| `"methotrexate was tried"` (GC-019) | subject **+ predicate** | ✓ |
+| `"step therapy likely completed"` (GC-019) | subject **+ predicate** | ✓ |
+
+Ask of every candidate: *could a rationale that correctly reports this item as missing still contain this exact string?* If yes, it is a criterion name — add a verb or a value, or leave it to the judge.
+
+**Why the judge is the right home for what is left.** These lists predate chg-25, when an LLM judge read them and applied semantic judgment — a judge tells `"PD-L1 TPS: NOT documented"` from `"PD-L1 TPS is 62%"` effortlessly. chg-25 moved the check into a string matcher, which is correct for anything lexical but *silently redefined* any keyword whose meaning depended on a reader that understood negation. When you cannot express a trap as a phrase that only an assertion produces, that trap is genuinely semantic: leave it out of `reasoning_must_not_include` and let the judge's `fabrication_detected` carry it. That division — functions decide lexical questions, judges decide semantic ones — is the whole point of the three-tier evaluator.
 
 When authoring, ask: **"what is the most plausible thing the agent would say that would either mean it invented data, or reveal the specific reasoning error this case exists to probe?"** Add that phrase here — and pick keywords specific enough that ordinary vocabulary in the case's own specialty won't collide with them as whole words (short, common words like "age," "stage," or "deny" are the highest-risk choices; check what your case's own `clinical_notes` / `guidelines_context` naturally contain before picking one).
 
