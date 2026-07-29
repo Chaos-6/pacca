@@ -17,7 +17,7 @@ Teaching note — why audit logging matters here:
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,6 +30,9 @@ from ...agents.orchestrator import DecisionContext, Orchestrator
 
 # Minimum-necessary scope guard (P-4 / chg-8) + the fail-closed escalation path.
 from ...agents.scope_guard import ScopeViolation, enforce_scope
+
+# Structured logging (P-002): never stdlib `logging.getLogger` in PACCA code.
+from ...config.logging import get_logger
 
 # get_settings() is the cached, process-start snapshot; effective_settings()
 # merges the PATCH /config runtime-override store on top of it (the repo
@@ -78,6 +81,7 @@ from ..models.user import User
 from ..rbac import Role, require_min_role
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 # These are module-level singletons — created once when the server starts,
 # reused for every request. Creating them once is efficient because
@@ -222,11 +226,12 @@ async def _resolve_duplicate_request_id(
     request: AuthorizationRequest,
     correlation_id: str,
 ) -> AuthorizationDecision | None:
-    """Resolve a `request_id` unique-constraint failure (spec D4 §3.1, chg-24).
+    """Resolve a `request_id` unique-constraint failure (spec D4 §3.1, chg-24;
+    in-flight/died disambiguation is FIX 1 from the Validator's D4 review).
 
     Called from `submit_authorization`'s `except IntegrityError:` handler,
     i.e. only once a row with this `request_id` is already known to exist —
-    the caller has already rolled back the failed insert. Three outcomes:
+    the caller has already rolled back the failed insert. Four outcomes:
 
       * Returns the existing `AuthorizationDecision` (idempotent replay) when
         a decision already exists for the SAME case (patient_id,
@@ -234,13 +239,37 @@ async def _resolve_duplicate_request_id(
       * Raises `HTTPException(409)` when those identifiers do NOT match —
         the one case this route must never do silently: handing back
         patient A's decision for patient B's resubmitted request_id.
-      * Returns `None` when the request row exists but no decision does yet
-        (a prior attempt died between T1 and T2) — the caller resumes
-        processing against the already-persisted row instead of retrying
-        the insert.
+      * Raises `HTTPException(409)` ("already being processed") when no
+        decision exists YET but the request row is younger than
+        `settings.agent_timeout` — see the in-flight/died heuristic below.
+      * Returns `None` when the request row exists, no decision does, and the
+        request row is OLDER than `agent_timeout` — a prior attempt is
+        assumed to have genuinely died between T1 and T2 (spec §3.2); the
+        caller resumes processing against the already-persisted row instead
+        of retrying the insert.
 
     "Same case" is a field-level check, not a cryptographic fingerprint of
     the full payload — see `_same_case`'s docstring.
+
+    In-flight vs. died heuristic (FIX 1a). "No decision yet" is genuinely
+    ambiguous between two very different situations: (1) a prior attempt
+    crashed before reaching T2 -- safe to resume -- and (2) a prior attempt
+    is STILL RUNNING right now, inside its own orchestrator call -- resuming
+    here would start a SECOND orchestrator run against the same row,
+    producing two decision rows for one request_id (and, before this fix,
+    permanently breaking every future lookup for it once `get_by_request_id`
+    hit `MultipleResultsFound`). There is no lease/claim column recording
+    "an attempt is actively working this row" -- only `submitted_at`. So this
+    compares the request row's age to `settings.agent_timeout` (the same
+    budget the orchestrator's own LLM calls are bounded by) as a heuristic,
+    not a lease: younger than the timeout is treated as in-flight (refuse,
+    409, do not resume, do not call the orchestrator a second time); older is
+    treated as dead (resume, as before). The window is real and is stated
+    here plainly rather than hidden: a request that legitimately runs longer
+    than `agent_timeout` for benign reasons will be misclassified as dead and
+    resumed. A hard lease (a `claimed_at`/`worker_id` column) is the rigorous
+    fix; it needs a migration and is out of scope for chg-24 (recommended as
+    defence-in-depth follow-up in the executor's report).
     """
     existing_request = await AuthorizationRepository(session).get_by_id(request.request_id)
     if existing_request is None:
@@ -248,7 +277,32 @@ async def _resolve_duplicate_request_id(
         # rather than silently swallow an unexplained state.
         raise RuntimeError(f"IntegrityError on request_id={request.request_id!r} but no row exists")
 
-    existing_decision = await DecisionRepository(session).get_by_request_id(request.request_id)
+    # FIX 1b: `list_by_request_id` (not `get_by_request_id`'s old
+    # `scalar_one_or_none()`) so a pre-existing two-decision anomaly — the
+    # exact state FIX 1a's window can still (rarely) produce — is a logged,
+    # audited data condition rather than an unhandled `MultipleResultsFound`
+    # that would permanently 500 every future submission of this request_id.
+    existing_decisions = await DecisionRepository(session).list_by_request_id(request.request_id)
+    if len(existing_decisions) > 1:
+        logger.error(
+            "duplicate_decision_rows_for_request_id",
+            request_id=request.request_id,
+            decision_count=len(existing_decisions),
+        )
+        await audit.log(
+            action="submission.multiple_decisions_anomaly",
+            actor="system",
+            actor_type="system",
+            request_id=request.request_id,
+            correlation_id=correlation_id,
+            success=False,
+            output_summary=(
+                f"{len(existing_decisions)} decision rows exist for one request_id "
+                "-- a data anomaly; using the earliest as authoritative"
+            ),
+            details={"decision_count": len(existing_decisions)},
+        )
+    existing_decision = existing_decisions[0] if existing_decisions else None
 
     if not _same_case(existing_request, request):
         await audit.log(
@@ -276,9 +330,29 @@ async def _resolve_duplicate_request_id(
         )
         return _decision_from_model(existing_decision)
 
-    # Request row exists, no decision yet: a prior attempt died between T1
-    # and T2 (spec §3.2). Resume rather than re-inserting (which would raise
-    # the same IntegrityError again).
+    # No decision yet: in-flight or died? See the heuristic in this
+    # function's docstring (FIX 1a).
+    age = datetime.utcnow() - existing_request.submitted_at
+    agent_timeout = get_settings().agent_timeout
+    if age < timedelta(seconds=agent_timeout):
+        await audit.log(
+            action="submission.in_flight_conflict",
+            actor=request.provider_npi,
+            actor_type="provider",
+            request_id=request.request_id,
+            correlation_id=correlation_id,
+            success=False,
+            output_summary="request_id is still being processed by an earlier in-flight submission",
+            details={"age_seconds": age.total_seconds(), "agent_timeout_seconds": agent_timeout},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"request_id {request.request_id!r} is already being processed",
+        )
+
+    # Older than agent_timeout: the prior attempt is assumed to have
+    # genuinely died between T1 and T2 (spec §3.2). Resume rather than
+    # re-inserting (which would raise the same IntegrityError again).
     await audit.log(
         action="submission.resumed_after_failure",
         actor=request.provider_npi,
@@ -286,6 +360,7 @@ async def _resolve_duplicate_request_id(
         request_id=request.request_id,
         correlation_id=correlation_id,
         output_summary="resuming a request whose prior attempt did not reach T2",
+        details={"age_seconds": age.total_seconds(), "agent_timeout_seconds": agent_timeout},
     )
     return None
 
@@ -589,13 +664,25 @@ async def submit_authorization(
             # execution). Resolved on the constraint failure (not an up-front
             # SELECT), so the overwhelmingly common new-id path never gains a
             # second query — see `_resolve_duplicate_request_id`'s docstring
-            # for the three outcomes (replay / 409 / resume).
+            # for the four outcomes (replay / 409-different-case /
+            # 409-in-flight / resume).
             await session.rollback()
             replay = await _resolve_duplicate_request_id(session, audit, request, correlation_id)
             if replay is not None:
                 return replay
-            # else: resume — fall through to RAG/orchestrator/T2 below,
-            # against the already-persisted request row.
+            # else: resume. `_resolve_duplicate_request_id`'s own SELECTs
+            # autobegin a fresh (read) transaction on this session, which
+            # would otherwise stay open across the orchestrator's LLM call
+            # below (Validator FIX 2 on the D4 review: measured 0.5445s
+            # connection-hold with checkedout()==1 on this path before this
+            # commit was added, vs. ~0.01s on the normal new-id path) --
+            # explicitly close it here, same as the T1 commit in the `else`
+            # branch below does for the normal path. Nothing was written by
+            # those SELECTs, so this commit has no rows to persist; its only
+            # job is to release the connection before the network call.
+            await session.commit()
+            # fall through to RAG/orchestrator/T2 below, against the
+            # already-persisted request row.
         else:
             # Short transaction: COMMIT closes T1 here, before any network
             # call — see spec D4 §2 target structure. Nothing between here and
