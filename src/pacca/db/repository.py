@@ -205,10 +205,13 @@ class AuthorizationRepository:
         """
         List decisions awaiting Medical Director review, with their requests.
 
-        Keyed on the DECISION's outcome, not the request's `status` column. The
-        submit route never updates that column after the orchestrator runs, so
-        every row still reads "submitted" and filtering requests by
-        AuthorizationStatus.IN_REVIEW would return an empty queue forever.
+        Keyed on the DECISION's outcome, not the request's `status` column.
+        (chg-24 doc-drift fix: this used to say the submit route never
+        updates that column -- chg-24's T2 now does, advancing it to the
+        decision's own outcome via `update_status()`. Still keyed off the
+        decision row here, not the request's status, so a request whose
+        status-advance failed independently of its decision write still
+        surfaces via the decision that DID persist.)
 
         Oldest first: a review queue is worked front to back, unlike
         `list_requests`, which shows the most recent submissions.
@@ -326,14 +329,43 @@ class DecisionRepository:
 
         return db_decision
 
-    async def get_by_request_id(self, request_id: str) -> AuthorizationDecisionModel | None:
-        """Get decision by request ID."""
+    async def list_by_request_id(self, request_id: str) -> list[AuthorizationDecisionModel]:
+        """All decision rows for one request_id, oldest (decided_at) first,
+        `id` as a stable tie-breaker.
+
+        Normally 0 or 1 -- `authorization_decisions.request_id` carries no
+        UNIQUE constraint (only an index + FK to
+        `authorization_requests.request_id`), so more than one row IS
+        possible. It became reachable in practice via chg-24 FIX 1: a
+        duplicate submission arriving while the first is still in flight
+        (T1 committed, no decision yet) could, before that fix, be
+        misread as "the prior attempt died" and resumed, producing a
+        second decision row for the same request_id. Deterministic
+        ordering here is what lets a caller pick "the first one" as a
+        stable, defined answer rather than an arbitrary row -- and lets
+        `get_by_request_id` below never raise on multiplicity, which
+        `scalar_one_or_none()` would (`MultipleResultsFound`, a plain
+        Python exception with no SQLAlchemyError lineage a caller might
+        otherwise think to catch).
+        """
         result = await self.session.execute(
-            select(AuthorizationDecisionModel).where(
-                AuthorizationDecisionModel.request_id == request_id
+            select(AuthorizationDecisionModel)
+            .where(AuthorizationDecisionModel.request_id == request_id)
+            .order_by(
+                AuthorizationDecisionModel.decided_at.asc(),
+                AuthorizationDecisionModel.id.asc(),
             )
         )
-        return result.scalar_one_or_none()
+        return list(result.scalars().all())
+
+    async def get_by_request_id(self, request_id: str) -> AuthorizationDecisionModel | None:
+        """Get decision by request ID -- the earliest one, deterministically,
+        if more than one exists. See `list_by_request_id`'s docstring for why
+        this can never raise `MultipleResultsFound`. Callers that need to
+        know WHETHER more than one row exists (to log/audit the anomaly, not
+        just silently pick one) should call `list_by_request_id` directly."""
+        rows = await self.list_by_request_id(request_id)
+        return rows[0] if rows else None
 
     async def get_by_id(self, decision_id: str) -> AuthorizationDecisionModel | None:
         """Get decision by decision ID."""
