@@ -52,7 +52,9 @@ OB_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.AUTO_APPROVED,
         expected_branch=EscalationBranch.BRANCH_1_AUTO_APPROVE,
         reasoning_must_include=["pregnancy", "ultrasound", "dating"],
-        reasoning_must_not_include=["experimental", "deny"],
+        # chg-25 review (F2): "denying" backfilled -- whole-word matching no
+        # longer catches it implicitly from "deny".
+        reasoning_must_not_include=["experimental", "deny", "denying"],
         clinical_rationale=(
             "Routine prenatal first-trimester ultrasound. ACOG standard of care. Clean approve."
         ),
