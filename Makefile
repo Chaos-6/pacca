@@ -9,6 +9,7 @@
 #   make test-all     Run everything except clinical (requires API key)
 #   make test-clinical Run LLM-as-judge clinical evaluation (requires API key)
 #   make test-holdout Run the held-out (out-of-sample) accuracy report (requires API key)
+#   make test-judge-stability Run the judge-stability harness (stubbed judge, no API key)
 #   make lint         Run ruff linter
 #   make typecheck    Run mypy type checker
 #   make clean        Remove build artifacts and __pycache__
@@ -20,7 +21,7 @@
 #   make install
 # =============================================================================
 
-.PHONY: install db-upgrade test test-cov test-all test-clinical test-holdout test-postgres lint typecheck clean help \
+.PHONY: install db-upgrade test test-cov test-all test-clinical test-holdout test-judge-stability test-postgres lint typecheck clean help \
         sme-author sme-author-test sme-author-status sme-author-help \
         sme-author-web sme-author-web-build sme-author-web-e2e
 
@@ -97,6 +98,17 @@ test-holdout:
 	# the whole point of this target is to obtain that number in one command.
 	pytest tests/ -m holdout -v -s
 
+test-judge-stability:
+	@echo "Running the judge-stability harness (stubbed judge, zero API calls)..."
+	@echo "REPORTS ONLY -- not a gate. See docs/EVALUATION.md 'Judge stability'."
+	# Deliberately NOT the `holdout` marker/target: that marker is already
+	# bound to a live-key-required Makefile branch (see the guard above) with
+	# unrelated semantics (the 32-case out-of-sample report). This harness's
+	# regression test is fully stubbed and carries no special marker, so it
+	# already runs inside `make test`; this target exists only so it is also
+	# reachable in isolation by name.
+	pytest tests/unit/test_judge_stability_harness.py -v
+
 test-postgres:
 	@echo "Real-Postgres integration tests (catches SQLite-masked bugs like B2/B3)..."
 	@echo "Starting throwaway Postgres 16 on :5499..."
@@ -141,6 +153,7 @@ help:
 	@echo "  make test-all           All fast tests"
 	@echo "  make test-clinical      Clinical LLM evaluation (needs API key)"
 	@echo "  make test-holdout       Held-out accuracy report, NOT a gate (needs API key)"
+	@echo "  make test-judge-stability  Judge-stability harness, stubbed, no API key needed"
 	@echo "  make lint               Ruff linter"
 	@echo "  make typecheck          Mypy type checker"
 	@echo "  make clean              Remove build artifacts"
