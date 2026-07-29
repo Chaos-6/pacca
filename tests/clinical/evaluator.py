@@ -105,6 +105,7 @@ Teaching note — self-preference posture (chg-25 / D5 §3.3):
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -143,19 +144,51 @@ class ConstraintCheck:
     Tier 1 result: which of a case's keyword constraints the rationale
     violates, computed in plain Python — never asked of the judge.
 
-    Matching is case-insensitive SUBSTRING containment, not word-boundary
-    matching. This is a deliberate, carried-over behavior: it reproduces
-    exactly what the removed judge-prompt keyword sections did (plain
-    Python ``in`` containment on the lowercased text), so moving the check
-    out of the judge changes WHO decides it, not WHAT the decision is. The
-    consequence is real and worth stating plainly: a short forbidden
-    keyword matches inside a longer word too — "age" matches inside
-    "average", "coverage", "manage". Case authors should choose keywords
-    specific enough to avoid this (see docs/CASE_AUTHORING_GUIDE.md).
-    GC-028's forbidden ``["age", "elderly"]`` is a real, documented
-    instance where this fires on a rationale that correctly discusses the
-    patient's (real, submitted) age to explain why it does NOT exclude
-    treatment — see ``test_gc_028_...`` for the regression this produces.
+    CORRECTION (chg-25, post-review): matching is case-insensitive WHOLE-WORD
+    matching, not substring containment. An earlier version of this docstring
+    claimed substring matching "reproduces exactly what the removed
+    judge-prompt keyword sections did." That claim was FALSE and has been
+    deleted, not softened: `fa71251`'s judge prompt contained no Python
+    containment check anywhere — `reasoning_must_include` /
+    `reasoning_must_not_include` were rendered as plain comma-joined text for
+    the JUDGE to read and apply SEMANTIC judgment to. A judge reading "age" in
+    a forbidden list would never have flagged "coverage" or "average" as a
+    violation; a naive substring check would. Substring matching was
+    therefore not a preservation of the old behavior — it was a NEW, STRICTER,
+    and materially different rule, silently introduced under the banner of
+    "moving an existing check into Python."
+
+    This is corrected here to whole-word matching, which is *closer* to (but
+    still not identical to) the old judge's semantic latitude, and the
+    trade-off is stated plainly: exactness and zero variance, in exchange for
+    no semantic latitude. This is still a real, deliberate change from the
+    old behavior — not a restoration of it — because no deterministic string
+    check can reproduce a judge's semantic reading. It is the correct
+    trade-off for a keyword constraint (see module docstring: "never ask a
+    model to decide something a function can decide"), but say so honestly
+    rather than claiming false equivalence.
+
+    Matching detail: a keyword matches only when it appears as a whole token
+    — not as a substring of a longer word. "age" no longer matches inside
+    "average", "coverage", "dosage", "triage", "manage", "damage", "stage",
+    "usage", "percentage", "agent", or "agenda" (measured against the full
+    clinical-case corpus at chg-25 review: substring matching produced 152
+    hits for "age" across the dataset's own clinical/guideline text; whole-
+    word matching produces 42 — the other 110 were exactly this class of
+    false positive). GC-028's forbidden `["age", "elderly"]` still fires on a
+    rationale that discusses the patient's real, submitted age ("the
+    patient's age (82 years) does not exclude...") — because "age" appears
+    there as its own word — but no longer fires on unrelated vocabulary that
+    happens to contain the same four letters.
+
+    Morphological variants ("aged", "ages") are NOT matched by a forbidden
+    "age" — this is deliberate, not an oversight: implicitly stemming a
+    keyword is exactly the kind of "clever" behavior a reader cannot predict
+    from reading the keyword list. If a case needs to forbid "elderly" AND
+    "aged" AND "ages", the case author lists all three explicitly in
+    `reasoning_must_not_include`. Predictable beats clever; this check's
+    entire value is that a reader can tell exactly what it will do by reading
+    the keyword, with no hidden linguistic normalization.
     """
 
     missing: list[str] = field(default_factory=list)
@@ -166,23 +199,48 @@ class ConstraintCheck:
         return bool(self.missing or self.forbidden_present)
 
 
+def _whole_word_match(keyword: str, text: str) -> bool:
+    """
+    Case-insensitive whole-word (not substring) match of ``keyword`` in
+    ``text``. Multi-word phrases work unchanged (a space is not a word
+    character, so it already acts as its own boundary).
+
+    Uses ``(?<!\\w)...(?!\\w)`` lookaround rather than ``\\b...\\b``
+    deliberately: several real forbidden keywords in this dataset start or
+    end with a non-word character (``"$100,000"``, ``"62%"``). ``\\b`` only
+    matches at a transition between a word character and a non-word
+    character — if the keyword itself starts with a non-word character
+    (``$``) preceded by another non-word character (a space), there is no
+    such transition, so a leading ``\\b`` never matches at all and the
+    keyword becomes silently unmatchable. The lookaround form instead asks
+    directly "is the adjacent character (if any) NOT a word character?",
+    which is correct regardless of whether the keyword's own edge characters
+    are word characters. Verified empirically: plain ``\\b`` matching drops
+    ``"$100,000"``, ``"$250,000"``, and ``"62%"`` to zero hits across the
+    full case corpus versus this lookaround form, which matches them exactly
+    where the substring check did.
+    """
+    pattern = r"(?<!\w)" + re.escape(keyword) + r"(?!\w)"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
 def check_reasoning_constraints(case: GoldenCase, rationale: str) -> ConstraintCheck:
     """
     Tier 1 exact check: does ``rationale`` contain every keyword in
-    ``case.reasoning_must_include`` and none of ``case.reasoning_must_not_
-    include``? Case-insensitive substring containment (see ``ConstraintCheck``
-    docstring for why substring, not word-boundary).
+    ``case.reasoning_must_include`` as a whole word, and none of
+    ``case.reasoning_must_not_include`` as a whole word? See
+    ``ConstraintCheck`` docstring for why whole-word (not substring, and not
+    a reproduction of the old judge-semantic behavior).
 
     Empty or absent keyword lists produce no violations — ``GoldenCase``
     defaults both fields to ``[]`` (never ``None``), so this never raises;
     a defensively-passed ``None`` behaves the same as ``[]`` via ``or ()``.
     """
-    rationale_lower = rationale.lower()
     must_include = case.reasoning_must_include or ()
     must_not_include = case.reasoning_must_not_include or ()
 
-    missing = [kw for kw in must_include if kw.lower() not in rationale_lower]
-    forbidden_present = [kw for kw in must_not_include if kw.lower() in rationale_lower]
+    missing = [kw for kw in must_include if not _whole_word_match(kw, rationale)]
+    forbidden_present = [kw for kw in must_not_include if _whole_word_match(kw, rationale)]
 
     return ConstraintCheck(missing=missing, forbidden_present=forbidden_present)
 
