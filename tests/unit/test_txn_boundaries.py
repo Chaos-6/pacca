@@ -161,6 +161,64 @@ async def test_no_transaction_open_on_route_session_during_orchestrator_call(eng
         "before the network call"
     )
 
+
+@pytest.mark.asyncio
+async def test_no_transaction_open_during_orchestrator_call_on_resume_path(engine, monkeypatch):
+    """Validator FIX 2 (D4 review, MEDIUM): the same "no transaction during
+    the orchestrator call" property, but on the RESUME path (a duplicate
+    request_id whose prior attempt genuinely died -- spec §3.2 / chg-24 FIX
+    1a). `_resolve_duplicate_request_id`'s own SELECTs autobegin a fresh
+    (read) transaction on the route's session; before FIX 2 that transaction
+    was never closed before falling through to the orchestrator call,
+    re-pinning a connection across the LLM window on this path specifically
+    (measured: 0.5445s hold with `engine.pool.checkedout()==1`, vs. ~0.01s on
+    the normal new-id path). This is the regression guard for that fix.
+    """
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import update
+
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    route_session = maker()
+
+    # Pre-condition: a request row from a "died" prior attempt -- older than
+    # agent_timeout, no decision yet -- so re-submitting the same request_id
+    # takes the resume path (FIX 1a's "old" branch), not the in-flight one.
+    req = _request("AUTH-TXN-RESUME-1")
+    await AuthorizationRepository(route_session).create(req)
+    await route_session.commit()
+    await route_session.execute(
+        update(AuthorizationRequestModel)
+        .where(AuthorizationRequestModel.request_id == "AUTH-TXN-RESUME-1")
+        .values(submitted_at=datetime.utcnow() - timedelta(seconds=120))
+    )
+    await route_session.commit()
+
+    captured = {}
+
+    async def mock_process_decision(decision_ctx, *, audit, correlation_id):
+        captured["in_transaction"] = route_session.in_transaction()
+        return AuthorizationDecision(
+            status=AuthorizationStatus.AUTO_APPROVED,
+            confidence_score=0.97,
+            rationale="test",
+            review_tier_used=ReviewTier.AUTOMATED,
+            cited_evidence_ids=["e1"],
+        )
+
+    monkeypatch.setattr(orchestrator, "process_decision", mock_process_decision)
+    monkeypatch.setattr(rag_engine, "query", lambda *a, **k: _healthy_outcome())
+
+    result = await submit_authorization(request=req, session=route_session)
+
+    assert result.status == AuthorizationStatus.AUTO_APPROVED
+    assert captured["in_transaction"] is False, (
+        "a transaction was still open on the route's own session during the "
+        "orchestrator call on the RESUME path -- the resolver's SELECTs "
+        "re-opened a transaction that FIX 2's commit should have closed "
+        "before falling through to the orchestrator"
+    )
+
     await route_session.close()
 
 
