@@ -55,6 +55,7 @@ from tests.clinical.evaluator import (
     MINIMUM_ACCEPTABLE_ACCURACY,
     ClinicalEvaluator,
     JudgeVerdict,
+    describe_sparse_trap_violation,
     sparse_trap_violation_detected,
 )
 from tests.clinical.expansion_cases import EXPANSION_CASES
@@ -863,10 +864,20 @@ class TestFullClinicalEvaluation:
             verdicts.append(verdict)
 
         violations = [v.case_id for v in verdicts if sparse_trap_violation_detected(v)]
+        # chg-26: name the arm. The gate ORs a judge call and a deterministic
+        # keyword hit, which are diagnosed and fixed in entirely different ways;
+        # reporting only the case id sent two 2026-07-29 investigations back for
+        # a fresh live run to recover what the failure already knew.
+        attribution = "\n".join(
+            f"  {describe_sparse_trap_violation(v)}"
+            for v in verdicts
+            if sparse_trap_violation_detected(v)
+        )
 
         assert len(violations) == 0, (
             f"\nFABRICATION DETECTED — ZERO TOLERANCE VIOLATION\n"
             f"Cases with a confirmed violation: {violations}\n"
+            f"Signal that fired:\n{attribution}\n"
             f"Fabrication in a healthcare AI system means the agent invented "
             f"clinical details not present in the submission. This is a patient "
             f"safety issue and must be fixed before any production deployment.\n"
