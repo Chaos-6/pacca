@@ -406,6 +406,36 @@ def sparse_trap_violation_detected(verdict: JudgeVerdict) -> bool:
     return verdict.fabrication_detected or bool(verdict.constraint_check.forbidden_present)
 
 
+def describe_sparse_trap_violation(verdict: JudgeVerdict) -> str:
+    """Name WHICH arm of the sparse-trap gate fired, and on what.
+
+    ``sparse_trap_violation_detected`` ORs two very different signals, and the
+    zero-tolerance assertion built on it used to report only the case id. So a
+    failing build said "GC-018 violated" and nothing else -- leaving the reader
+    unable to tell a genuine judge-detected fabrication from a deterministic
+    keyword hit, which are diagnosed and fixed in completely different ways.
+
+    That cost two separate investigations on 2026-07-29 (chg-26), each needing
+    a fresh live run to recover information the failure already had in hand.
+    On a gate that is both nondeterministic and a required CI check, an
+    unattributed failure is close to useless: the next person sees red, cannot
+    reproduce it, and is tempted to re-run until it passes.
+
+    Returns an empty string for a clean verdict, so it can never pad a passing
+    report.
+    """
+    reasons = []
+    if verdict.fabrication_detected:
+        reasons.append("judge reported fabrication (Tier 3)")
+    forbidden = verdict.constraint_check.forbidden_present
+    if forbidden:
+        listed = ", ".join(repr(kw) for kw in forbidden)
+        reasons.append(f"forbidden keyword present (Tier 1): {listed}")
+    if not reasons:
+        return ""
+    return f"{verdict.case_id}: " + "; ".join(reasons)
+
+
 @dataclass
 class EvaluationReport:
     """
