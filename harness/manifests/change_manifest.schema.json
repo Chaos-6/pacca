@@ -66,6 +66,42 @@
       }
     }
   },
+  "if": {
+    "properties": {
+      "iteration": {
+        "minimum": 18
+      }
+    },
+    "required": [
+      "iteration"
+    ]
+  },
+  "then": {
+    "properties": {
+      "changes": {
+        "items": {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "improvement",
+                  "rollback"
+                ]
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "baseline"
+            ]
+          }
+        }
+      }
+    }
+  },
   "$defs": {
     "change": {
       "type": "object",
@@ -201,6 +237,33 @@
         "rollback_plan": {
           "type": "string",
           "description": "How to revert this change if the next-iteration verdict rejects it. For most file-level changes this is 'git revert <sha>'. For changes that require database migrations or RAG collection updates, document the reverse migration here."
+        },
+        "baseline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "claim",
+            "verified_by",
+            "result"
+          ],
+          "description": "Required for 'improvement'/'rollback' changes from iteration 18 forward (D6, forward-only cutover -- see docs/HARNESS.md and AGENT_LESSONS.md P-013). Records what the system did BEFORE this change, as the change's premise depends on it, how that was measured by a reproducible command or procedure, and what the measurement actually produced. Optional for 'new'/'removal'/'instrumentation' changes at any iteration, and not required at all below iteration 18 -- those manifests predate the field and are grandfathered rather than backfilled.",
+          "properties": {
+            "claim": {
+              "type": "string",
+              "minLength": 20,
+              "description": "What the system did before this change, stated as the change depends on it (e.g. 'The evaluator performs no Python keyword containment; ... the judge decides semantically.')."
+            },
+            "verified_by": {
+              "type": "string",
+              "minLength": 5,
+              "description": "The command or procedure that measured the claim. Must be reproducible by a third party (e.g. 'git show <sha>:path | grep -n ...')."
+            },
+            "result": {
+              "type": "string",
+              "minLength": 5,
+              "description": "What the verification command actually produced -- the evidence, not a restatement of the claim."
+            }
+          }
         }
       }
     },
