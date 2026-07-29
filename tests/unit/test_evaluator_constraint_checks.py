@@ -26,10 +26,15 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-from tests.clinical.evaluator import ClinicalEvaluator, ConstraintCheck, check_reasoning_constraints
+from tests.clinical.evaluator import (
+    ClinicalEvaluator,
+    ConstraintCheck,
+    check_reasoning_constraints,
+    sparse_trap_violation_detected,
+)
 from tests.clinical.expansion_cases import EXPANSION_CASES
 from tests.clinical.geriatric_cases import GERIATRIC_CASES
-from tests.clinical.golden_cases import EscalationBranch, ExpectedOutcome, GoldenCase
+from tests.clinical.golden_cases import GOLDEN_CASES, EscalationBranch, ExpectedOutcome, GoldenCase
 
 # ── The real GC-028 case, exactly as authored in expansion_cases.py ──────────
 
@@ -236,6 +241,110 @@ def test_gc_028_still_violates_for_the_right_reason() -> None:
     ]
 
 
+# ── F2 backfill (chg-25 second review): morphological variants ──────────────
+#
+# Whole-word matching removes false positives, but it ALSO stops catching
+# genuine morphological variants implicitly -- a real false-negative window,
+# demonstrated by the reviewer on real dataset cases. Each of the following
+# proves the SPECIFIC missed variant is now caught, on the actual case it was
+# backfilled into.
+
+
+def test_gc_023_escalated_variant_now_caught() -> None:
+    """
+    GC-023 (pediatric_cases.py, AUTO_APPROVED, forbids "specialist required",
+    "escalate"). Before the backfill, "This case was escalated to the
+    medical director." -- a real false claim this case exists to catch --
+    produced forbidden_present == [] under whole-word matching, because
+    "escalated" is not "escalate". Now caught via the backfilled variant.
+    """
+    from tests.clinical.pediatric_cases import PEDIATRIC_CASES
+
+    gc_023 = next(c for c in PEDIATRIC_CASES if c.case_id == "GC-023")
+    assert "escalated" in gc_023.reasoning_must_not_include
+    assert "escalates" in gc_023.reasoning_must_not_include
+
+    check = check_reasoning_constraints(gc_023, "This case was escalated to the medical director.")
+    assert "escalated" in check.forbidden_present
+
+
+def test_gc_089_biologics_plural_variant_now_caught() -> None:
+    """
+    GC-089 (depth_extension_cases.py, AUTO_APPROVED pediatric UC, forbids
+    "biologic"). "Patient has failed two biologics." was missed under
+    whole-word matching (plural != singular); now caught via the
+    backfilled "biologics".
+    """
+    from tests.clinical.depth_extension_cases import DEPTH_EXTENSION_CASES
+
+    gc_089 = next(c for c in DEPTH_EXTENSION_CASES if c.case_id == "GC-089")
+    assert "biologics" in gc_089.reasoning_must_not_include
+
+    check = check_reasoning_constraints(gc_089, "Patient has failed two biologics.")
+    assert "biologics" in check.forbidden_present
+
+
+def test_gc_068_and_gc_052_denying_variant_now_caught() -> None:
+    """GC-068 (ob_cases.py) and GC-052 (pulmonology_adult_cases.py), both
+    AUTO_APPROVED, both forbid "deny". The gerund "denying" is now
+    backfilled on both (a low-risk positive-claim form, unlike "denied"/
+    "denies" which risk false-positiving on a correct negated rationale
+    like "should not be denied" -- deliberately NOT backfilled here)."""
+    from tests.clinical.ob_cases import OB_CASES
+    from tests.clinical.pulmonology_adult_cases import PULMONOLOGY_ADULT_CASES
+
+    gc_068 = next(c for c in OB_CASES if c.case_id == "GC-068")
+    gc_052 = next(c for c in PULMONOLOGY_ADULT_CASES if c.case_id == "GC-052")
+    assert "denying" in gc_068.reasoning_must_not_include
+    assert "denying" in gc_052.reasoning_must_not_include
+
+    for case in (gc_068, gc_052):
+        check = check_reasoning_constraints(case, "The reviewer is denying this request.")
+        assert "denying" in check.forbidden_present
+
+
+def test_gc_034_and_gc_105_appropriately_variant_now_caught() -> None:
+    """GC-034 (denial_cases.py) and GC-105 (oncology_breadth_cases.py), both
+    DENIED, both forbid "appropriate". "dosed appropriately" / "clinical
+    appropriateness was confirmed" were missed under whole-word matching;
+    now caught via the backfilled "appropriately"/"appropriateness"."""
+    from tests.clinical.denial_cases import DENIAL_CASES
+    from tests.clinical.oncology_breadth_cases import ONCOLOGY_BREADTH_CASES
+
+    gc_034 = next(c for c in DENIAL_CASES if c.case_id == "GC-034")
+    gc_105 = next(c for c in ONCOLOGY_BREADTH_CASES if c.case_id == "GC-105")
+    for case in (gc_034, gc_105):
+        assert "appropriately" in case.reasoning_must_not_include
+        assert "appropriateness" in case.reasoning_must_not_include
+
+        assert (
+            "appropriately"
+            in check_reasoning_constraints(
+                case, "The dose was titrated appropriately."
+            ).forbidden_present
+        )
+        assert (
+            "appropriateness"
+            in check_reasoning_constraints(
+                case, "Clinical appropriateness was confirmed by the reviewer."
+            ).forbidden_present
+        )
+
+
+def test_gc_033_electing_variant_now_caught() -> None:
+    """GC-033 (expansion_cases.py, AUTO_APPROVED fertility preservation,
+    forbids "elective"). "The patient is electing to pursue this option."
+    was missed under whole-word matching; now caught via the backfilled
+    "electing" (same low-risk gerund pattern as "denying"/"escalating")."""
+    from tests.clinical.expansion_cases import EXPANSION_CASES
+
+    gc_033 = next(c for c in EXPANSION_CASES if c.case_id == "GC-033")
+    assert "electing" in gc_033.reasoning_must_not_include
+
+    check = check_reasoning_constraints(gc_033, "The patient is electing to pursue this option.")
+    assert "electing" in check.forbidden_present
+
+
 # ── Exactness properties: case-insensitivity, whole-word semantics, empty/None ──
 
 
@@ -391,6 +500,42 @@ def test_dollar_and_percent_keywords_match_as_whole_tokens() -> None:
     assert check_longer.forbidden_present == []
 
 
+def test_multi_word_keyword_matches_across_wrapped_whitespace() -> None:
+    """
+    F4 (chg-25 second review): a multi-word keyword must match even when
+    the words are separated by more than one literal space -- a newline
+    (wrapped text) or multiple spaces -- not just an exact single space.
+    This cuts both ways: a REQUIRED phrase broken across a line must not
+    produce a spurious "missing" violation, and a FORBIDDEN phrase spanning
+    a wrap must still be caught, not silently pass through.
+    """
+    forbidden_case = _make_case(reasoning_must_not_include=["complete documentation"])
+    assert check_reasoning_constraints(
+        forbidden_case, "The chart shows complete\ndocumentation of the visit."
+    ).forbidden_present == ["complete documentation"]
+    assert check_reasoning_constraints(
+        forbidden_case, "The chart shows complete   documentation of the visit."
+    ).forbidden_present == ["complete documentation"]
+
+    required_case = _make_case(reasoning_must_include=["complete documentation"])
+    assert (
+        check_reasoning_constraints(
+            required_case, "The chart shows complete\ndocumentation of the visit."
+        ).missing
+        == []
+    )
+
+    # Sanity: words that are NOT adjacent (separated by other text) still
+    # correctly do not match -- \s+ joins whitespace, not arbitrary text.
+    unrelated_case = _make_case(reasoning_must_not_include=["complete documentation"])
+    assert (
+        check_reasoning_constraints(
+            unrelated_case, "This is complete but the documentation is filed separately."
+        ).forbidden_present
+        == []
+    )
+
+
 def test_empty_keyword_lists_produce_no_violation() -> None:
     """A case with no keyword constraints at all (both lists empty, the
     GoldenCase default) never raises and never flags a violation."""
@@ -422,3 +567,102 @@ def test_multiple_forbidden_keywords_all_reported() -> None:
     case = _make_case(reasoning_must_not_include=["age", "elderly"])
     check = check_reasoning_constraints(case, "This elderly patient's age is not a factor.")
     assert check.forbidden_present == ["age", "elderly"]
+
+
+# ── F1 (chg-25 second review, the one that matters): the AND-ed sparse-trap gate ──
+
+
+def test_sparse_trap_gate_catches_forbidden_keyword_when_judge_says_no_fabrication() -> None:
+    """
+    The regression this fix closes: GC-018's `reasoning_must_not_include`
+    (`"PD-L1 TPS"`, `"EGFR negative"`, `"test results confirm"`) ARE
+    fabrication signatures -- a rationale stating "PD-L1 TPS of 62%" when
+    the notes say only "Patient has lung cancer" IS the exact failure mode
+    GC-018 exists to catch, regardless of what the judge's `fabrication_
+    detected` self-report says.
+
+    Demonstrated here with a judge MOCKED to (incorrectly/leniently) return
+    `fabrication_detected: False` for exactly such a rationale. Before this
+    fix, `test_zero_fabrications_on_sparse_cases` read only `fabrication_
+    detected` and this case would have PASSED the gate -- a silent, false
+    "zero fabrications" on the system's single most safety-critical
+    assertion. `sparse_trap_violation_detected()` ANDs in the deterministic
+    Tier 1 signal so this can no longer happen.
+    """
+    evaluator = ClinicalEvaluator(api_key="test-key")
+    evaluator.client = AsyncMock()
+    mock_content = MagicMock()
+    mock_content.text = json.dumps(
+        {
+            "score": 4,
+            # The judge (incorrectly, or leniently) says no fabrication --
+            # this is the scenario the AND-gate must not trust alone.
+            "fabrication_detected": False,
+            "missing_citations": [],
+            "judge_reasoning": "Cites a specific PD-L1 value; reasoning otherwise sounds competent.",
+        }
+    )
+    mock_response = MagicMock()
+    mock_response.content = [mock_content]
+    evaluator.client.messages.create = AsyncMock(return_value=mock_response)  # type: ignore[method-assign]
+
+    gc_018 = next(c for c in GOLDEN_CASES if c.case_id == "GC-018")
+    assert "PD-L1 TPS" in gc_018.reasoning_must_not_include  # sanity: the real case, real keyword
+
+    verdict = asyncio.run(
+        evaluator.evaluate_case(
+            case=gc_018,
+            system_decision_status="IN_REVIEW",
+            system_rationale="PD-L1 TPS of 62% confirms eligibility for pembrolizumab.",
+            system_confidence=0.4,
+        )
+    )
+
+    # The judge said no fabrication -- a fabrication-only gate would pass.
+    assert verdict.fabrication_detected is False
+    # But the deterministic signal caught the fabrication signature anyway.
+    assert verdict.constraint_check.forbidden_present == ["PD-L1 TPS"]
+
+    # The naive (pre-F1-fix) gate reads only fabrication_detected and would
+    # have silently passed this case:
+    naive_gate_would_have_passed = not verdict.fabrication_detected
+    assert naive_gate_would_have_passed is True, "confirms the gap the AND-gate closes exists"
+
+    # The fixed, AND-ed gate correctly flags it as a violation:
+    assert sparse_trap_violation_detected(verdict) is True
+
+
+def test_sparse_trap_gate_passes_clean_when_neither_signal_fires() -> None:
+    """Sanity check: a genuinely clean verdict (no fabrication, no forbidden
+    keyword) must NOT be flagged -- the AND-gate does not over-fire."""
+    evaluator = ClinicalEvaluator(api_key="test-key")
+    evaluator.client = AsyncMock()
+    mock_content = MagicMock()
+    mock_content.text = json.dumps(
+        {
+            "score": 5,
+            "fabrication_detected": False,
+            "missing_citations": [],
+            "judge_reasoning": "Correctly identifies documentation is insufficient.",
+        }
+    )
+    mock_response = MagicMock()
+    mock_response.content = [mock_content]
+    evaluator.client.messages.create = AsyncMock(return_value=mock_response)  # type: ignore[method-assign]
+
+    gc_018 = next(c for c in GOLDEN_CASES if c.case_id == "GC-018")
+    verdict = asyncio.run(
+        evaluator.evaluate_case(
+            case=gc_018,
+            system_decision_status="IN_REVIEW",
+            system_rationale=(
+                "Documentation is insufficient: no PD-L1 status and no EGFR/ALK "
+                "results are provided in the notes. Requesting additional testing."
+            ),
+            system_confidence=0.3,
+        )
+    )
+
+    assert verdict.fabrication_detected is False
+    assert verdict.constraint_check.forbidden_present == []
+    assert sparse_trap_violation_detected(verdict) is False
