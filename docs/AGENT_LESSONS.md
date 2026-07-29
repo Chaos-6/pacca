@@ -191,6 +191,41 @@ Fix in-file (`cast()`, a real coercion) rather than suppressing in either.
 
 ---
 
+### P-013 · Characterize before you change — a load-bearing claim about current behaviour must be measured, not asserted
+**Symptom.** A change is well-designed, well-documented, well-tested, and wrong — because the premise it rests on was never checked. The tests pass because they were written against the same wrong premise.
+
+**Three instances in one day (2026-07-28), all found late and all checkable in seconds:**
+
+| Change | Load-bearing premise | Reality |
+|---|---|---|
+| chg-23 (audit durability) | "the FK-violation retry works" — verified on SQLite | Postgres leaves the instance detached; the retry emitted UPDATE-0-rows and lost the row silently |
+| chg-24 (transaction boundaries) | "duplicate + no decision → resume" — the spec named two states | A third state existed, *in flight*: the race produced two decisions and then a permanent 500 |
+| chg-25 (judge separation) | "substring matching reproduces the removed judge-prompt keyword check" | There was **no** Python check. `git show <base>:tests/clinical/evaluator.py \| grep must_include` returns only the two prompt-template lines — the old behaviour was the judge applying *semantic* judgment |
+
+**Cause.** Claims about the *existing* system get asserted from reading, while claims about the *new* system get tested. So the riskiest statement in a change — "here is what it does today" — is the one nothing verifies.
+
+**Rule.** Before modifying behaviour X, write a **characterization test** that captures X's CURRENT behaviour and **passes against the unmodified base**. Then change the code and let it fail.
+
+```bash
+# capture the baseline, in the base worktree (NOT via git stash — L-021)
+git show <base-sha>:<path> > /tmp/base_copy.py     # or a scratch worktree
+# run the characterization test against it: it must PASS
+# then apply the change: it must FAIL
+```
+
+Run against the three above, each premise dies in about a minute:
+- "assert the old pipeline flags GC-028 as a constraint violation" → fails on base; there is no such check.
+- "assert a duplicate request_id returns 409" → fails on base with a 500; there is no contract at all.
+- "assert audit rows survive a rollback on Postgres" → fails on base; you meet the FK before building on top of it.
+
+**Relationship to P-010.** P-010 says *watch your new guard fail*. P-013 says *watch your characterization pass* — on the code you are about to replace. Together they bracket a change: measured where you started, proven you can detect where you are going. Neither alone is sufficient; chg-25 had P-010 and still shipped a false premise.
+
+**For reviewers and validators.** Add this as a standing probe, not an instinct: *list every claim the change makes about pre-change behaviour, and verify each against the base commit by execution. An unverified baseline claim is a finding regardless of whether the implementation works.* Adversarial validation caught chg-23's; it missed chg-24's until it ran a race; and it never questioned chg-25's baseline claim at all.
+
+**What does NOT work** (all three were tried and all three failed here): more tests on the new behaviour, careful code review, and relying on the validator to notice. Every one of these premises was plausible on a read.
+
+---
+
 ## Git & PR workflow (PACCA-specific overlay on the global rule L-001)
 
 ### P-006 · PACCA defaults to branch-and-PR. No direct pushes to main.
