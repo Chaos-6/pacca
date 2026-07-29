@@ -226,6 +226,31 @@ Run against the three above, each premise dies in about a minute:
 
 ---
 
+### P-014 · A gate that decides whether to run reports SUCCESS when it skips — so "green" can mean "never ran"
+**Symptom.** A required status check is green on a change it exists to gate. Nothing failed, nothing was skipped in the UI's red sense, and the branch-protection tick is present — because GitHub records a job whose steps were all `if`-gated off as **success**, not as "skipped".
+
+**Cause (observed 2026-07-29, run 30470889996).** `clinical-gate` decides for itself whether to run, from a shell step in `ci.yml`. Its base was `base="${BASE_SHA:-origin/main}"`, where `BASE_SHA` is `github.event.pull_request.base.sha` — **empty on a push**. On a push *to* `main`, base therefore resolved to the literal ref `origin/main`, which after `actions/checkout` of that same push **is HEAD**. `git diff origin/main...HEAD` is empty by construction, so the gate answered `run=false` for every push to main regardless of content. The push carrying chg-19 through chg-25 went green, ungated.
+
+**Rules.**
+1. **An undecidable base runs the gate.** Fail *open*, never closed. Branch creation sends an all-zero `before`; a force-push sends one that no longer resolves. If you cannot compute the range, you cannot show the change is harmless — so gate it. The original bug was preferring the cheap answer to the safe one.
+2. **Read the base from the event that carries it.** `pull_request` → `base.sha`; `push` → `github.event.before`. A single fallback cannot serve both, and the failure is silent.
+3. **Execute the decision logic in a test, don't read it.** `tests/harness/test_clinical_gate_decision.py` parses the step out of `ci.yml` and runs it against synthetic repos, so it cannot drift from the workflow. Copying the shell into the test would pass forever while CI diverged.
+4. **When reproducing CI state, reproduce it exactly.** The first draft of that test *passed against the broken workflow*: the fixture advanced `origin/main` **before** adding the pushed commits, handing the buggy fallback a legitimate base. In real CI the push has already landed, so `origin/main` IS the new HEAD. A near-miss reproduction inverts the result (P-010, and the same shape as P-009's `PRAGMA foreign_keys=ON` proxy).
+5. **Verify a gate *ran*, not that it was green.** For any behavioural merge, open the job log and confirm the pytest invocation is there. `##[notice]clinical-gate skipped` under a green tick is the thing to look for.
+
+**Related.** P-009 and P-010. This is their CI-layer instance: a proxy that isn't the real thing, and a guard nobody watched fail.
+
+---
+
+### P-015 · A stale `origin` makes every nightly green a green on code you aren't running
+**Symptom.** Nightly CI has been passing for days, including the clinical gate, so behaviour is assumed verified. It isn't — the nightly ran against the remote's HEAD, which is far behind local `main`.
+
+**Cause (2026-07-29).** `origin/main` sat at 2026-07-26 while local `main` accumulated **118 commits** (chg-19 → chg-25 plus D6). Every scheduled run in between validated the pre-chg-19 tree. Concretely: the nightly's clinical gate ran `pytest tests/ -m clinical -v` with no `-s`, because the Makefile fix that added `-s` (`a84c6af`) was itself sitting unpushed — so the runs also silently discarded the accuracy figures they existed to produce.
+
+**Rule.** Before citing a CI result as evidence for local work, check `git rev-list --count origin/main..main`. Non-zero means the run does not describe your code. Scheduled jobs run against the *remote* default branch and have no idea your laptop has moved. Push behavioural work the day it lands; a long-lived local backlog silently converts the whole CI suite into theatre.
+
+---
+
 ## Git & PR workflow (PACCA-specific overlay on the global rule L-001)
 
 ### P-006 · PACCA defaults to branch-and-PR. No direct pushes to main.
