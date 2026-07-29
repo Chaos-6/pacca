@@ -44,15 +44,24 @@ Before a behavioral change:
    `audit_relevant` fields — they are required for healthcare governance.
 5. Record a verdict in `docs/DECISIONS.md` at the next evaluation round.
 
-> **Enforcement status (P-6 landed).** CI now runs a **`validate-manifests`** job
-> (`python -m pacca.harness.validate_manifest --all`, every PR) and a **`clinical-gate`**
-> job (GC-018/019 + golden-set accuracy via `make test-clinical`, on `chg-`/agent-rag PRs
-> and nightly). The PR template still forces the Standard-vs-Behavioral choice. **Two
-> things remain David's manual steps (CI cannot self-impose them):** (1) add the
-> `ANTHROPIC_API_KEY` repo secret — the clinical-gate is inert until then; (2) enable
-> branch protection requiring `validate-manifests` + `test` + `clinical-gate`, which is
-> what makes these checks *blocking* rather than advisory. Until both are done, a missing
-> manifest fails its job but can still be merged past.
+> **Enforcement status — P-6 complete, with one bypass (verified 2026-07-29).** CI runs a
+> **`validate-manifests`** job (`python -m pacca.harness.validate_manifest --all`, every PR)
+> and a **`clinical-gate`** job (GC-018/019 + golden-set accuracy via `make test-clinical`,
+> on `chg-`/agent-rag PRs and nightly). The PR template still forces the
+> Standard-vs-Behavioral choice. Both of David's manual steps are **done**: the
+> `ANTHROPIC_API_KEY` repo secret exists (set 2026-07-23; the nightly run's clinical gate
+> passes, so it is live, not inert), and `main` carries branch protection with **five
+> required status checks** — `Tests`, `Validate change manifests`,
+> `Clinical gate (GC-018/019 + accuracy)`, `Lint & Type Check`, and
+> `Postgres integration (SQLite-masked bugs — B2/B3)`. A missing manifest now blocks a
+> merge, not just a job.
+>
+> **The bypass, stated plainly:** `enforce_admins` is **false** and no PR review is
+> required, so an admin (David) pushing straight to `main` skips all five checks — GitHub
+> prints "5 of 5 required status checks are expected" and accepts the push anyway. That
+> path was used on 2026-07-29 to land a 118-commit local backlog. `strict` is also false,
+> so a branch need not be current with `main` before merging. Protection is real for the
+> PR path and advisory for the admin path; don't cite it as an unconditional gate.
 
 Non-behavioral changes (refactors, docs, test additions that don't change behavior)
 follow the standard PR flow and skip the manifest. The PR template forces the choice —
@@ -125,8 +134,9 @@ every PR is one path or the other, never ambiguous.
 - **Anti-hallucination guards.** Agents may only reference clinical evidence explicitly
   present in the submission. Golden cases **GC-018** and **GC-019** (in
   `tests/clinical/golden_cases.py`) assert zero score-1 hallucination. As of P-6 the
-  `clinical-gate` CI job runs these (on `chg-`/agent-rag PRs and nightly) — so they fail
-  the *job*; making a job failure *block merge* is David's branch-protection step. P-5
+  `clinical-gate` CI job runs these (on `chg-`/agent-rag PRs and nightly), and as of
+  2026-07-29 it is a **required status check** on `main` — a failure blocks a PR merge
+  (though an admin direct-push still bypasses it; see the enforcement note above). P-5
   (chg-10) also promotes this guard to a **runtime** detector (`evidence_grounding.py`):
   a decision citing an evidence id absent from the submission is forced to human review.
 - **Tool-use forced** for structured output. Don't switch an agent to free-text parsing.
@@ -208,11 +218,14 @@ Use the Makefile targets (they encode the correct markers):
   (and is captured in the rationale + the retrieved-context audit), but is not a
   grounded-evidence id. Threading stable precedent/chunk ids into the grounding set is
   the roadmap "RAG chunk-id grounding" follow-up.
-- **Clinical gate in CI, blocking pending David.** As of P-6 `ci.yml` adds
-  `validate-manifests` (every PR) and `clinical-gate` (GC-018/019 + accuracy, on
-  `chg-`/agent-rag PRs and nightly). They run and can fail, but *blocking merge* on them
-  requires David's branch-protection setting + the `ANTHROPIC_API_KEY` repo secret (the
-  clinical-gate is inert without it). Doc-drift already runs inside `tests/unit` (P-1).
+- **CI gates are blocking on the PR path only (admin push bypasses them).** P-6 is
+  otherwise complete: `validate-manifests` (every PR) and `clinical-gate` (GC-018/019 +
+  accuracy) run, the `ANTHROPIC_API_KEY` secret is set, and both are required status
+  checks on `main`. The residual gap is `enforce_admins: false` with no required review —
+  an admin pushing directly to `main` lands unreviewed, ungated commits, which is how the
+  2026-07-29 118-commit backlog merged. Closing it means enabling "Include administrators"
+  (David's step) and accepting that emergency direct pushes then require a temporary
+  disable. Doc-drift already runs inside `tests/unit` (P-1).
 - **Medical Director case resolution is unimplemented.** The review queue
   (`GET /authorizations/review-queue`) reads real escalated decisions, and `/feedback`
   writes a real precedent, but nothing records a director's *disposition*: no
@@ -237,8 +250,9 @@ These are the intended end-states, moved here so they are not mistaken for curre
   (`agents/evidence_grounding.py`) can also verify citations against *retrieved RAG
   chunks*. Today the retriever hands the agent concatenated text with no ids, so P-5
   grounds only against submission `EvidenceItem` ids.
-- **CI enforcement (P-6):** the `validate-manifests` + `clinical-gate` jobs exist and
-  run; what remains is branch protection making them build-blocking (David's step).
+- **CI enforcement (P-6): done, minus the admin bypass.** The jobs exist, run, and are
+  required status checks on `main` (verified 2026-07-29). What remains is
+  `enforce_admins` — see Limitations.
 - **Integration test tier:** `tests/integration/` holds 2 real-Postgres tests
   (`test_submit_postgres.py`, marked `postgres`), which skip unless `POSTGRES_TEST_URL`
   is set — `make test-postgres`. The intent is wider end-to-end coverage across real
