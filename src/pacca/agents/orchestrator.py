@@ -15,13 +15,20 @@ Architecture teaching note — why a separate Orchestrator?
       in here, without rewriting the decision logic
     - You can test escalation logic independently of LLM calls
 
-The 7-branch escalation tree (PRD SS5.4 — now fully implemented):
+The 7-branch escalation tree (PRD SS5.4 — now fully implemented, and grown
+beyond the original PRD scope on the pre-flight side):
 
-  PRE-FLIGHT CHECKS (run before any agent call):
-    Branch 4: Experimental treatment   → always route to human review
-    Branch 5: Rare condition           → always route to human review
-    Branch 6: Conflicting guidelines   → always route to human review
-    Branch 7: Prior denial same service→ always route to human review
+  PRE-FLIGHT CHECKS (deterministic, run before any agent call — 7 checks,
+  all evaluated in ClinicalRiskDetector.evaluate()). Any single check
+  firing routes the case directly to human review via
+  _handle_pre_flight_escalation; the Decision Agent is never called:
+    Branch 4: Experimental treatment    → always route to human review
+    Branch 5: Rare condition            → always route to human review
+    Branch 6: Conflicting guidelines    → always route to human review
+    Branch 7: Prior denial same service → always route to human review
+    High cost                           → always route to human review
+    Pediatric complexity                → always route to human review
+    Adult complexity                    → always route to human review
 
   POST-AGENT CHECKS (run after Decision Agent returns) — thresholds are
   settings-driven via effective_settings(); the values below are the current
@@ -31,10 +38,21 @@ The 7-branch escalation tree (PRD SS5.4 — now fully implemented):
     Branch 2: escalation <= confidence < auto-approve (default 0.90–0.95) → Medical Director Agent
     Branch 3: confidence < escalation threshold (default 0.90)            → human review queue
 
-  The pre-flight checks are the key architectural addition in Week 2.
-  They ensure certain cases NEVER reach autonomous decision regardless of
-  how confident the AI appears. This is not a limitation — it is a
-  deliberate clinical safety property of the system.
+  The pre-flight checks are the key architectural addition in Week 2, later
+  extended (iter-3 chg-1, iter-5 chg-3, iter-6 chg-2) with cost- and
+  complexity-based policy checks. They ensure certain cases NEVER reach
+  autonomous decision regardless of how confident the AI appears. This is
+  not a limitation — it is a deliberate clinical safety property of the
+  system.
+
+  Naming note: the three checks added after Week 2 (high cost, pediatric
+  complexity, adult complexity) are labeled "Branch 2" in
+  ClinicalRiskDetector's own code comments, borrowing the confidence-routing
+  branch's name. That label does NOT mean they route to the Medical
+  Director Agent — like branches 4-7, any hit short-circuits straight to
+  human review, before the Decision Agent ever runs. Treat all seven
+  pre-flight checks as one undifferentiated gate; the "Branch 2" name in
+  clinical_risk_detector.py is a leftover label, not a routing distinction.
 
 Teaching note — pre-flight before post-flight:
   You might wonder: why not just run the Decision Agent on every case and
@@ -85,7 +103,8 @@ class Orchestrator:
     Coordinates the full 7-branch prior authorization decision pipeline.
 
     Responsibilities:
-      - Run pre-flight clinical risk checks (Branches 4-7)
+      - Run pre-flight clinical risk checks (7 deterministic checks: PRD
+        branches 4-7 plus the cost/complexity checks added in iter-3/5/6)
       - Run the Frontline Decision Agent on cases that pass pre-flight
       - Apply confidence thresholds (Branches 1-3)
       - Escalate to Medical Director Agent when confidence is ambiguous
@@ -131,7 +150,7 @@ class Orchestrator:
         prior_denial_codes = prior_denial_codes or []
 
         # ═════════════════════════════════════════════════════════════════════
-        # PRE-FLIGHT: Branches 4-7 — run BEFORE any LLM call
+        # PRE-FLIGHT: 7 deterministic checks — run BEFORE any LLM call
         # ═════════════════════════════════════════════════════════════════════
         #
         # Teaching note: these checks are deterministic policy rules. They
