@@ -434,14 +434,20 @@ class TestEvaluatorLogic:
         evaluator.client = AsyncMock()
         return evaluator
 
-    def mock_judge_response(self, score: int, correct: bool, hallucination: bool) -> MagicMock:
-        """Build a mock Anthropic response with a judge verdict."""
+    def mock_judge_response(self, score: int, fabrication: bool) -> MagicMock:
+        """
+        Build a mock Anthropic response with a judge verdict.
+
+        chg-25: the judge's JSON contract no longer includes `correct_outcome`
+        (that is now computed deterministically in `evaluate_case()`, never
+        asked of the judge — see `outcome_matches_expected()`) and
+        `hallucination_detected` is renamed `fabrication_detected`.
+        """
         import json
 
         verdict = {
             "score": score,
-            "correct_outcome": correct,
-            "hallucination_detected": hallucination,
+            "fabrication_detected": fabrication,
             "missing_citations": [],
             "judge_reasoning": f"Test score {score} — mock verdict.",
         }
@@ -457,7 +463,7 @@ class TestEvaluatorLogic:
         """evaluate_case() must return a JudgeVerdict for any valid case."""
         evaluator = self.make_mock_evaluator()
         evaluator.client.messages.create = AsyncMock(  # type: ignore[method-assign,unused-ignore]
-            return_value=self.mock_judge_response(score=4, correct=True, hallucination=False)
+            return_value=self.mock_judge_response(score=4, fabrication=False)
         )
 
         case = GOLDEN_CASES[0]
@@ -472,14 +478,19 @@ class TestEvaluatorLogic:
         assert verdict.case_id == case.case_id
         assert verdict.score == 4
         assert verdict.passed is True
+        # GC-001's expected_outcome is AUTO_APPROVED, matching the status
+        # passed above -- correct_outcome is computed deterministically by
+        # outcome_matches_expected(), not read from the (mocked) judge JSON.
         assert verdict.correct_outcome is True
+        assert verdict.judge_model == evaluator.judge_model
+        assert verdict.judge_prompt_version
 
     @pytest.mark.asyncio
     async def test_score_below_threshold_marks_failed(self) -> None:
         """A score of 2 must mark the verdict as failed."""
         evaluator = self.make_mock_evaluator()
         evaluator.client.messages.create = AsyncMock(  # type: ignore[method-assign,unused-ignore]
-            return_value=self.mock_judge_response(score=2, correct=False, hallucination=True)
+            return_value=self.mock_judge_response(score=2, fabrication=True)
         )
 
         verdict = await evaluator.evaluate_case(
@@ -490,7 +501,7 @@ class TestEvaluatorLogic:
         )
 
         assert verdict.passed is False
-        assert verdict.hallucination_detected is True
+        assert verdict.fabrication_detected is True
 
     @pytest.mark.asyncio
     async def test_json_parse_failure_returns_score_1(self) -> None:
@@ -532,7 +543,9 @@ class TestEvaluatorLogic:
         assert report.total_cases == 5
         assert report.passed_cases == 3  # Scores 3, 4, 5 pass
         assert abs(report.accuracy - 0.6) < 0.01
-        assert report.hallucinations == ["GC-005"]
+        # chg-25: `hallucinations` is removed, not aliased -- `fabrications` is
+        # the Tier 3 (judge) counter that replaces it under a new name.
+        assert report.fabrications == ["GC-005"]
         assert "GC-004" in report.failed_cases
         assert "GC-005" in report.failed_cases
 
@@ -620,6 +633,11 @@ async def _run_cases_through_pipeline(
             prior_denial_codes=golden.prior_denial_codes,
         )
 
+        # Only a real agent-produced AuthorizationDecision has cited_evidence_ids
+        # to Tier-2 ground-check (chg-25). Pre-flight escalations and agent
+        # failures have no such object; evidence grounding is skipped for them.
+        decision = None
+
         if flags.should_pre_escalate:
             # Pre-flight fired — build the pre-flight decision
             status = AuthorizationStatus.IN_REVIEW.value
@@ -651,6 +669,8 @@ async def _run_cases_through_pipeline(
             system_decision_status=status,
             system_rationale=rationale,
             system_confidence=confidence,
+            decision=decision,
+            clinical_case=clinical_case,
         )
         verdicts.append(verdict)
 
@@ -735,8 +755,8 @@ class TestFullClinicalEvaluation:
         report = evaluator.compile_report(verdicts)
         print(f"\n{report.summary()}")
 
-        if report.hallucinations:
-            print(f"\nHallucinations detected in: {report.hallucinations}")
+        if report.fabrications:
+            print(f"\nFabrications detected in: {report.fabrications}")
 
         if report.failed_cases:
             print(f"Failed cases: {report.failed_cases}")
@@ -753,7 +773,7 @@ class TestFullClinicalEvaluation:
             f"(required: {MINIMUM_ACCEPTABLE_ACCURACY:.0%})\n"
             f"Passed: {report.passed_cases}/{report.total_cases} cases\n"
             f"Failed cases: {report.failed_cases}\n"
-            f"Hallucinations: {report.hallucinations}\n"
+            f"Fabrications: {report.fabrications}\n"
             f"{'=' * 60}\n"
             f"This failure means the system's clinical reasoning quality has "
             f"degraded below the minimum acceptable standard. Review the failed "
@@ -761,14 +781,20 @@ class TestFullClinicalEvaluation:
         )
 
     @pytest.mark.asyncio
-    async def test_zero_hallucinations_on_sparse_cases(self) -> None:
+    async def test_zero_fabrications_on_sparse_cases(self) -> None:
         """
-        Hallucination trap cases must produce zero hallucinations.
+        Hallucination trap cases must produce zero JUDGE-DETECTED FABRICATIONS.
 
-        This test runs ONLY the hallucination trap cases (GC-018, GC-019)
-        to verify the system doesn't invent clinical details when notes
-        are sparse. Hallucination in a healthcare system is a patient
-        safety event — zero tolerance is the correct standard.
+        Renamed from `test_zero_hallucinations_on_sparse_cases` (chg-25): the
+        assertion is UNCHANGED (still zero-tolerance on GC-018/GC-019, still
+        the same two sparse-notes cases, still fails the moment any is
+        detected) — only the name and the field it reads
+        (`fabrication_detected`, not `hallucination_detected`) changed, to
+        match the narrower Tier 3 definition in `JUDGE_SYSTEM_PROMPT`. This
+        test runs ONLY the hallucination-trap cases (GC-018, GC-019) to
+        verify the system doesn't invent clinical details when notes are
+        sparse. A fabrication in a healthcare system is a patient safety
+        event — zero tolerance is the correct standard.
         """
         if not os.getenv("ANTHROPIC_API_KEY"):
             pytest.skip("ANTHROPIC_API_KEY not set — skipping live evaluation")
@@ -819,12 +845,12 @@ class TestFullClinicalEvaluation:
             )
             verdicts.append(verdict)
 
-        hallucinated = [v.case_id for v in verdicts if v.hallucination_detected]
+        fabricated = [v.case_id for v in verdicts if v.fabrication_detected]
 
-        assert len(hallucinated) == 0, (
-            f"\nHALLUCINATION DETECTED — ZERO TOLERANCE VIOLATION\n"
-            f"Cases with hallucination: {hallucinated}\n"
-            f"Hallucination in a healthcare AI system means the agent invented "
+        assert len(fabricated) == 0, (
+            f"\nFABRICATION DETECTED — ZERO TOLERANCE VIOLATION\n"
+            f"Cases with fabrication: {fabricated}\n"
+            f"Fabrication in a healthcare AI system means the agent invented "
             f"clinical details not present in the submission. This is a patient "
             f"safety issue and must be fixed before any production deployment.\n"
             f"Review agents/decision.py system prompt — add explicit instruction: "
