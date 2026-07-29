@@ -5,7 +5,7 @@
   "author": "David Reed",
   "base_model": "claude-sonnet-4-5-20250929",
   "previous_iteration_tag": "harness-iter-18",
-  "summary": "chg-26 repairs a false positive chg-25 put into the repo's strictest assertion. GC-018 forbade 'PD-L1 TPS', a bare criterion NAME. That worked while a JUDGE read the list, since a judge tells 'PD-L1 TPS: NOT documented' from 'PD-L1 TPS is 62%'. chg-25 moved the check to a string matcher, which cannot, so changing the READER redefined the keyword: a correct rationale listing what the notes omit failed the zero-tolerance gate on 1 of 6 runs. Rule: forbid assertions, never criterion names.",
+  "summary": "Two repairs to the evaluation instrument, both measuring the wrong thing. chg-26: GC-018 forbade 'PD-L1 TPS', a bare criterion NAME -- safe while a JUDGE read the list, a false positive once chg-25 moved the check to a string matcher, failing the zero-tolerance gate on correct behaviour. chg-27: three ids each named two different cases, invisible because every count counted unique IDS -- 108 objects reported as 105, and only 71 are ever evaluated.",
   "changes": [
     {
       "id": "chg-26",
@@ -31,7 +31,7 @@
         "The surviving traps are assertion-shaped but not negation-proof. 'no test results confirm eligibility' and 'no EGFR negative result was provided' would both trip Tier 1 while being correct. Not observed in 8 probe trials, but the same class as the defect fixed here, and it is the first thing to check when the gate next flakes.",
         "Removing the keyword narrows deterministic coverage: a fabricated PD-L1 value phrased without an assertion trap ('PD-L1 TPS 62%') is now caught only by the judge arm. Accepted deliberately -- a value-bearing pattern ('PD-L1 TPS of') catches one phrasing and misses 'is 62%' and bare '62%', and a trap that looks deterministic while being partial is the failure mode chg-25 existed to remove.",
         "Scope is one keyword on one case, because two attempts at a structural rule for finding others died against the data: 'a forbidden keyword that contains a required keyword' flags 12 cases including GC-019, which does not have this defect; a bare-noun-phrase heuristic flags 154 traps and misses this one. The distinction is semantic and stays authoring judgment, which is why the durable artifact is a guide rule rather than a dataset-integrity check.",
-        "PRE-EXISTING, carried forward from chg-25 and still open: GC-101/102/103 are duplicated across adult_complexity_cases.py and oncology_breadth_cases.py (109 case-id occurrences, 106 unique). Counters keyed by case_id remain ambiguous for those three. Needs its own change."
+        "PRE-EXISTING, carried forward from chg-25 and CLOSED by chg-27 in this same iteration: GC-101/102/103 were duplicated across adult_complexity_cases.py and oncology_breadth_cases.py. Note the figures quoted while it was open (109 case-id occurrences, 106 unique) were themselves produced by a source-text grep and were wrong -- the dataset holds 108 case objects with 105 unique ids. Both numbers came from counting the wrong noun, which is precisely the defect chg-27 fixes."
       ],
       "constraint_level": "evaluation_harness",
       "why_this_component": "GC-018 is the case behind test_zero_fabrications_on_sparse_cases, the repo's single most safety-critical assertion and a required status check on main. A gate that fails on correct behaviour is worse than one that is merely noisy: it trains readers to re-run until green, which is exactly how a real fabrication would eventually be waved through. Fixing the keyword restores the gate's meaning; the attribution message restores its usability.",
@@ -42,6 +42,41 @@
         "claim": "Before chg-26, GC-018's reasoning_must_not_include contained 'PD-L1 TPS', and a correct rationale reporting that criterion as undocumented produced a Tier 1 forbidden-keyword hit, tripping the zero-tolerance gate with no fabrication present.",
         "verified_by": "Six live agent runs on GC-018 at HEAD 2c3eaa7, each scored with check_reasoning_constraints(); plus the make test-clinical failure at the same HEAD.",
         "result": "1 of 6 runs produced a Tier 1 hit on 'PD-L1 TPS', verbatim: '**PD-L1 TPS status:** NOT documented. No assay result, no percentage, no date.' The clinical gate failed with 'FABRICATION DETECTED -- ZERO TOLERANCE VIOLATION Cases with a confirmed violation: [GC-018]'. Judge fabrication_detected was False in the same runs, confirming the Tier 1 arm as the source."
+      }
+    },
+    {
+      "id": "chg-27",
+      "type": "improvement",
+      "description": "Renumber oncology-breadth GC-101/102/103 to GC-106/107/108, resolving three case_id collisions where one id identified two different clinical cases. Add tests/unit/test_dataset_integrity.py: a GATE asserting no two case objects share an id, and a non-gating REPORT censusing which case objects any evaluation run actually executes. Correct the dataset count in holdout.py and DATASET_SUFFICIENCY.md from 105 to 108, and record that only 71 of the 108 are evaluated.",
+      "files": [
+        "tests/clinical/oncology_breadth_cases.py",
+        "tests/clinical/holdout.py",
+        "tests/unit/test_dataset_integrity.py",
+        "docs/DATASET_SUFFICIENCY.md",
+        "docs/AGENT_LESSONS.md"
+      ],
+      "failure_pattern": "The evaluation dataset's own size was misreported for seven weeks. Three case ids each identified two entirely different clinical cases, making every case_id-keyed evaluation counter ambiguous for those ids, and leaving held_out_cases() able to resolve one declared id to two objects. Correcting the count then exposed a larger fact: a third of the authored dataset is executed by no evaluation run at all.",
+      "root_cause": "Every measurement of the dataset counted unique IDS rather than case objects. all_dataset_case_ids() returns frozenset[str]; DATASET_SUFFICIENCY.md stated the size as 'verified by unique-ID count'; and test_holdout_and_in_sample_partition_the_full_dataset, whose docstring promises 'No case may be silently dropped', compares id sets too. A set collapses a collision into one entry, so the count stayed self-consistent and plausible while being wrong. Both authoring PRs checked whether the id range was free and both got 'yes' from that same instrument: RUNBOOK_iter6.md:514 records 'dataset is at GC-100; these are GC-101..GC-103', true on 2026-05-31, and the 2026-06-06 oncology PR independently reached the identical conclusion about ids the first PR had already taken.",
+      "predicted_fixes": [
+        "A case_id now identifies exactly one clinical case, so case_id-keyed counters (failed_cases, constraint violations, the fabrication census) are unambiguous and held_out_cases() cannot resolve one declared id to two objects. Deterministic and provable offline: test_no_two_cases_share_a_case_id fails against the pre-renumber tree and passes after.",
+        "The dataset's reported size is now derived from case objects, not ids, so a future collision changes the count instead of hiding inside it. The gate makes the recurrence loud rather than silent.",
+        "The gap between authored and evaluated is visible on every CI run rather than latent. The census prints objects, unique ids, both run sizes and the unreached list, and asserts only that the arithmetic balances -- so the 37 cannot drift while still appearing accounted-for."
+      ],
+      "risk_cases": [
+        "UNRESOLVED and deliberately not fixed here: 37 of 108 case objects are executed by no evaluation run -- whole specialty files (hematology GC-080/081/082, oncology-depth GC-084..088, depth-extension GC-091..100, denial GC-034/035/036, oncology-breadth GC-104/106/107/108). They are imported by test_clinical_accuracy.py and swept statically for keywords, so they look wired. Wiring them into the gate roughly doubles clinical-gate runtime and API spend and moves the accuracy baseline, so it is its own scoped change. Reported, not gated, per David's decision.",
+        "The renumber changes a published figure. PACCA_PRD_v2.6_Consolidated.md repeats '105 cases' in roughly ten places including the entire section 16 clinical-validation chapter, and CHANGELOG.md records 'oncology breadth GC-101 -> GC-105'. Those are versioned work-sample artifacts; correcting them needs a version bump and is David's editorial call, NOT done here. Until then the PRD overstates neither safety nor accuracy, but does misstate dataset size and says nothing about the evaluated subset.",
+        "Statistical claims derived at the stated 105 figure (10 pp aggregate-drop detection, DENY-class sufficiency) were computed on a number that was wrong by three and, more importantly, on an assumption that the dataset is exercised. The direction of the error is small for size and large for coverage; neither has been re-derived.",
+        "First-claim-wins was the tie-break, so oncology-breadth moved. That preserves RUNBOOK_iter6's worked complexity-score examples and the adult-complexity ids that the accuracy gate actually runs, at the cost of making CHANGELOG's 'GC-101 -> GC-105' line historically inaccurate."
+      ],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "The case_id is the primary key of the entire evaluation record: every counter, every failed-case list, the holdout partition and the audit trail of which case produced which verdict are keyed by it. A duplicate key silently corrupts all of them, and it did so undetected because the instrument used to check for duplicates was itself keyed the same way. Fixing the collision without also fixing how the dataset is counted would leave the detection gap open for the next allocation.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Revert the renumber commit to restore GC-101/102/103 in oncology_breadth_cases.py; the id sets in holdout.py are computed, not literal, so they follow automatically. The integrity guard and the census are independent of the renumber and should be kept regardless -- the gate would simply go red again, which is the correct signal. No src/ file is touched and no schema changes, so the runtime is unaffected.",
+      "baseline": {
+        "claim": "Before chg-27, three case ids each identified two different clinical cases, and every count in the repo reported the dataset as 105 while it held 108 case objects.",
+        "verified_by": "tests/unit/test_dataset_integrity.py run against the pre-renumber tree, de-duplicating cases by object identity rather than by case_id.",
+        "result": "test_no_two_cases_share_a_case_id FAILED listing GC-101, GC-102 and GC-103 with two distinct titles each (spironolactone vs metastatic colorectal; cholecystectomy vs HR+/HER2- breast; epoetin alfa vs pancreatic nal-IRI). The census printed 'case objects on disk: 108, unique case ids: 105'. After the renumber: 108 and 108, gate green, census unchanged at 37 unreached."
       }
     }
   ],
