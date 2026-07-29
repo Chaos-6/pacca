@@ -143,7 +143,9 @@ PULMONOLOGY_ADULT_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.AUTO_APPROVED,
         expected_branch=EscalationBranch.BRANCH_1_AUTO_APPROVE,
         reasoning_must_include=["pulmonary rehabilitation", "mMRC", "ATS"],
-        reasoning_must_not_include=["experimental", "deny"],
+        # chg-25 review (F2): "denying" backfilled -- whole-word matching no
+        # longer catches it implicitly from "deny".
+        reasoning_must_not_include=["experimental", "deny", "denying"],
         clinical_rationale=(
             "Post-exacerbation COPD with documented functional impairment "
             "and physician referral. CMS NCD 240.8 criteria met. Clean "
