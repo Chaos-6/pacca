@@ -210,22 +210,53 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          base="${BASE_SHA:-origin/main}"
+
+          # The base must come from the event, because the two events carry it in
+          # different places. A pull_request has base.sha; a push has `before`, the
+          # sha main pointed at BEFORE this push landed.
+          #
+          # The old code was `base="${BASE_SHA:-origin/main}"`, and that fallback was
+          # silently fatal on a push. BASE_SHA is empty on a push, so base became the
+          # literal ref origin/main -- which, after actions/checkout of a push to main,
+          # IS HEAD. Diffing HEAD against itself is empty by construction, so the gate
+          # answered "skip" for every push to main no matter what it contained, and a
+          # skipped required check reports SUCCESS. Observed 2026-07-29 on run
+          # 30470889996: a push carrying chg-19 through chg-25 went green ungated.
+          case "$EVENT_NAME" in
+            pull_request*) base="$BASE_SHA" ;;
+            push)          base="$PUSH_BEFORE_SHA" ;;
+            *)             base="" ;;
+          esac
+
+          # Fail OPEN. Branch creation sends an all-zero `before`; a force-push can
+          # send a sha that no longer exists. Either way the pushed range is
+          # uncomputable, so we cannot show the change is harmless -- and an
+          # unprovable change gets gated, not waved through. Preferring the cheap
+          # answer to the safe one is the bug above, and it is worth stating as a
+          # rule: an undecidable base runs the gate.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || \
+             ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::clinical-gate: base '${base:-unset}' is unresolvable — running rather than skipping"
+            exit 0
+          fi
+
           # Commit subjects and file names are only piped to grep, never executed.
           if git diff --name-only "$base"...HEAD | grep -qE '^src/pacca/(agents|rag)/'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::clinical-gate: PR touches agent/rag code"; exit 0
+            echo "::notice::clinical-gate: change touches agent/rag code"; exit 0
           fi
           if git log --format='%s' "$base"...HEAD | grep -qE '^chg-'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::clinical-gate: PR carries a chg- (behavioral) commit"; exit 0
+            echo "::notice::clinical-gate: change carries a chg- (behavioral) commit"; exit 0
           fi
           echo "run=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::clinical-gate skipped — no agent/rag change or chg- commit"
+          echo "::notice::clinical-gate skipped — no agent/rag change or chg- commit in ${base}...HEAD"
 
       - name: Check for API key (opt-in by secret)
         id: key
