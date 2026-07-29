@@ -405,7 +405,87 @@ out-of-sample about the deterministic pre-flight safety layer that
 `ClinicalRiskDetector` implements. Authoring GC-106+ pre-flight cases
 (experimental treatment, rare condition, conflicting guidelines, prior
 denial — never referenced under `src/pacca/`) is named here as the follow-up
-that closes this gap; it is out of scope for this change.
+that closes this gap; it is out of scope for this change. *(ID note: that
+follow-up originally said "GC-106+". chg-27 renumbered three colliding cases
+into GC-106/107/108, so the next free id is **GC-109**.)*
+
+### In-sample vs held-out on a matched case mix (2026-07-29)
+
+The two headline figures — 89.7% in-sample, 87.5% held-out — were never
+comparable, and the gap between them was routinely read as evidence about
+memorisation. It is not. The in-sample gate is 35.9% `AUTO_APPROVED` and
+includes **5 pre-flight cases decided deterministically with no model call**;
+the held-out set is 59.4% `AUTO_APPROVED` with zero pre-flight. That is a
+difference in difficulty, not in contamination.
+
+This is the first matched comparison. Two controls: pre-flight cases dropped
+from in-sample (they are free correct answers, so 39 → 34 LLM-decided), and
+`correct_outcome` compared **within `expected_outcome` strata**, then
+direct-standardised to the in-sample stratum mix. `correct_outcome` is the
+metric rather than the 1–5 judge score, to keep judge variance out of a
+measurement about model behaviour. Both partitions were run at the same HEAD
+(`9b66df4`); in-sample from CI run 30480853423, held-out locally.
+
+| Partition | n | correct-outcome |
+|---|---|---|
+| In-sample, LLM-decided (pre-flight removed) | 34 | **88.2%** (95% CI 73.4–95.3) |
+| Held-out, raw | 32 | 87.5% (95% CI 71.9–95.0) |
+| Held-out, **standardised to in-sample mix** | 32 | **88.7%** |
+
+**Standardised gap: −0.5 pp** (unstandardised +0.7 pp; 95% CI by Newcombe
+**−15.9 to +17.8 pp**).
+
+**Reading it.** The raw spread is fully accounted for by the two confounds;
+nothing is left for memorisation to explain. This **rules out a large
+memorisation effect** — the in-sample figure appears to reflect capability
+rather than recall of the cases the prompt was tuned against. It does **not**
+rule out a modest one: at these n's the interval is ±17 pp, so a 5–10 pp effect
+is entirely compatible with this data. Narrowing to ±5 pp needs roughly 4× the
+cases in both partitions. Report this as "no large effect detected", never as
+"no contamination".
+
+#### The per-stratum result, which matters more
+
+| Stratum | in-sample | held-out |
+|---|---|---|
+| AUTO_APPROVED | 13/14 (92.9%) | 16/19 (84.2%) |
+| IN_REVIEW | 17/18 (94.4%) | 10/11 (90.9%) |
+| **DENIED** | **0/2 (0%)** | 2/2 (100%) |
+
+Both in-sample DENY cases fail, with the same signature: **GC-026** (low-risk
+prostate proton-beam) and **GC-027** (cardiac cath for atypical chest pain)
+each returned `IN_REVIEW` at 0.00 confidence where `DENIED` was expected, both
+scored 2, and in both the judge found the system had *invented a conflict*
+between guidelines that were unambiguous and aligned toward denial. These are
+persistent across runs, not judge noise.
+
+The ratio is n=2 vs n=2 and means little on its own; the shared failure mode is
+what makes it worth recording. Tracked as the chg-28 candidate.
+
+#### Why the DENY stratum cannot currently be measured
+
+| | count |
+|---|---|
+| DENIED cases authored | 7 |
+| …executed by the in-sample gate | 2 (GC-026, GC-027) |
+| …executed by the held-out report | 2 (GC-039, GC-105) |
+| …**executed by nothing** | **3 (GC-034, GC-035, GC-036 — all of `DENIAL_CASES`)** |
+
+The smallest, most commercially consequential and worst-performing class is
+also the least evaluated. Worse, **GC-034 and GC-035 are named inside the
+agent's own prompt surface** (`prompts/templates.py`, and `long_term_memory.md`
+which is injected wholesale) — so they are contaminated *and* unmeasured: no
+holdout value left to spend, and no measurement being taken. GC-036 is named
+only in `roadmap_reader.py`, SME tooling the DecisionAgent never sees, so it is
+still clean.
+
+Wiring `DENIAL_CASES` into evaluation is therefore close to free — three cases,
+roughly 45 s of added gate runtime — and takes evaluated DENY coverage from 4/7
+to 7/7. It does not make the stratum *measurable*: at n=7 the Wilson interval is
+still about ±26 pp. A DENY stratum estimated to ±15 pp needs roughly **20–25
+cases**, i.e. ~15 more authored. That is the concrete cost of eliminating this
+weak point, and it is the highest-value authoring batch available — the one
+class that is simultaneously failing and untested.
 
 ## What ships in Phase H5
 
