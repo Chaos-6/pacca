@@ -38,7 +38,7 @@ def _verdict(case_id: str, passed: bool) -> JudgeVerdict:
         passed=passed,
         judge_reasoning="synthetic test verdict",
         correct_outcome=passed,
-        hallucination_detected=False,
+        fabrication_detected=False,
         missing_citations=[],
     )
 
