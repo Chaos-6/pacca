@@ -78,7 +78,10 @@ PEDIATRIC_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.AUTO_APPROVED,
         expected_branch=EscalationBranch.BRANCH_1_AUTO_APPROVE,
         reasoning_must_include=["mild", "well-controlled", "GINA"],
-        reasoning_must_not_include=["specialist required", "escalate"],
+        # chg-25 review (F2): whole-word matching no longer catches
+        # morphological variants implicitly ("escalated", "escalates") --
+        # backfilled explicitly per docs/CASE_AUTHORING_GUIDE.md § 6.
+        reasoning_must_not_include=["specialist required", "escalate", "escalated", "escalates"],
         clinical_rationale=(
             "Routine pediatric ICS refill in a well-controlled mild "
             "intermittent asthma case. No complexity drivers: mild severity, "
