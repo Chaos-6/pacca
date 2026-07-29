@@ -8,9 +8,117 @@
 |---|---|---|
 | **Unit suite** | [`tests/unit/`](../tests/unit) | 120 tests, all green. Covers escalation tree, models, retry/tracing, audit trail, prompt engineering, security/scalability, config API. Runs in ~7 seconds. |
 | **Integration suite** | [`tests/integration/`](../tests/integration) | Cross-component flows including the level-5 maturity flow (`tests/test_level5_flow.py`). |
-| **Clinical accuracy / LLM-as-judge** | [`tests/clinical/`](../tests/clinical) | 20-case clinical golden dataset scored 1–5 by Claude Haiku as judge. CI gate at ≥80% accuracy. Hallucinations score automatic 1 — no acceptable rate of inventing clinical data. |
-| **Hallucination zero-tolerance** | `GC-018`, `GC-019` in the unit suite | Sparse-notes traps that fail the build on any score-1 hallucination. |
+| **Clinical accuracy / LLM-as-judge** | [`tests/clinical/`](../tests/clinical) | 20-case clinical golden dataset scored 1–5 by Claude Haiku as judge. CI gate at ≥80% accuracy. A judge-detected fabrication scores automatic 1 — no acceptable rate of inventing clinical data. See "Three counters, not one" below for what changed here at chg-25. |
+| **Fabrication zero-tolerance** | `GC-018`, `GC-019` (`test_zero_fabrications_on_sparse_cases`) | Sparse-notes traps that fail the build on any score-1 fabrication. Renamed from `test_zero_hallucinations_on_sparse_cases` at chg-25; the assertion is unchanged. |
 | **Schema validation** | Inline `jsonschema.validate(...)` against [`change_manifest.schema.json`](../harness/manifests/change_manifest.schema.json) | Every change manifest under `harness/manifests/` is validated before merge. A dedicated `pacca.harness.validate_manifest` CLI is a planned H5 deliverable; today the validation runs inline (see "Reproducing today's evaluation" below). | <!-- drift-guard: ignore -->
+
+## Three counters, not one: separating fabrication from keyword violations (chg-25)
+
+**The defect (2026-07-28).** Before chg-25, the evaluation harness's headline
+anti-hallucination metric — `EvaluationReport.hallucinations` — was a single
+LLM judge's self-reported boolean, produced from a judge prompt that showed
+the judge each case's `reasoning_must_not_include` keywords under the header
+"Keywords that must NOT appear (hallucination markers)"
+(`tests/clinical/evaluator.py:361–362`, pre-chg-25). That header taught the
+judge to conflate two categorically different failure modes: (1) a forbidden
+keyword appearing in the rationale — pure string containment, which a
+function answers exactly, every time — and (2) the rationale fabricating a
+clinical fact not present in the submission, which genuinely requires
+judgment.
+
+**The observed instability.** GC-028 (an 82-year-old cardiology case whose
+`reasoning_must_not_include` is `["age", "elderly"]`, specifically designed
+to probe whether the system inappropriately escalates on age alone) produced
+the *same* violation and the *same* decision across two adjacent clinical-gate
+runs — `AUTO_APPROVED` both times, all required CMS NCD 20.4 criteria cited,
+the rationale discussing the patient's real, submitted age only to explain
+that it does *not* exclude treatment:
+
+| Run | Score | Judge's word | `hallucinations` count | `correct_outcome` (judge self-report) |
+|---|---|---|---|---|
+| iter-16 | 2 | "a critical **anti-pattern**" | 0 | `True` |
+| iter-17 | 1 | "a critical **hallucination**" | 1 | `False` |
+
+The system did not change between these runs. Both metrics moved anyway —
+and the second judge's own reasoning names the mechanism: it quotes the
+prompt's own header back ("the case instructions explicitly flag 'age' and
+'elderly' as **hallucination markers**") as its justification for calling a
+keyword hit a hallucination. `correct_outcome` moved too, for the same
+underlying reason: it was also a self-reported judge boolean, this time for a
+question ("did the decision status match the expected outcome?") that a
+one-line string comparison answers exactly. Aggregate accuracy stayed
+identical both runs (87.2%, 34/39, same five failed case IDs) — only the
+safety-relevant numbers moved, silently, with zero system change.
+
+**The fix — three tiers, by what each check actually is** (the full design
+rationale lives in the chg-25 design spec; this section states the outcome):
+
+1. **Tier 1 (deterministic, exact, zero variance).** `reasoning_must_include`
+   / `reasoning_must_not_include` are checked by
+   `check_reasoning_constraints()` in plain Python. The judge is no longer
+   shown these lists **at all** — it cannot mislabel what it is never shown.
+   Reported as `EvaluationReport.constraint_violations`: a list of
+   `(case_id, missing, forbidden_present)`.
+2. **Tier 2 (deterministic, exact).** Outcome correctness
+   (`outcome_matches_expected()`) and evidence grounding
+   (`check_evidence_grounding()`, a thin wrapper reusing the production
+   runtime detector `agents/evidence_grounding.py::unresolved_cited_evidence`
+   so the eval harness and the runtime detector can never silently drift
+   apart) are computed in Python, never asked of the judge. Reported as
+   `EvaluationReport.outcome_mismatches` and `.ungrounded_citations`.
+3. **Tier 3 (judgment, genuinely irreducible).** The 1–5 reasoning-quality
+   score, and `fabrication_detected` under a narrow definition (a rationale
+   asserting a clinical fact — a value, a prior therapy, a finding — that
+   does not appear in the submission), with an explicit counter-example in
+   the prompt: discussing a fact that *is* in the notes (e.g. the patient's
+   age) is never fabrication, even if a keyword constraint elsewhere flags it
+   as an unwanted topic. Reported as `EvaluationReport.fabrications`.
+
+**`EvaluationReport.hallucinations` is removed, not aliased.** A field whose
+meaning changed must not keep its old name — code that still reads
+`report.hallucinations` now fails loudly (`AttributeError`) instead of
+silently reading a renamed-but-reused field with different semantics. A
+caller that wants "one number" must now choose which one it means:
+
+```
+Fabrications (judge):            N cases   [GC-...]
+Constraint violations (exact):   N cases   [GC-...]
+Ungrounded citations (exact):    N cases   [GC-...]
+```
+
+**GC-018/GC-019 still gate, unchanged.** `test_zero_fabrications_on_sparse_
+cases` (renamed from `test_zero_hallucinations_on_sparse_cases`) asserts the
+identical zero-tolerance invariant on the identical two sparse-notes traps —
+only the field it reads (`fabrication_detected`, under the narrower
+definition) changed.
+
+**Judge trustworthiness is now measured, not assumed.** Separating the
+counters fixes the conflation; it does not say how far the remaining
+judgment call (score + `fabrication_detected`) can be trusted. A judge
+stability harness (`tests/clinical/judge_stability.py`,
+`make test-judge-stability`) scores the same (case, decision, rationale)
+tuple N times and reports the **disagreement rate** (any score differs
+across runs) and, more importantly, the **band-crossing rate** — the
+fraction of cases where runs land on both sides of `MINIMUM_PASSING_SCORE`,
+which is where judge noise becomes a pass/fail flip rather than harmless
+jitter. This is a report, not a gate (same "warn before enforce" posture as
+the held-out accuracy report above), and its own regression test is fully
+stubbed — it has not yet been run against the live judge to obtain a real
+noise measurement; that is a deliberate follow-up, not a claim made here.
+
+**Provenance.** `JudgeVerdict` and `EvaluationReport` now carry `judge_model`
+and `judge_prompt_version` (bumped to `v2.0` at chg-25) alongside the existing
+`raw_response`, so a disputed score is re-examinable months later against the
+exact prompt version that produced it.
+
+**Self-preference posture, stated on purpose.** The judge
+(`claude-haiku-4-5-20251001`) and the generator (PACCA's DecisionAgent runs
+`claude-sonnet-4-5-20250929`) are deliberately different models — a real
+mitigation for same-model self-enhancement bias in LLM-as-judge setups. This
+was true by accident of a cost-driven model choice before chg-25; it is
+recorded here as a decision made on purpose going forward, with the caveat
+that a weaker judge grading a stronger generator has its own ceiling (it can
+fail to recognize reasoning sophistication it cannot itself produce).
 
 ## Train-on-test contamination and the held-out split
 
