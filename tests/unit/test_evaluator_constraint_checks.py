@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from tests.clinical.evaluator import ClinicalEvaluator, ConstraintCheck, check_reasoning_constraints
 from tests.clinical.expansion_cases import EXPANSION_CASES
+from tests.clinical.geriatric_cases import GERIATRIC_CASES
 from tests.clinical.golden_cases import EscalationBranch, ExpectedOutcome, GoldenCase
 
 # ── The real GC-028 case, exactly as authored in expansion_cases.py ──────────
@@ -156,7 +157,86 @@ def test_gc_028_end_to_end_produces_constraint_violation_and_not_fabrication() -
     assert report.fabrications == []
 
 
-# ── Exactness properties: case-insensitivity, substring semantics, empty/None ──
+# ── Before/after sweep: GC-028, GC-046, GC-048 (post-review word-boundary fix) ──
+#
+# The three real, authored cases whose reasoning_must_not_include includes
+# "age": GC-028 (expansion_cases.py), GC-046 and GC-048 (geriatric_cases.py).
+# For each, this pins what SUBSTRING matching (the bug) counted versus what
+# WHOLE-WORD matching (the fix) counts, on a plausible correct rationale.
+#
+# OLD (substring) is reconstructed here with plain Python `in` containment --
+# not by re-running removed code -- purely to make the before/after
+# comparison concrete and permanently checkable, not just narrated.
+
+
+def _old_substring_forbidden_present(case: GoldenCase, rationale: str) -> list[str]:
+    """Reconstruction of the pre-fix (buggy) substring-containment rule, kept
+    ONLY to make the before/after comparison below a permanent, checkable
+    fact rather than a one-time narrated claim. Not used by production code."""
+    rationale_lower = rationale.lower()
+    return [kw for kw in case.reasoning_must_not_include if kw.lower() in rationale_lower]
+
+
+GC_046 = next(c for c in GERIATRIC_CASES if c.case_id == "GC-046")
+GC_048 = next(c for c in GERIATRIC_CASES if c.case_id == "GC-048")
+
+
+def test_gc_046_age_false_positive_from_coverage_is_fixed() -> None:
+    """
+    GC-046 (85yo cataract surgery, forbidden ["age", "elderly", "frailty"]).
+    A plausible CORRECT rationale that never discusses the patient's age at
+    all -- it says "coverage" -- must not trigger forbidden "age".
+    """
+    rationale = (
+        "Confirming coverage for cataract extraction: visual acuity 20/100 "
+        "with a documented falls history meets AAO functional-impact "
+        "criteria. No active ocular comorbidity. Approved per routine CMS "
+        "coverage."
+    )
+    assert _old_substring_forbidden_present(GC_046, rationale) == ["age"], (
+        "Sanity check: the OLD substring rule DID false-positive here "
+        "(via 'coverage') -- this is the bug being fixed."
+    )
+    assert check_reasoning_constraints(GC_046, rationale).forbidden_present == []
+
+
+def test_gc_048_age_false_positive_from_average_is_fixed() -> None:
+    """
+    GC-048 (82yo elective THA, forbidden ["age", "elderly", "frailty"]). A
+    plausible CORRECT rationale using "average" (conservative-therapy
+    duration) -- never discusses the patient's age -- must not trigger
+    forbidden "age".
+    """
+    rationale = (
+        "HOOS score of 28 (severe disability) with average conservative-"
+        "therapy trial duration exceeding AAOS thresholds: NSAIDs, 12 weeks "
+        "of physical therapy, and two corticosteroid injections all failed. "
+        "ASA 2, pre-op clearance documented. Approved."
+    )
+    assert _old_substring_forbidden_present(GC_048, rationale) == ["age"], (
+        "Sanity check: the OLD substring rule DID false-positive here "
+        "(via 'average') -- this is the bug being fixed."
+    )
+    assert check_reasoning_constraints(GC_048, rationale).forbidden_present == []
+
+
+def test_gc_028_still_violates_for_the_right_reason() -> None:
+    """
+    GC-028 must STILL violate on the fixture rationale -- it genuinely says
+    "the patient's age (82 years)..." with "age" as its own word -- but now
+    for the correct reason (a real standalone-word match), not merely
+    because "age" happens to be a substring of some other word in the text.
+    Both OLD and NEW rules agree here, which is exactly the point: the fix
+    changes what non-violations get miscounted, not what real violations
+    are caught.
+    """
+    assert _old_substring_forbidden_present(GC_028, GC_028_FIXTURE_RATIONALE) == ["age"]
+    assert check_reasoning_constraints(GC_028, GC_028_FIXTURE_RATIONALE).forbidden_present == [
+        "age"
+    ]
+
+
+# ── Exactness properties: case-insensitivity, whole-word semantics, empty/None ──
 
 
 def _make_case(
@@ -193,27 +273,122 @@ def test_match_is_case_insensitive_for_forbidden_keywords() -> None:
     assert check.forbidden_present == ["ELDERLY"]
 
 
-def test_forbidden_keyword_matches_as_substring_not_whole_word() -> None:
+def test_forbidden_keyword_requires_whole_word_not_substring() -> None:
     """
-    Documents and PINS the substring (not word-boundary) semantics carried
-    over unchanged from the removed judge-prompt keyword check (plain Python
-    `in` containment on lowercased text). A short forbidden keyword matches
-    inside a longer word too -- "age" inside "averages" -- which is exactly
-    why case authors must choose specific keywords (see GC-028 above, where
-    this same property fires on a real, intentional case). This is a
-    deliberate, documented trade-off, not a bug: moving the check out of the
-    judge changes WHO decides it, not WHAT the decision is.
+    CORRECTED (post-review): matching is whole-word, NOT substring. An
+    earlier version of this test pinned substring matching as "carried over
+    from the judge-prompt check" -- that was false (the pre-chg-25 judge
+    prompt contained no Python containment check at all; the judge applied
+    semantic judgment to a rendered keyword list). Substring matching was in
+    fact a NEW, stricter rule that would have produced false positives on
+    ordinary oncology/prior-auth vocabulary: "coverage", "dosage", "stage",
+    "agent" all contain "age" as a substring and none of them are about a
+    patient's age. Whole-word matching fixes this: "age" no longer matches
+    inside "averages".
     """
     case = _make_case(reasoning_must_not_include=["age"])
     check = check_reasoning_constraints(case, "Cost averages were reviewed for this plan.")
-    assert check.forbidden_present == ["age"]
+    assert check.forbidden_present == []
 
 
-def test_required_keyword_matches_as_substring_not_whole_word() -> None:
-    """Same substring semantics apply symmetrically to reasoning_must_include."""
+def test_forbidden_age_does_not_false_positive_on_common_prior_auth_vocabulary() -> None:
+    """
+    The concrete false-positive class the coordinator identified: in a
+    prior-authorization system reasoning about oncology, "coverage",
+    "dosage", "stage"/"staging", and "antineoplastic agent" are not edge
+    cases -- they are the vocabulary. None of these may trigger a forbidden
+    "age".
+    """
+    case = _make_case(reasoning_must_not_include=["age"])
+    vocabulary_sentences = [
+        "Confirming coverage under the member's current plan.",
+        "The dosage was adjusted per renal function.",
+        "Disease stage was confirmed by imaging prior to treatment.",
+        "Requesting authorization for an antineoplastic agent per NCCN guidance.",
+        "Cost averages were reviewed for this plan.",
+        "Triage was completed by the on-call nurse.",
+        "The care management team will follow up in two weeks.",
+        "No organ damage was noted on the most recent scan.",
+        "Usage of the prior authorization portal increased this quarter.",
+        "The percentage of patients meeting criteria was documented.",
+        "Packages of medication were shipped to the specialty pharmacy.",
+    ]
+    for sentence in vocabulary_sentences:
+        check = check_reasoning_constraints(case, sentence)
+        assert check.forbidden_present == [], (
+            f"False positive on ordinary vocabulary: {sentence!r} incorrectly "
+            f"flagged forbidden keyword 'age'."
+        )
+
+
+def test_forbidden_keyword_still_matches_as_its_own_word() -> None:
+    """The fix must not become so strict it stops matching real violations --
+    "age" as its own standalone word must still be caught, in several
+    realistic surrounding-punctuation shapes."""
+    case = _make_case(reasoning_must_not_include=["age"])
+    for sentence in [
+        "The patient's age (82 years) does not exclude ICD therapy.",
+        "Age alone is not an exclusion criterion.",
+        "This is an age-related consideration.",  # hyphen is a non-word char boundary
+    ]:
+        check = check_reasoning_constraints(case, sentence)
+        assert check.forbidden_present == ["age"], f"Should have matched in: {sentence!r}"
+
+
+def test_forbidden_keyword_does_not_match_morphological_variants() -> None:
+    """
+    Deliberate, not an oversight: a forbidden "age" does not implicitly
+    also forbid "aged" or "ages" -- stemming/normalizing a keyword is
+    exactly the kind of behavior a reader cannot predict from reading the
+    keyword list. A case that means to forbid the variants too must list
+    them explicitly.
+    """
+    case = _make_case(reasoning_must_not_include=["age"])
+    assert check_reasoning_constraints(case, "This aged patient qualifies.").forbidden_present == []
+    assert check_reasoning_constraints(case, "Symptoms present for ages.").forbidden_present == []
+
+    case_with_variants = _make_case(reasoning_must_not_include=["age", "aged", "ages"])
+    assert check_reasoning_constraints(
+        case_with_variants, "This aged patient qualifies."
+    ).forbidden_present == ["aged"]
+
+
+def test_required_keyword_matches_as_whole_word() -> None:
+    case = _make_case(reasoning_must_include=["NCCN"])
+    check = check_reasoning_constraints(case, "Per NCCN guidance, approved.")
+    assert check.missing == []
+
+
+def test_required_keyword_does_not_match_as_part_of_a_longer_token() -> None:
+    """Symmetric to the forbidden-keyword case: "NCCN" glued directly to a
+    version string ("NCCNv4.2025") is a different token, not a match --
+    the required keyword is correctly reported missing."""
     case = _make_case(reasoning_must_include=["NCCN"])
     check = check_reasoning_constraints(case, "Per NCCNv4.2025 guidance, approved.")
-    assert check.missing == []
+    assert check.missing == ["NCCN"]
+
+
+def test_dollar_and_percent_keywords_match_as_whole_tokens() -> None:
+    """
+    Regression guard for the lookaround-vs-\\b choice: keywords starting or
+    ending in a non-word character ("$100,000", "62%") must still match when
+    they appear as their own token, surrounded by whitespace/punctuation --
+    a naive `\\b...\\b` implementation fails to match these AT ALL (verified
+    during chg-25 review: \\b dropped both to zero hits across the full case
+    corpus), because \\b requires a word-char/non-word-char transition and
+    neither the keyword's edge character nor typical surrounding whitespace
+    is a word character.
+    """
+    case = _make_case(reasoning_must_not_include=["$100,000", "62%"])
+    check = check_reasoning_constraints(
+        case, "Annual cost exceeds $100,000 and PD-L1 TPS was 62% on biopsy."
+    )
+    assert check.forbidden_present == ["$100,000", "62%"]
+
+    # And must NOT match as part of a longer number.
+    case_longer = _make_case(reasoning_must_not_include=["62%"])
+    check_longer = check_reasoning_constraints(case_longer, "The result was 162% of baseline.")
+    assert check_longer.forbidden_present == []
 
 
 def test_empty_keyword_lists_produce_no_violation() -> None:
