@@ -1,0 +1,120 @@
+{
+  "iteration": 17,
+  "iteration_tag": "harness-iter-17",
+  "iso_date": "2026-07-28",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-16",
+  "summary": "chg-24 bounds submit_authorization's DB transaction to the work rather than the request. It had been held open across the Claude API calls (~23s), making SQLite concurrency literally 1, pinning a Postgres connection idle-in-transaction, and costing 55 audit rows to 'database is locked' in one clinical run. Also defines the duplicate-request_id contract, which previously returned an unhandled 500.",
+  "changes": [
+    {
+      "id": "chg-24",
+      "type": "improvement",
+      "description": "Commit T1 (request write) before the LLM work and open a short T2 for the decision write, so no DB transaction spans the Claude API calls. Defines the duplicate-request_id contract: idempotent replay, 409 on a reused id carrying a different case, resume after a died attempt, 409 while an attempt is in flight.",
+      "files": [
+        "src/pacca/api/routes/authorizations.py",
+        "src/pacca/db/repository.py",
+        "tests/unit/test_txn_boundaries.py",
+        "tests/unit/test_txn_concurrency.py",
+        "tests/unit/test_duplicate_request_id.py",
+        "tests/unit/test_duplicate_request_id_race.py",
+        "tests/integration/test_submit_postgres.py"
+      ],
+      "failure_pattern": "A long-lived DB write transaction held open across an external network call. FastAPI's get_session commits at end-of-request, and this request makes 1-3 Claude calls in the middle, so the write lock taken at the request insert was held for the whole ~23s.",
+      "root_cause": "Transaction lifetime was coupled to request lifetime by the session dependency. Nothing in the route closed T1 before orchestrator.process_decision, so the lock, the connection and the open transaction spanned the LLM window.",
+      "evidence": [
+        {
+          "source": "measured, both backends, 2026-07-28",
+          "note": "Lock hold 0.5095s -> 0.0013s (SQLite) and 0.5436s -> 0.0026s (Postgres). engine.pool.checkedout() == 0 during the LLM window after the change."
+        },
+        {
+          "source": "concurrency, measured",
+          "note": "SQLite N=10: 1/10 -> 10/10 completions, audit_write_failed 30 -> 0, wall 22.4s -> 0.61s. Postgres N=20 on pool 15: 15/20 -> 20/20, audit_write_failed 65 -> 0, wall 120.7s -> 0.91s. Independently reproduced by adversarial validation."
+        },
+        {
+          "source": "duplicate request_id, pre-change",
+          "note": "Verified by execution: a second submission with the same request_id hit the unique index and fell through to except Exception -> HTTP 500. There was no duplicate handling in the route at all."
+        }
+      ],
+      "predicted_fixes": [
+        "T1 transaction hold drops below 10ms and N=10 concurrent SQLite submissions all complete. Measured true: 1-4ms, 10/10.",
+        "Zero audit_write_failed events under concurrency on both backends, because chg-23's independent audit session no longer competes with a long-lived writer.",
+        "No duplicate-request_id path returns 500. Same case replays idempotently with no new LLM call; a reused id carrying a different case returns 409 and never the stored decision."
+      ],
+      "risk_cases": [
+        "Cross-patient decision leak on a reused request_id -- mitigated by a field-level check on patient_id/primary_diagnosis_code/treatment_code, proven capable of catching a naive replay implementation. It is NOT a payload fingerprint: a different case sharing those three fields would replay.",
+        "A duplicate arriving while the first submission is in flight produced two decisions and then permanently 500'd that request_id (found by adversarial validation, not by the suite). Mitigated by an age-vs-agent_timeout heuristic plus a decision lookup that can no longer raise on multiplicity.",
+        "The in-flight heuristic is a heuristic, not a lease. A request legitimately exceeding agent_timeout (60s) is misclassified as dead and resumed; conversely a genuinely dead request cannot be retried for up to agent_timeout because it still looks in flight. A claimed_at/worker_id lease column is the rigorous fix and needs a migration.",
+        "Replay asymmetry: a replayed decision always reports cited_evidence_ids == [] because no column persists it, so an EHR client diffing first response against replay sees that field differ.",
+        "Keeping the injected session rather than a session factory (a deliberate deviation, forced by ~24 existing tests that call the route function directly) left the resume path re-pinning a connection across the LLM call -- 0.5445s with checkedout()==1. Fixed with a path-specific commit; a session factory would have made the class structurally impossible."
+      ],
+      "constraint_level": "tool_implementation",
+      "why_this_component": "The defect is in the route's transaction management, not in any agent's reasoning, tool or prompt. agents/orchestrator.py was deliberately untouched. The harness taxonomy has no name for the request/persistence layer; tool_implementation is the closest fit and the gap is recorded rather than force-fitted.",
+      "phi_impact": "indirect",
+      "audit_relevant": true,
+      "rollback_plan": "Revert the chg-24 commits touching authorizations.py and repository.py. No migration, no schema change -- the status column already existed. The new test files can remain; they would fail against reverted code, which is useful signal."
+    }
+  ],
+  "verdicts": [
+    {
+      "change_id": "chg-21",
+      "previous_iteration_tag": "harness-iter-16",
+      "outcome": "keep",
+      "verified_fixes": [
+        "Boundary matrix through the real _call_with_retry: 500/503/504/529/599 retried to llm_retry_max_attempts; 499 and the full 4xx set attempted exactly once.",
+        "max_retries=0 on the client makes tenacity the sole retry authority: worst case for a persistent 5xx is exactly llm_retry_max_attempts HTTP requests under one visible schedule, down from up to 9 under two.",
+        "retry-after / retry-after-ms honoured and clamped to llm_retry_wait_max_seconds; a hostile 86400 clamps to 30s."
+      ],
+      "missed_fixes": [
+        "Disabling the SDK retry loop initially discarded its retry-after handling -- a rate-limit regression traded for a visibility fix. Caught in review, not by any test, and restored at the tenacity layer in the same iteration."
+      ],
+      "false_predicted_fixes": [],
+      "verified_risks": [
+        "MagicMock implements __float__ (returns 1.0), so an unconfigured mock header would have parsed as a real 1s retry-after and introduced actual sleeping into the suite. Guarded by an isinstance check; recorded as AGENT_LESSONS P-011."
+      ],
+      "unforeseen_regressions": [],
+      "notes": "Clinical gate passed 9/9 at the iter-16 merge HEAD; golden-set 87.2% (34/39), 0 hallucinations."
+    },
+    {
+      "change_id": "chg-22",
+      "previous_iteration_tag": "harness-iter-16",
+      "outcome": "keep",
+      "verified_fixes": [
+        "A scope violation after the request row exists persists exactly one decision row and is returned by list_escalated_for_review().",
+        "The persistence audit across every escalation exit was independently re-derived by execution using total-table row counts: pre-flight, evidence-grounding, confidence branch 3, kill switch, Medical Director (both outcomes) and RAG-degraded all already persisted exactly one row.",
+        "The persist failure envelope covers SQLAlchemyError, so a database failure inside the handler is audited rather than escaping as an unaudited 500."
+      ],
+      "missed_fixes": [
+        "The initial envelope caught only ScopeViolation and IntegrityError; an OperationalError from get_by_id escaped as an unaudited 500. Widened in the same iteration."
+      ],
+      "false_predicted_fixes": [],
+      "verified_risks": [
+        "A violation on the db.write_decision action itself still never reaches the queue -- the re-guard deterministically re-denies. Correct fail-closed behaviour, audited as escalation_persist_failed, and recorded rather than left in a code comment."
+      ],
+      "unforeseen_regressions": [],
+      "notes": "The deliberate non-persist on a db.write_request-time violation was independently judged correct: persisting would perform the exact write the guard denied."
+    },
+    {
+      "change_id": "chg-23",
+      "previous_iteration_tag": "harness-iter-16",
+      "outcome": "keep",
+      "verified_fixes": [
+        "On real Postgres 16: a normal successful request persists 7/7 route audit rows with request_id intact, and pre-write rows survive a business-transaction rollback. Both measured 0 before migration 007.",
+        "Live A/B on identical code proved migration 007 necessary rather than convenient: at 006 the same code persisted 0/7 with seven ForeignKeyViolationErrors; at 007, 7/7 with none.",
+        "Both original CRITICALs are structurally unreachable: the retry path is deleted, and the returned entry never enters a session so it cannot become detached."
+      ],
+      "missed_fixes": [
+        "The independent audit session competes with the request's own long-lived write transaction on SQLite, costing 55 audit rows to 'database is locked' in one clinical run. Invisible on Postgres (MVCC) and not caught by any test -- surfaced by the clinical gate itself. Fixed by chg-24, which removes the long-lived transaction.",
+        "A non-AsyncEngine bind silently degraded the commit to savepoint semantics with zero error events -- a silent fallback in the lane whose purpose was eliminating silent failure. Now refused loudly."
+      ],
+      "false_predicted_fixes": [],
+      "verified_risks": [
+        "Migration 007's downgrade is a one-way door on any Postgres database that has exercised rollback survival: orphaned request_id values are produced by design, so re-adding the FK fails. It fails safe (transactional DDL) and the cleanup procedure is documented in the migration."
+      ],
+      "unforeseen_regressions": [
+        "The SQLite lock contention above. It is the clearest case this cycle of a fix whose cost appeared only on the backend its tests did not exercise -- recorded as AGENT_LESSONS P-009."
+      ],
+      "notes": "The first version of this change would have destroyed 7 of 7 audit rows per SUCCESSFUL request on Postgres while passing every SQLite test. Caught by adversarial validation against a real container, not by the 890-test suite."
+    }
+  ]
+}

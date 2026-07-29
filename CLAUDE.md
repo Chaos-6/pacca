@@ -81,7 +81,9 @@ every PR is one path or the other, never ambiguous.
   (there is no middleware loader) that denies out-of-scope tool/DB/RAG calls against
   the `IntentRecord` and raises `ScopeViolation` → `EscalationReason.SCOPE_VIOLATION`.
   **As built (chg-8 → chg-9, +1 site at chg-20, +1 at chg-22):** wired into the submit
-  route in **enforce** mode at five sites — four identifier-checked DB writes
+  route in **enforce** mode at five sites — three in `submit_authorization` itself and two in
+  the escalation helpers it calls (`_handle_rag_degraded_escalation`,
+  `_persist_scope_violation_escalation`), extracted at chg-24. Four identifier-checked DB writes
   (`db.write_request`; `db.write_decision` at the normal-flow persist; again at the
   RAG-degraded escalation persist; again at the scope-violation escalation persist) and
   the RAG query. `learn_from_feedback` carries a sixth site (`rag.write_precedent`) under
