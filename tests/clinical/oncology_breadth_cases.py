@@ -10,15 +10,15 @@ a commercial-payer claim mix) rather than gap-closure, so this file adds
 the high-incidence cancer types not yet represented at depth, with a
 deliberate spread of outcomes to keep the eval honest.
 
-  GC-101  Metastatic colorectal — FOLFIRI + bevacizumab        AUTO_APPROVED
-  GC-102  HR+/HER2- metastatic breast — ribociclib + letrozole AUTO_APPROVED
-  GC-103  Metastatic pancreatic 2nd-line, ECOG 3               IN_REVIEW
+  GC-106  Metastatic colorectal — FOLFIRI + bevacizumab        AUTO_APPROVED
+  GC-107  HR+/HER2- metastatic breast — ribociclib + letrozole AUTO_APPROVED
+  GC-108  Metastatic pancreatic 2nd-line, ECOG 3               IN_REVIEW
   GC-104  Metastatic clear-cell RCC — pembrolizumab + axitinib AUTO_APPROVED
   GC-105  Metastatic urothelial — EV monotherapy, wrong line   DENIED
 
 Outcome spread: 3 AUTO_APPROVED, 1 IN_REVIEW, 1 DENIED. The two
 non-approve cases probe distinct failure modes:
-  - GC-103: an approved drug whose appropriateness is questionable for
+  - GC-108: an approved drug whose appropriateness is questionable for
     THIS patient (ECOG 3 — excluded from the registration trials;
     NCCN recommends best supportive care at this performance status).
     Tests that the system separates "is the drug guideline-listed" from
@@ -28,9 +28,9 @@ non-approve cases probe distinct failure modes:
     treatment-naïve, cisplatin-eligible patient is a sequencing error.
     Tests step/sequence logic, not on/off-formulary.
 
-GC-101 deliberately differs from GC-034 (off-label pancreatic nivolumab,
+GC-106 deliberately differs from GC-034 (off-label pancreatic nivolumab,
 DENIED): there the drug had no compendia support; here every drug is
-guideline-listed and the discriminator is patient-fit (GC-103) or
+guideline-listed and the discriminator is patient-fit (GC-108) or
 line-of-therapy (GC-105).
 """
 
@@ -44,10 +44,10 @@ from tests.clinical.golden_cases import (
 
 ONCOLOGY_BREADTH_CASES: list[GoldenCase] = [
     # ─────────────────────────────────────────────────────────────────────────
-    # GC-101 — Metastatic colorectal cancer, FOLFIRI + bevacizumab first-line.
+    # GC-106 — Metastatic colorectal cancer, FOLFIRI + bevacizumab first-line.
     # ─────────────────────────────────────────────────────────────────────────
     GoldenCase(
-        case_id="GC-101",
+        case_id="GC-106",
         title="Metastatic colorectal — FOLFIRI + bevacizumab first-line per NCCN",
         diagnosis_code="C18.9",
         diagnosis_description="Malignant neoplasm of colon, unspecified",
@@ -89,10 +89,10 @@ ONCOLOGY_BREADTH_CASES: list[GoldenCase] = [
         ),
     ),
     # ─────────────────────────────────────────────────────────────────────────
-    # GC-102 — HR+/HER2- metastatic breast cancer, CDK4/6i + AI first-line.
+    # GC-107 — HR+/HER2- metastatic breast cancer, CDK4/6i + AI first-line.
     # ─────────────────────────────────────────────────────────────────────────
     GoldenCase(
-        case_id="GC-102",
+        case_id="GC-107",
         title="HR+/HER2- metastatic breast — ribociclib + letrozole first-line",
         diagnosis_code="C50.911",
         diagnosis_description="Malignant neoplasm of unspecified site of right female breast",
@@ -133,12 +133,12 @@ ONCOLOGY_BREADTH_CASES: list[GoldenCase] = [
         ),
     ),
     # ─────────────────────────────────────────────────────────────────────────
-    # GC-103 — Metastatic pancreatic, 2nd-line nal-IRI, ECOG 3 (appropriateness).
+    # GC-108 — Metastatic pancreatic, 2nd-line nal-IRI, ECOG 3 (appropriateness).
     # The drug is guideline-listed; the patient's performance status is the
     # discriminator. Approved-drug ≠ appropriate-for-this-patient.
     # ─────────────────────────────────────────────────────────────────────────
     GoldenCase(
-        case_id="GC-103",
+        case_id="GC-108",
         title="Pancreatic 2nd-line nal-IRI at ECOG 3 — performance-status review",
         diagnosis_code="C25.9",
         diagnosis_description="Malignant neoplasm of pancreas, unspecified",
