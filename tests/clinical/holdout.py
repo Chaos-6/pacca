@@ -153,10 +153,22 @@ _ALL_CASE_LISTS: tuple[list[GoldenCase], ...] = (
 
 
 def all_dataset_case_ids() -> frozenset[str]:
-    """Every case_id across the full clinical dataset (105 cases as of 2026-07-27).
+    """Every case_id across the full clinical dataset (108 as of 2026-07-29).
 
     Computed by importing the case modules directly rather than hardcoding
     a count or an id range, so it tracks the dataset as it grows.
+
+    It tracks IDS, not cases, and that distinction is load-bearing. Being a
+    frozenset, this collapses two different cases sharing one id into a single
+    entry — which is exactly how three collisions (GC-101/102/103) stayed
+    invisible from 2026-06-06 to 2026-07-29 while every count in the repo,
+    including this one, reported the dataset as "105". The figure above is now
+    108 because chg-27 renumbered the duplicates, not because cases were added.
+
+    For anything that must reason about case OBJECTS — how many exist, which
+    ones an evaluation actually runs — use
+    tests/unit/test_dataset_integrity.py, which de-duplicates by object
+    identity. A count taken from this function cannot answer those questions.
     """
     return frozenset(case.case_id for cases in _ALL_CASE_LISTS for case in cases)
 
