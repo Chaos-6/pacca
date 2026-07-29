@@ -142,6 +142,10 @@ async def investigate(case_id: str) -> int:  # noqa: PLR0912, PLR0915
     )
 
     print(f"Pre-flight should_pre_escalate: {flags.should_pre_escalate}")
+    # Only a real agent-produced AuthorizationDecision has cited_evidence_ids to
+    # ground-check (Tier 2). Pre-flight escalations and agent failures have no
+    # such object — evidence grounding is skipped for them ("where recorded").
+    decision = None
     if flags.should_pre_escalate:
         print(f"  Reasons : {[r.value for r in flags.reasons]}")
         print(f"  Details : {flags.details}")
@@ -193,11 +197,20 @@ async def investigate(case_id: str) -> int:  # noqa: PLR0912, PLR0915
         system_decision_status=status,
         system_rationale=rationale,
         system_confidence=confidence,
+        decision=decision,
+        clinical_case=clinical_case,
     )
     print(f"Score                  : {verdict.score}")
     print(f"Passed (≥3)            : {verdict.passed}")
-    print(f"Correct outcome        : {verdict.correct_outcome}")
-    print(f"Hallucination detected : {verdict.hallucination_detected}")
+    print(f"Correct outcome (exact): {verdict.correct_outcome}")
+    print(f"Fabrication detected   : {verdict.fabrication_detected}")
+    print(f"Constraint violation   : {verdict.constraint_check.has_violation}")
+    if verdict.constraint_check.has_violation:
+        print(f"  Missing (must-include)  : {verdict.constraint_check.missing or '(none)'}")
+        print(
+            f"  Forbidden present       : {verdict.constraint_check.forbidden_present or '(none)'}"
+        )
+    print(f"Ungrounded citations   : {verdict.ungrounded_citations or '(none)'}")
     print(f"Missing citations      : {verdict.missing_citations or '(none)'}")
     print()
     print(SUB)
@@ -217,8 +230,8 @@ async def investigate(case_id: str) -> int:  # noqa: PLR0912, PLR0915
             f"  → WRONG OUTCOME: agent returned {status!r}, "
             f"expected {golden.expected_outcome.value!r}"
         )
-    elif verdict.hallucination_detected:
-        print("  → HALLUCINATION: agent invented clinical detail (see judge reasoning)")
+    elif verdict.fabrication_detected:
+        print("  → FABRICATION: agent invented clinical detail (see judge reasoning)")
     elif verdict.score == 1:
         print(
             "  → SCORE 1: per the rubric (evaluator.py lines 70–76), "
