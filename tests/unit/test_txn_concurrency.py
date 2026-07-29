@@ -184,8 +184,11 @@ async def _run_concurrent_pair(db_url: str, monkeypatch) -> dict:
 @pytest.mark.asyncio
 async def test_two_concurrent_sqlite_submissions_both_complete(db_url, monkeypatch):
     """THE HEADLINE TEST (spec §4 item 1). Must pass against the fixed code
-    on this branch. See test_two_concurrent_sqlite_submissions_fails_on_
-    reverted_code below for the P-010 fail-then-pass proof."""
+    on this branch. The P-010 fail-then-pass proof (RED against f3eb7a3,
+    restored and confirmed GREEN) was an inline revert
+    (`git show f3eb7a3:... > authorizations.py`, backed up first, restored
+    after -- never `git stash`), not a second committed test -- see the
+    executor's final report for the pasted RED/GREEN output."""
     outcome = await _run_concurrent_pair(db_url, monkeypatch)
 
     exceptions = [r for r in outcome["results"] if isinstance(r, BaseException)]
