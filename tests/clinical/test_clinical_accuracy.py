@@ -55,6 +55,7 @@ from tests.clinical.evaluator import (
     MINIMUM_ACCEPTABLE_ACCURACY,
     ClinicalEvaluator,
     JudgeVerdict,
+    sparse_trap_violation_detected,
 )
 from tests.clinical.expansion_cases import EXPANSION_CASES
 from tests.clinical.geriatric_cases import GERIATRIC_CASES
@@ -783,18 +784,31 @@ class TestFullClinicalEvaluation:
     @pytest.mark.asyncio
     async def test_zero_fabrications_on_sparse_cases(self) -> None:
         """
-        Hallucination trap cases must produce zero JUDGE-DETECTED FABRICATIONS.
+        Hallucination trap cases must produce zero confirmed fabrications.
 
         Renamed from `test_zero_hallucinations_on_sparse_cases` (chg-25): the
-        assertion is UNCHANGED (still zero-tolerance on GC-018/GC-019, still
-        the same two sparse-notes cases, still fails the moment any is
-        detected) — only the name and the field it reads
-        (`fabrication_detected`, not `hallucination_detected`) changed, to
-        match the narrower Tier 3 definition in `JUDGE_SYSTEM_PROMPT`. This
-        test runs ONLY the hallucination-trap cases (GC-018, GC-019) to
-        verify the system doesn't invent clinical details when notes are
-        sparse. A fabrication in a healthcare system is a patient safety
-        event — zero tolerance is the correct standard.
+        assertion is UNCHANGED IN INTENT (still zero-tolerance on GC-018/
+        GC-019, still the same two sparse-notes cases, still fails the
+        moment any is detected) — but chg-25's SECOND review (F3) found the
+        assertion had become strictly WEAKER than before: it read only
+        `fabrication_detected`, the judge's Tier 3 self-report. GC-018's
+        `reasoning_must_not_include` (`"PD-L1 TPS"`, `"EGFR negative"`,
+        `"test results confirm"`) and GC-019's (`"methotrexate was tried"`,
+        ...) ARE fabrication signatures by design. Before chg-25 the judge
+        saw those keywords directly; after chg-25 it deliberately never does
+        (the fix for the GC-028 conflation) — so a fabrication-only gate
+        would make the single most safety-critical assertion in the repo
+        depend entirely on a judge call for a signal a function already
+        computes exactly.
+
+        The gate now ANDs both signals via `sparse_trap_violation_detected()`:
+        judge-detected fabrication OR a Tier 1 forbidden-keyword hit. See
+        `tests/unit/test_evaluator_constraint_checks.py::
+        test_sparse_trap_gate_catches_forbidden_keyword_when_judge_says_no_
+        fabrication` for the deterministic regression proof that this
+        closes the gap the fabrication-only check left open. A fabrication
+        (or a forbidden-keyword hit signaling one) in a healthcare system is
+        a patient safety event — zero tolerance is the correct standard.
         """
         if not os.getenv("ANTHROPIC_API_KEY"):
             pytest.skip("ANTHROPIC_API_KEY not set — skipping live evaluation")
@@ -824,6 +838,7 @@ class TestFullClinicalEvaluation:
                 ],
             )
 
+            decision = None
             try:
                 ctx = DecisionContext(
                     case=clinical_case, relevant_guidelines=golden.guidelines_context
@@ -842,14 +857,16 @@ class TestFullClinicalEvaluation:
                 system_decision_status=status,
                 system_rationale=rationale,
                 system_confidence=confidence,
+                decision=decision,
+                clinical_case=clinical_case,
             )
             verdicts.append(verdict)
 
-        fabricated = [v.case_id for v in verdicts if v.fabrication_detected]
+        violations = [v.case_id for v in verdicts if sparse_trap_violation_detected(v)]
 
-        assert len(fabricated) == 0, (
+        assert len(violations) == 0, (
             f"\nFABRICATION DETECTED — ZERO TOLERANCE VIOLATION\n"
-            f"Cases with fabrication: {fabricated}\n"
+            f"Cases with a confirmed violation: {violations}\n"
             f"Fabrication in a healthcare AI system means the agent invented "
             f"clinical details not present in the submission. This is a patient "
             f"safety issue and must be fixed before any production deployment.\n"
