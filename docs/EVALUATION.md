@@ -148,6 +148,106 @@ recorded here as a decision made on purpose going forward, with the caveat
 that a weaker judge grading a stronger generator has its own ceiling (it can
 fail to recognize reasoning sophistication it cannot itself produce).
 
+### Second review: the sparse-trap gate, morphological variants, and case-id collisions
+
+An adversarial second review of chg-25 found four more issues, in descending
+severity:
+
+**F3 (MEDIUM) — the sparse-notes zero-tolerance gate had become MORE
+judge-dependent, not less.** `test_zero_fabrications_on_sparse_cases`
+(GC-018/GC-019) read only `fabrication_detected`. But GC-018's
+`reasoning_must_not_include` (`"PD-L1 TPS"`, `"EGFR negative"`, `"test
+results confirm"`) and GC-019's (`"methotrexate was tried"`, ...) ARE
+fabrication signatures by design — the case was authored specifically so
+that seeing one of those phrases in the rationale means the agent invented
+the value. Demonstrated: a rationale containing "PD-L1 TPS of 62%" with a
+judge (correctly, per the new narrowed prompt) returning
+`fabrication_detected: False` would have passed the gate. Fixed:
+`sparse_trap_violation_detected(verdict)` ANDs the judge's Tier 3 call with
+the deterministic Tier 1 forbidden-keyword hit; a violation on EITHER
+signal fails the gate. Regression-proofed in
+`tests/unit/test_evaluator_constraint_checks.py::
+test_sparse_trap_gate_catches_forbidden_keyword_when_judge_says_no_
+fabrication` (fully mocked, no live calls).
+
+**F2 (MEDIUM) — whole-word matching removes false positives but ALSO
+removes genuine morphological-variant true positives.** Demonstrated on
+real dataset cases: forbidding `"escalate"` does not catch "This case was
+**escalated** to the medical director"; forbidding `"biologic"` does not
+catch "Patient has failed two **biologics**"; forbidding `"appropriate"`
+does not catch "dosed **appropriately**." `docs/CASE_AUTHORING_GUIDE.md`
+already said "list variants explicitly," but no case had actually been
+backfilled — an open false-negative window on the exact counter this
+change exists to make trustworthy. Backfilled (data-only, no logic
+change): `escalated`/`escalates` (GC-023), `biologics` (GC-089),
+`denying` (GC-068, GC-052), `appropriately`/`appropriateness` (GC-034,
+GC-105), `electing` (GC-033) — the last one added on the same low-risk
+"positive-claim gerund" pattern as the reviewer's own examples, not
+explicitly named but implied by the sweep. Forms carrying a NEGATION
+false-positive risk (`"denied"`, `"approval"` — a correct rationale can
+legitimately say "should not be **denied**" or reference "further
+**approval**") were deliberately NOT backfilled; see
+`tests/unit/test_evaluator_constraint_checks.py` for the reasoning per
+keyword. Unique forbidden-keyword count: 95 → 102. Re-swept: 10 keywords
+now show substring ≠ whole-word behavior (was 8) — the two new ones
+(`"appropriately"`, `"appropriateness"`) show the identical property on
+themselves (e.g. "inappropriately" substring-contains "appropriately" but
+is correctly excluded), a recursive confirmation the fix works on the
+newly-added keywords too.
+
+**F7 (LOW) — the prompt-leak guard covered 20 cases, not all 108.**
+`test_evaluator_judge_prompt.py` iterated `GOLDEN_CASES` only; the review
+rendered all 108 case objects and found zero leaks, so there was no live
+defect, but the committed guard should cover what was actually checked.
+Widened to iterate every case object. A stricter, keyword-by-keyword "must
+never appear outside `clinical_notes`" check was considered and rejected
+as impractical, with the count to prove it: 23 (case, keyword) pairs across
+the dataset have a forbidden keyword legitimately appear in
+`guidelines_context` or `judge_scoring_criteria` but not `clinical_notes`
+— e.g. GC-028's forbidden "age" appears in its own `guidelines_context`
+("Age alone is not an exclusion"), GC-023's forbidden "escalates" appears
+in its own `judge_scoring_criteria` (rubric text explaining what to
+penalize). Neither is a keyword-list leak; both are legitimate case
+content. The joined-list + header check remains the defensible form.
+
+**F5 (LOW) — multi-word keywords required an exact single space.**
+`"complete\ndocumentation"` did not match `"complete documentation"` —
+this cuts both ways: a required phrase broken across a wrapped line
+produced a spurious "missing" violation, and a forbidden phrase spanning a
+wrap silently passed through. Fixed by joining each phrase's whitespace-
+split tokens with `\s+` rather than escaping the literal space.
+
+**F1 (baseline correction, not this lane's).** The "939 passed" baseline
+in the original spec was never re-measured; the true count is 940. Noted
+here for the record — corrected in the composed harness manifest, not by
+editing this lane's own commits.
+
+**F4 (pre-existing, reported not fixed) — GC-101/GC-102/GC-103 collide
+across two case files.** `adult_complexity_cases.py` and
+`oncology_breadth_cases.py` each independently used `GC-101`/`GC-102`/
+`GC-103` for three DIFFERENT clinical cases (pre-existing since
+2026-06-06, not introduced by chg-25). Measured blast radius: 108 case
+objects, 105 unique ids — exactly these 3 collisions. All six colliding
+objects are in `IN_SAMPLE_CASE_IDS`, none in `HELD_OUT_CASE_IDS`, so there
+is no holdout contamination. Only `adult_complexity_cases.py`'s versions
+run through the live gate today (`oncology_breadth_cases.py` is not one of
+the five lists `test_full_pipeline_meets_accuracy_threshold` iterates), so
+today's live reports are not ambiguous in practice — but a
+`constraint_violations` (or `fabrications`, or `outcome_mismatches`) entry
+keyed by `case_id` alone would be genuinely ambiguous the moment both
+lists are ever evaluated together (as e.g. this change's own
+`tests/unit/test_evaluator_keyword_sweep.py::ALL_CASES` already does, for
+sweep purposes where identity doesn't matter). Confirmed:
+`tests/unit/test_eval_holdout_guard.py`'s partition-completeness assertion
+(`HELD_OUT_CASE_IDS ∪ IN_SAMPLE_CASE_IDS` = the full dataset) passes only
+because it compares **id sets** (105) rather than case **objects** (108)
+— `HELD_OUT_CASE_IDS | IN_SAMPLE_CASE_IDS` has exactly 105 members,
+matching the unique-id count, not the object count, so it is structurally
+blind to this class of collision. Renumbering is out of scope for this
+change (it touches the holdout partition, all five gate lists, and every
+published "105-case" claim) and is not attempted here; this is a report
+for sizing that follow-up, not a fix.
+
 ## Train-on-test contamination and the held-out split
 
 **The finding (2026-07-27).** The live clinical gate's "20/20 = 100%" headline is
