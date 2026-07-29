@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -154,6 +155,36 @@ def _resolves_get_current_user(route: Any) -> bool:
     return seen
 
 
+def _iter_http_routes(routes: list[Any]) -> Iterator[Any]:
+    """Every HTTP route the app actually serves, across FastAPI's two layouts.
+
+    Each yielded object exposes `.path`, `.methods` and `.dependant` — the only
+    things C8 reads — with router-level dependencies already merged in.
+
+    Why this is not just `isinstance(r, APIRoute)` any more. Through FastAPI
+    0.139, `include_router` COPIED each route into `app.routes`, so a flat
+    isinstance scan saw everything. From 0.140 it appends a single private
+    `_IncludedRouter` instead, and the real routes live behind its
+    `effective_route_contexts()` (which applies the prefix, merges the
+    router-level `dependencies=[...]`, and flattens nested includes).
+
+    A flat scan therefore finds ZERO of PACCA's routes on FastAPI >= 0.140 —
+    every one of them arrives via `include_router`. That is exactly what
+    happened: CI resolves 0.140.13, C8 enumerated 0 routes, and the security
+    guard silently passed vacuously. Only `assert checked >= 25` caught it.
+    Observed 2026-07-29; see docs/AGENT_LESSONS.md P-016.
+
+    Deliberately duck-typed rather than importing `_IncludedRouter`: it is
+    private, absent before 0.140, and may be renamed. Both layouts are
+    supported because the repo currently runs 0.135 locally and 0.140 in CI.
+    """
+    for route in routes:
+        if isinstance(route, APIRoute):
+            yield route
+        elif hasattr(route, "effective_route_contexts"):
+            yield from route.effective_route_contexts()
+
+
 def _find_unguarded_routes(routes: list[Any], public_paths: set[str]) -> tuple[int, list[str]]:
     """
     The C8 detection algorithm, extracted so it can be run against a
@@ -166,9 +197,7 @@ def _find_unguarded_routes(routes: list[Any], public_paths: set[str]) -> tuple[i
     """
     unguarded: list[str] = []
     checked = 0
-    for r in routes:
-        if not isinstance(r, APIRoute):
-            continue
+    for r in _iter_http_routes(routes):
         if r.path in public_paths:
             continue
         checked += 1
@@ -220,6 +249,40 @@ def test_c8_negative_control_detector_can_actually_fail() -> None:
     assert "/lost-guard" in unguarded[0], f"detector flagged the wrong route: {unguarded}"
     assert not any(entry.split(" ", 1)[1] == "/guarded" for entry in unguarded), (
         f"detector false-flagged the properly-guarded route: {unguarded}"
+    )
+
+
+def test_c8_enumeration_descends_into_included_routers() -> None:
+    """The enumeration must not stop at the top level of `app.routes`.
+
+    FastAPI >= 0.140 stops copying included routes into `app.routes` and appends
+    a single private `_IncludedRouter` instead, so a flat `isinstance(r,
+    APIRoute)` scan finds none of PACCA's routes — every one arrives via
+    `include_router`. CI resolves 0.140.13 and C8 duly enumerated 0 routes while
+    reporting no unguarded ones: a security check passing vacuously.
+
+    This pins the descent with a stub rather than a real app, so it fails on the
+    flat implementation no matter which FastAPI is installed. The repo currently
+    runs 0.135 locally and 0.140 in CI; a test that needed 0.140 to go red would
+    be green on the very machine the fix is written on.
+    """
+
+    class _StubContext:
+        path = "/api/v1/authorizations/nested"
+        methods = frozenset({"GET"})
+        dependant = None
+
+    class _StubIncludedRouter:
+        """Duck-types the one method `_iter_http_routes` relies on."""
+
+        def effective_route_contexts(self) -> Iterator[Any]:
+            return iter([_StubContext()])
+
+    found = list(_iter_http_routes([_StubIncludedRouter()]))
+
+    assert [r.path for r in found] == ["/api/v1/authorizations/nested"], (
+        "routes reachable only through an included router were skipped — this is "
+        "the shape that silently emptied the C8 guard on FastAPI >= 0.140"
     )
 
 
