@@ -732,7 +732,17 @@ GOLDEN_CASES: list[GoldenCase] = [
         expected_outcome=ExpectedOutcome.IN_REVIEW,
         expected_branch=EscalationBranch.BRANCH_3_LOW_CONFIDENCE,
         reasoning_must_include=["PD-L1", "documentation", "missing"],
-        reasoning_must_not_include=["PD-L1 TPS", "EGFR negative", "test results confirm"],
+        # chg-26: "PD-L1 TPS" removed. It is a bare criterion NAME, not an
+        # assertion -- and this case's own guidelines_context hands the agent
+        # that exact phrase, while must_include demands "PD-L1". A correct
+        # rationale reporting the result as absent ("PD-L1 TPS status: NOT
+        # documented") therefore tripped the zero-tolerance gate on 1 of 6 live
+        # runs, flagging fabrication where none occurred. The keyword worked
+        # while a JUDGE read it semantically; chg-25 moved the check to a string
+        # matcher, which cannot tell "NOT documented" from "is 62%". That call
+        # stays with the judge arm. The assertion-shaped traps below are
+        # unaffected and still catch an invented value deterministically.
+        reasoning_must_not_include=["EGFR negative", "test results confirm"],
         clinical_rationale=(
             "Notes provide zero clinical detail. Agent must NOT invent PD-L1 scores, "
             "EGFR status, or other lab values. Must identify documentation as insufficient. "
