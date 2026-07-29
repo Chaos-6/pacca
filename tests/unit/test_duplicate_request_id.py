@@ -5,15 +5,22 @@ Before this fix, `request_id`'s unique constraint (db/models.py) had NO
 handling in the submit route at all -- a duplicate submission raised an
 unhandled IntegrityError that the route's `except Exception` turned into an
 HTTP 500 (verified by execution in the design spec). This is not a contract
-change; it is the FIRST defined contract for the case. Four rows, all
-audited, never a 500:
+change; it is the FIRST defined contract for the case. Five rows, all
+audited, never a 500 (the fifth -- in-flight vs. died -- is FIX 1 from the
+Validator's D4 review, closing a race the original spec's "no decision ->
+resume" language didn't disambiguate):
 
-  | Case                                          | Behaviour              |
-  |------------------------------------------------|------------------------|
-  | duplicate id, decision exists, SAME case        | 200, idempotent replay |
-  | duplicate id, decision exists, DIFFERENT case   | 409, refuse            |
-  | duplicate id, no decision (died before T2)      | resume                 |
-  | new id                                          | normal path            |
+  | Case                                             | Behaviour              |
+  |---------------------------------------------------|------------------------|
+  | duplicate id, decision exists, SAME case           | 200, idempotent replay |
+  | duplicate id, decision exists, DIFFERENT case      | 409, refuse            |
+  | duplicate id, no decision, request row YOUNG       | 409, in-flight, refuse |
+  | duplicate id, no decision, request row OLD         | resume                 |
+  | new id                                             | normal path            |
+
+"Young" vs. "old" is a heuristic (request row age vs. `settings.agent_
+timeout`), not a lease -- see `_resolve_duplicate_request_id`'s docstring in
+authorizations.py for the full reasoning and its known window.
 
 THE SAFETY TEST is `test_duplicate_different_patient_returns_409_not_stored_
 decision` -- a client that reuses a request_id with a different patient must
@@ -106,6 +113,27 @@ async def _submit(session, request, monkeypatch, *, process_decision=None) -> Au
     monkeypatch.setattr(orchestrator, "process_decision", mock_pd)
     monkeypatch.setattr(rag_engine, "query", lambda *a, **k: _healthy_outcome())
     return await submit_authorization(request=request, session=session)
+
+
+async def _backdate_request(session, request_id: str, *, seconds_ago: float) -> None:
+    """Simulate a request row from a prior attempt that genuinely DIED
+    (rather than one still in flight) by pushing `submitted_at` further into
+    the past than `settings.agent_timeout` (FIX 1a's disambiguation) --
+    otherwise a row inserted moments ago in a test is indistinguishable from
+    one an in-flight submission is still working, and the resolver correctly
+    (per FIX 1a) treats it as in-flight and refuses with 409."""
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import update
+
+    from pacca.db.models import AuthorizationRequestModel
+
+    await session.execute(
+        update(AuthorizationRequestModel)
+        .where(AuthorizationRequestModel.request_id == request_id)
+        .values(submitted_at=datetime.utcnow() - timedelta(seconds=seconds_ago))
+    )
+    await session.commit()
 
 
 # =============================================================================
@@ -223,16 +251,19 @@ async def test_duplicate_same_case_replays_idempotently_without_new_llm_call(ses
 
 @pytest.mark.asyncio
 async def test_duplicate_no_decision_resumes_processing(session, monkeypatch):
-    """Case 3: duplicate request_id, NO decision yet (a prior attempt died
-    between T1 and T2) -> resumes processing against the already-persisted
-    row rather than re-inserting or raising, still exactly one request row,
-    and now completes with a real decision."""
+    """Case 3: duplicate request_id, NO decision yet, and the request row is
+    OLDER than agent_timeout -- a prior attempt is assumed to have genuinely
+    died between T1 and T2 (FIX 1a's disambiguation) -> resumes processing
+    against the already-persisted row rather than re-inserting or raising,
+    still exactly one request row, and now completes with a real decision."""
     req = _request("AUTH-DUP-3", "P-PATIENT-RESUME")
 
     # Simulate a prior attempt that reached T1 but died before T2: persist
-    # the request row directly, write no decision.
+    # the request row directly, write no decision, and backdate it past
+    # agent_timeout so the resolver reads it as died, not in-flight.
     await AuthorizationRepository(session).create(req)
     await session.commit()
+    await _backdate_request(session, "AUTH-DUP-3", seconds_ago=120)
 
     assert await DecisionRepository(session).get_by_request_id("AUTH-DUP-3") is None
 
@@ -269,8 +300,8 @@ async def test_new_request_id_takes_normal_path_never_500s(session, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_audit_actions_for_each_duplicate_case(session, monkeypatch):
-    """Each of the three duplicate-handling outcomes writes the specific
-    audit action spec §3.1 names, so the contract is queryable after the
+    """Each of the duplicate-handling outcomes writes the specific audit
+    action spec §3.1 / FIX 1a names, so the contract is queryable after the
     fact, not just observable in the HTTP response."""
     from pacca.db.repository import AuditRepository
 
@@ -290,10 +321,25 @@ async def test_audit_actions_for_each_duplicate_case(session, monkeypatch):
     rows2 = await AuditRepository(session).get_by_request_id("AUTH-DUP-AUDIT-2")
     assert any(r.action == "submission.id_reused_for_different_case" for r in rows2)
 
-    # No decision yet -> submission.resumed_after_failure
+    # No decision yet, request row OLD (past agent_timeout) -> died, resume
+    # -> submission.resumed_after_failure
     req3 = _request("AUTH-DUP-AUDIT-3", "P-D")
     await AuthorizationRepository(session).create(req3)
     await session.commit()
+    await _backdate_request(session, "AUTH-DUP-AUDIT-3", seconds_ago=120)
     await _submit(session, req3, monkeypatch)
     rows3 = await AuditRepository(session).get_by_request_id("AUTH-DUP-AUDIT-3")
     assert any(r.action == "submission.resumed_after_failure" for r in rows3)
+
+    # No decision yet, request row YOUNG (within agent_timeout) -> in-flight
+    # -> submission.in_flight_conflict, 409, no orchestrator call
+    req4 = _request("AUTH-DUP-AUDIT-4", "P-E")
+    await AuthorizationRepository(session).create(req4)
+    await session.commit()
+    in_flight_pd = AsyncMock(return_value=_decision())
+    with pytest.raises(HTTPException) as exc_info:
+        await _submit(session, req4, monkeypatch, process_decision=in_flight_pd)
+    assert exc_info.value.status_code == 409
+    assert in_flight_pd.call_count == 0, "in-flight conflict must not invoke the orchestrator"
+    rows4 = await AuditRepository(session).get_by_request_id("AUTH-DUP-AUDIT-4")
+    assert any(r.action == "submission.in_flight_conflict" for r in rows4)
