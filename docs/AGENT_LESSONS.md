@@ -251,6 +251,28 @@ Run against the three above, each premise dies in about a minute:
 
 ---
 
+### P-016 · A dependency upgrade can silently empty a security check — assert the denominator, and reproduce CI's resolution
+**Symptom.** `test_c8_every_non_public_http_route_resolves_an_rbac_dependency` — the RBAC backstop asserting no HTTP route is reachable without a role floor — failed in CI with `enumeration collapsed — only 0 routes checked`, while `make test-all` passed locally. Had the denominator assertion not existed, it would have reported **zero unguarded routes** and gone green: a security check passing vacuously.
+
+**Cause.** Two things, and the second is the one that hides:
+1. **FastAPI 0.140 changed `include_router`.** Through 0.139 it COPIED each route into `app.routes`, so a flat `isinstance(r, APIRoute)` scan saw everything. From 0.140 it appends a single private `_IncludedRouter`, and the real routes live behind its `effective_route_contexts()` (which applies the prefix, merges the router-level `dependencies=[...]`, and flattens nested includes). Every PACCA route arrives via `include_router`, so the flat scan found **none** of them.
+2. **Local and CI resolved different versions.** `pyproject.toml` pins loosely; CI installs fresh (`fastapi==0.140.13`, `starlette==1.3.1`) while the local env sat on `0.135.1`/`0.52.1`. So the failure was invisible locally *and* unreproducible by re-running the local suite.
+
+**Rules.**
+1. **Any check that scans a collection must assert the collection's size.** `assert checked >= 25` is the only reason this was caught. A guard that iterates and finds nothing must fail loudly — "no violations found" and "nothing was examined" are indistinguishable otherwise, and the second one looks like success.
+2. **Before concluding "passes locally, must be a CI fluke," reproduce CI's dependency resolution.** A throwaway venv is enough and touches nothing:
+   ```bash
+   python3 -m venv /tmp/probe && /tmp/probe/bin/pip install -e ".[dev]"
+   /tmp/probe/bin/python -m pytest tests/unit/test_rbac_adversarial.py -q
+   ```
+   This reproduced the failure in one run, and gave a place to demonstrate fail-then-pass (P-010) in the environment that actually exhibits the bug — impossible on the machine the fix was written on.
+3. **Duck-type framework internals; do not import them.** `_IncludedRouter` is private, absent before 0.140, and may be renamed. `hasattr(route, "effective_route_contexts")` supports both layouts and degrades safely.
+4. **A guard's own coverage is a claim that needs checking after every dependency bump.** This one was written 2026-07-27 and was already vacuous by 2026-07-29 — not through any code change of ours.
+
+**Related.** P-010 (watch the guard fail), P-015 (a stale `origin` hid this for two days — it had been red in CI on every push since the backlog landed), and the global L-028 (a green suite proves nothing about backstops that only engage elsewhere).
+
+---
+
 ## Git & PR workflow (PACCA-specific overlay on the global rule L-001)
 
 ### P-006 · PACCA defaults to branch-and-PR. No direct pushes to main.
