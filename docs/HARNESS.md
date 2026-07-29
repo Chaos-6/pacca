@@ -110,6 +110,34 @@ Every harness change includes a `change_manifest.json` entry naming:
 
 The manifest schema lives at `harness/manifests/change_manifest.schema.json`.
 
+**`baseline` (D6, iteration 18 forward-only).** An `improvement` or `rollback` change
+inherently asserts something about *current* behavior — "X is broken", "X regressed" — and
+that assertion is exactly the kind of claim `docs/AGENT_LESSONS.md` P-013 warns must be
+measured, not remembered: three changes on 2026-07-28 shipped or nearly shipped on an
+unverified premise about what the system already did, each falsifiable in under a minute
+once someone actually ran the command. From iteration 18 forward, `changes[].type ==
+"improvement" | "rollback"` requires a `baseline` object:
+
+```json
+"baseline": {
+  "claim": "The evaluator performs no Python keyword containment; reasoning_must_not_include is shown to the LLM judge under a 'hallucination markers' header and the judge decides semantically.",
+  "verified_by": "git show fa71251:tests/clinical/evaluator.py | grep -n 'must_include\\|must_not_include'",
+  "result": "Only lines 359 and 362, both inside the judge-prompt template. No containment check exists in code."
+}
+```
+
+- **`claim`** — what the system did *before* this change, stated as the change depends on it.
+- **`verified_by`** — the command or procedure that measured it, reproducible by a third party.
+- **`result`** — what that command actually produced.
+
+`new` and `instrumentation` changes are exempt — adding something that did not exist has no
+baseline to measure. **Forward-only, not retroactive:** iterations 0-17 predate the field and
+remain valid without it; backfilling one after the fact would mean inventing the evidence
+this gate exists to guarantee, so the record instead states plainly that the discipline
+began at iteration 18. `validate_manifest.py` enforces the cutover via the schema's `if/then`
+conditional and explains it in the error text (field, reason, and the P-013 citation) rather
+than reciting a bare "'baseline' is a required property".
+
 ### Rule 3 — Predictions are verified against the next eval round
 
 The next time the evaluation suite runs after a manifest entry lands, predicted fixes are compared against actual flipped cases, predicted risks are compared against actual regressions, and a verdict is recorded. Verdicts are append-only; rejected changes are reverted at file granularity.
