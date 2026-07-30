@@ -487,6 +487,75 @@ cases**, i.e. ~15 more authored. That is the concrete cost of eliminating this
 weak point, and it is the highest-value authoring batch available — the one
 class that is simultaneously failing and untested.
 
+### DENY-class baseline after chg-28 (2026-07-30)
+
+chg-28 added `DENIAL_CASES` to the gate, taking DENY-class coverage from 4/7 to
+7/7 and the gate from 39 to 42 cases. First reading at that state:
+
+**Gate: 85.7% (36/42)**, fabrications 0, ungrounded citations 0.
+
+> **Not comparable to the 89.7% (35/39) that preceded it, and not a
+> regression.** One *more* case passed in absolute terms (35 → 36). The
+> percentage fell because three never-scored cases entered the denominator, all
+> three from the worst-performing class. The two figures measure different sets.
+
+| In-sample DENY case | What it is | Result |
+|---|---|---|
+| GC-026 | Proton-beam, low-risk prostate — NCCN + ASTRO + CMS NCD aligned | `IN_REVIEW` ✗ (score 2) |
+| GC-027 | Cardiac cath, atypical chest pain — ACC/AHA/SCAI + Choosing Wisely | `IN_REVIEW` ✗ (score 2) |
+| GC-034 | Off-label nivolumab, pancreatic — no compendia support | `IN_REVIEW` ✗ (score 2) |
+| **GC-035** | **PT visits — 50 used of a 30-visit benefit cap** | **`DENIED` ✓ (score 5)** |
+| GC-036 | Re-request after prior denial — no new clinical evidence | `IN_REVIEW` ✗ (score 2) |
+
+**In-sample DENY: 1/5. All evaluated DENY: 3/7** (held-out contributes 2/2, n=2).
+
+#### The discriminator is administrative vs clinical, not easy vs hard
+
+The single DENY the system gets right is the only one requiring **no clinical
+judgment** — arithmetic against a contractual benefit cap. It denies that one at
+score 5. Every failure requires applying *clinical guidance* to reach denial,
+and in every one the system returns `IN_REVIEW` at 0.00 confidence, three of the
+four justifying it by asserting a guideline conflict that the case's own
+`guidelines_context` does not contain. The judge on GC-036: *"circular
+reasoning — the system abdicated its decision-making responsibility."*
+
+Note this is not difficulty. GC-035 is the *hardest* denial to defend
+commercially — a patient is refused care on a contractual limit — and the system
+does it without hesitation. GC-026 is clinically clear-cut and it will not.
+
+#### This is specified behaviour, not a defect
+
+`src/pacca/agents/decision_support/long_term_memory.md` predicts the result
+exactly. It holds four patterns. Three are approve-class and carry absolute
+anti-pattern routing — `NEVER to DENIED` (L115, L195), *"to human review, not to
+automatic denial. The agent's role is to recognize that a case doesn't fit the
+auto-approve shortcut — **NOT to make the adjudication call itself**"* (L65-68).
+The fourth (L246+) is the benefit-cap pattern, anchored on GC-035, and states at
+L256: *"**This is the only entry whose shortcut outcome is DENIED.**"*
+
+So there is exactly one deny-teaching pattern and it is administrative. **No
+memory pattern exists for guideline-based clinical denial.** The agent denies
+where it has a pattern and escalates where it does not, which is what it was
+told to do.
+
+The consequence for the harness is that this is **not a bug to fix**. Two
+deliberate decisions contradict each other: the prompt says the agent must never
+adjudicate a denial on clinical grounds (written across iters 3-6, each entry
+added after a real observed failure), and the dataset says four of these cases
+should be `DENIED` (ground truths independently verified against NCCN/ASTRO/CMS
+NCD 110.8.1 and ACC/AHA/SCAI 2021 + Choosing Wisely — they hold). One of the two
+is wrong, and deciding which is a product question about what PACCA is: a triage
+router that never refuses on clinical grounds, or an adjudicator that does.
+Tracked as chg-29; deliberately not resolved by an agent.
+
+#### Statistical caveat, stated so it is not lost
+
+n=5 in-sample and n=2 held-out. At n=7 total the Wilson interval on the DENY
+rate is roughly ±26 pp. **No DENY-rate claim is licensed by this baseline.** Its
+value is that the failure *mechanism* is now visible on 4 cases rather than 2,
+with a clean discriminating negative (GC-035). A DENY stratum measurable to
+±15 pp needs ~20-25 cases.
+
 ## What ships in Phase H5
 
 The README's v2.3 cycle commits PACCA to a unified benchmark in Phase H5 (weeks 10-12). When that lands, this document expands to cover:
