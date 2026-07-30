@@ -1,0 +1,43 @@
+{
+  "iteration": 20,
+  "iteration_tag": "harness-iter-20",
+  "iso_date": "2026-07-30",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-19",
+  "summary": "chg-28 makes the DENY class observable before anything tries to fix it. The first matched-mix comparison of in-sample against held-out (iter-19, docs/EVALUATION.md) found no large memorisation effect but surfaced a worse problem per stratum: both in-sample DENY cases fail identically, and 3 of the 7 authored DENY cases were executed by no run at all. Measurement first, behaviour second -- chg-29 cannot be verified against 2 cases.",
+  "changes": [
+    {
+      "id": "chg-28",
+      "type": "instrumentation",
+      "description": "Add DENIAL_CASES (GC-034/035/036) to the in-sample accuracy gate, taking it from 39 to 42 cases and DENY-class evaluation coverage from 4/7 to 7/7. Add tests/unit/test_dataset_integrity.py::test_every_deny_class_case_is_evaluated as a gate against the class going unmeasured again. No src/ file is touched and no agent behaviour changes.",
+      "files": [
+        "tests/clinical/test_clinical_accuracy.py",
+        "tests/unit/test_dataset_integrity.py"
+      ],
+      "failure_pattern": "The dataset's smallest, worst-performing and most commercially consequential class was also its least measured. Of 7 authored DENY cases, 2 ran in the in-sample gate (both failing), 2 in the non-blocking held-out report, and 3 in nothing at all. Two of those three were simultaneously named inside the agent's own prompt surface -- contaminated and unmeasured at once, so they could neither serve as out-of-sample evidence nor contribute any measurement.",
+      "root_cause": "The accuracy gate's case list is a hardcoded concatenation that grew by accretion: each iteration appended the suite it authored, and DENIAL_CASES was never appended. Nothing detected the omission because the partition guard in test_eval_holdout_guard.py labels every non-held-out id 'in-sample', which means 'not held out' rather than 'runs in the in-sample gate'. One word doing two jobs, so a guard whose docstring promises 'No case may be silently dropped' stayed green while three DENY cases were.",
+      "predicted_fixes": [
+        "All 7 authored DENY cases are executed by some evaluation run, up from 4. Deterministic and provable offline: test_every_deny_class_case_is_evaluated fails against the pre-chg-28 tree listing GC-034/035/036 and passes after.",
+        "The DENY stratum becomes observable in the gate's own output, so chg-29 has a baseline. Judging a deny-behaviour change against the previous 2 in-sample cases would not have been verification.",
+        "The class cannot silently fall out of evaluation again, because the gate is a test rather than a convention. The general 34-case reachability gap remains a report by deliberate choice, not an oversight."
+      ],
+      "risk_cases": [
+        "This makes the DENY class observable, NOT measurable. At n=7 the Wilson interval is about +/-26 pp. No DENY-rate claim should be made on it, and chg-29 will be verifiable only as 'did not break the other strata' plus 'the two known failures flipped'. Roughly 20-25 DENY cases are needed for +/-15 pp; that is ~15 more to author and is the single highest-value authoring batch available.",
+        "The headline accuracy figure moves and is not comparable across this change. Three never-scored cases enter the denominator and all three are DENY, the class currently performing worst. A drop in the reported percentage after chg-28 is a change in what is being measured, not a regression -- the iter-19 figure (89.7%, 35/39) and any post-chg-28 figure are different quantities.",
+        "GC-036 was clean -- named only in roadmap_reader.py, which is SME tooling the DecisionAgent never sees -- and putting it in the in-sample gate forecloses using it as a third held-out DENY case. Deliberate but reversible while nothing has tuned on it; after chg-29 tunes on the in-sample DENY set it is spent. Held-out DENY remains n=2, which is the weakest link in verifying chg-29 independently.",
+        "GC-034 and GC-035 are named in prompt-visible text, so their in-gate results are contaminated by construction and cannot be read as evidence of generalisation. They are worth running because an unmeasured contaminated case is strictly worse than a measured one, not because their result is clean."
+      ],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "Sequencing, not preference. chg-29 proposes to loosen a never-deny directive in long_term_memory.md -- the first change in this arc that would alter clinical behaviour, and in the direction of refusing care. Loosening a safety instruction while the class it governs is 43% unmeasured would be indefensible. This change buys nothing except the ability to see what the next one does, which is exactly what the harness discipline is for.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Remove DENIAL_CASES from the concatenation in test_clinical_accuracy.py and revert the mirrored constants plus the new gate in tests/unit/test_dataset_integrity.py. No src/ file, no schema change, no runtime effect. Rolling back restores the previous headline accuracy denominator and returns DENY coverage to 4/7.",
+      "baseline": {
+        "claim": "Before chg-28, 3 of the 7 authored DENIED-class cases (GC-034, GC-035, GC-036, i.e. all of DENIAL_CASES) were executed by neither the in-sample accuracy gate nor the held-out report, and the 2 DENY cases that were in the gate both failed.",
+        "verified_by": "tests/unit/test_dataset_integrity.py::test_every_deny_class_case_is_evaluated run against the pre-wiring tree; per-case output of CI run 30480853423 at HEAD 9b66df4 for the DENY stratum result.",
+        "result": "The gate FAILED listing GC-034, GC-035 and GC-036 as executed by no run. The in-sample DENY stratum scored 0/2: GC-026 and GC-027 each returned IN_REVIEW at 0.00 confidence against an expected DENIED, judge score 2, both with the judge finding an invented conflict between guidelines that are aligned in support of denial. The held-out DENY stratum scored 2/2 (n=2)."
+      }
+    }
+  ]
+}
