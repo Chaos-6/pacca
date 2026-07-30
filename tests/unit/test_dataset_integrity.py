@@ -18,11 +18,15 @@ independently recorded "the dataset is at GC-100" (see docs/AGENT_LESSONS.md
 P-017). 108 case objects presented as 105.
 
 That collision also concealed a second, larger fact. Once you count objects,
-the evaluation census stops balancing: 39 cases run in the in-sample accuracy
-gate, 32 in the held-out report, and the remainder are executed by nothing at
-all — authored, reviewed, counted in the headline figure, never scored.
+the evaluation census stops balancing: the in-sample accuracy gate and the
+held-out report together run fewer cases than exist, and the remainder are
+executed by nothing at all — authored, reviewed, counted in the headline
+figure, never scored. It was 39 + 32 of 108 when this file was written;
+chg-28 added `DENIAL_CASES` to the gate, making it 42 + 32, with 34 still
+unreached. The live figures print from the census test rather than being
+restated here, precisely so this paragraph cannot become the next stale count.
 
-The two tests below are deliberately different in kind:
+The tests below are deliberately different in kind:
 
   * `test_no_two_cases_share_a_case_id` is a **gate**. Two different cases
     sharing an id is wrong under every reading: counters keyed by case_id
@@ -48,6 +52,7 @@ from typing import Any
 # case file. Re-listing the imports here would create exactly the drift this
 # file exists to detect.
 from tests.clinical.adult_complexity_cases import ADULT_COMPLEXITY_CASES
+from tests.clinical.denial_cases import DENIAL_CASES
 from tests.clinical.expansion_cases import EXPANSION_CASES
 from tests.clinical.golden_cases import GOLDEN_CASES
 from tests.clinical.holdout import _ALL_CASE_LISTS, held_out_cases
@@ -66,9 +71,15 @@ _IN_SAMPLE_LIST_NAMES = (
     "PEDIATRIC_CASES",
     "EXPANSION_CASES",
     "ADULT_COMPLEXITY_CASES",
+    "DENIAL_CASES",  # chg-28
 )
 _IN_SAMPLE_RUN = (
-    GOLDEN_CASES + NEAR_MISS_CASES + PEDIATRIC_CASES + EXPANSION_CASES + ADULT_COMPLEXITY_CASES
+    GOLDEN_CASES
+    + NEAR_MISS_CASES
+    + PEDIATRIC_CASES
+    + EXPANSION_CASES
+    + ADULT_COMPLEXITY_CASES
+    + DENIAL_CASES
 )
 
 
@@ -175,4 +186,43 @@ def test_in_sample_composition_has_not_drifted() -> None:
     assert not unexpected, (
         f"the accuracy gate gained case lists this census does not mirror: {sorted(unexpected)} — "
         "add them to _IN_SAMPLE_LIST_NAMES and _IN_SAMPLE_RUN"
+    )
+
+
+def test_every_deny_class_case_is_evaluated() -> None:
+    """GATE: no DENIED-class case may sit unevaluated.
+
+    DENY is the smallest class in the dataset (7 of 108), the worst-performing
+    (0/2 on the in-sample gate at HEAD 9b66df4, both failing identically by
+    escalating to IN_REVIEW where guidelines unambiguously support denial), and
+    the one with the most commercial consequence -- a prior-auth system that
+    cannot deny is a router, not a decision system.
+
+    It was also the least measured: 3 of the 7 (`DENIAL_CASES` -- GC-034,
+    GC-035, GC-036) were executed by no run at all, and two of those are named
+    inside the agent's own prompt surface (`prompts/templates.py`, and
+    `long_term_memory.md`, which is injected wholesale). Contaminated *and*
+    unmeasured -- no out-of-sample value left to spend, and no measurement being
+    taken either.
+
+    Unlike the general reachability census, which reports, this one gates: the
+    smallest safety-critical class is exactly where an unevaluated case does the
+    most damage, and it is cheap to keep at zero. The general 37-case gap stays
+    a report (see `test_evaluation_reachability_census`) because closing it is a
+    scoped dataset decision; this subset is three cases and ~45s of runtime.
+    """
+    in_sample_ids = {id(c) for c in _IN_SAMPLE_RUN}
+    held_out_ids = {id(c) for c in held_out_cases()}
+
+    unevaluated = [
+        c
+        for c in _distinct_cases()
+        if c.expected_outcome.value == "DENIED"
+        and id(c) not in in_sample_ids
+        and id(c) not in held_out_ids
+    ]
+
+    assert sorted(c.case_id for c in unevaluated) == [], (
+        "DENIED-class cases executed by no evaluation run: "
+        + ", ".join(f"{c.case_id} ({c.title[:48]})" for c in unevaluated)
     )
