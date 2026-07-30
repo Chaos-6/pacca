@@ -742,12 +742,30 @@ class TestFullClinicalEvaluation:
         # — the `len == 20` integrity assertion above still holds for GOLDEN_CASES.
         # + ADULT_COMPLEXITY_CASES (iter-6 chg-3 — adult pre-flight validation set).
         # None of these ids overlap HELD_OUT_CASE_IDS — see tests/clinical/holdout.py.
+        #
+        # + DENIAL_CASES (chg-28 — GC-034/035/036, the whole DENY-class remainder).
+        # Added because the DENY class was the least-measured part of the dataset
+        # and the worst-performing: 7 cases authored, only 4 executed by anything,
+        # and 0/2 correct on the in-sample gate at HEAD 9b66df4 (GC-026 and GC-027
+        # both escalating to IN_REVIEW where aligned guidelines support denial).
+        # A prior-auth system that cannot deny is a router, not a decision system,
+        # so the class that measures it should not have been the one running
+        # blind. These three cost ~45s and take DENY coverage from 4/7 to 7/7.
+        #
+        # They are NOT holdout material and nothing is being spent by running
+        # them: GC-034 and GC-035 are already named in the agent's own prompt
+        # surface (prompts/templates.py, and long_term_memory.md which is
+        # injected wholesale), so their out-of-sample value was gone long before
+        # this change. GC-036 is clean — if a third held-out DENY case is worth
+        # more than a fourth in-sample one, move it, but that edits the declared
+        # holdout and is its own decision.
         verdicts = await _run_cases_through_pipeline(
             GOLDEN_CASES
             + NEAR_MISS_CASES
             + PEDIATRIC_CASES
             + EXPANSION_CASES
-            + ADULT_COMPLEXITY_CASES,
+            + ADULT_COMPLEXITY_CASES
+            + DENIAL_CASES,
             detector,
             agent,
             evaluator,
