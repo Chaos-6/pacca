@@ -548,6 +548,51 @@ is wrong, and deciding which is a product question about what PACCA is: a triage
 router that never refuses on clinical grounds, or an adjudicator that does.
 Tracked as chg-29; deliberately not resolved by an agent.
 
+#### Resolution: the governing boundary (David, 2026-07-31)
+
+> **PACCA does make coverage determinations. PACCA never makes medical-necessity
+> determinations.**
+
+That resolves the contradiction above, and it resolves it in favour of the
+prompt's instinct rather than against it — but it does **not** vindicate the
+current behaviour, because none of the four failing cases is a medical-necessity
+judgment. Read each denial reason:
+
+| Case | The stated denial reason | Kind |
+|---|---|---|
+| GC-034 | NCCN Compendium *"does not list this indication"*; *"absence of compendia listing means off-label use is not covered"* | coverage — compendia lookup |
+| GC-036 | *"Re-request with identical documentation is denied per the doctrine of finality"*; appeal pathway open | procedural |
+| GC-027 | Required prior non-invasive workup **not documented** | step / sequence |
+| GC-026 | CMS NCD 110.8.1 condition unmet — *"no documented contraindication"* to IMRT; *"patient preference is not an accepted justification"* | coverage — NCD condition |
+
+Not one asserts that the patient does not clinically need the service. Each
+asserts that a **named, objective, documentable criterion is unmet**. GC-034 is
+a compendium lookup; GC-036 asks whether a document changed in 60 days.
+
+**The operational test** — the one that keeps the boundary decidable rather than
+rhetorical: *is the unmet criterion checkable from the record without clinical
+judgment?* Where the record **states** the criterion it is documentary; where
+PACCA would have to **derive** it, it is clinical and the case escalates.
+
+GC-026 was the boundary case and was checked against exactly that test. Its
+notes state *"low-risk prostate adenocarcinoma (Gleason 3+3=6, PSA 5.2, clinical
+stage T1c)"* and *"No documented contraindication to conventional external-beam
+radiation therapy or IMRT"* — both given, neither derived. It is a coverage
+determination. Had PACCA needed to deduce low-risk status from the Gleason/PSA/
+stage triplet, or to judge whether some finding constituted an IMRT
+contraindication, the correct answer would have been `IN_REVIEW` and the case's
+`expected_outcome` would have been the thing to fix.
+
+**What this means for the gap.** `long_term_memory.md` L318-323 excludes
+medical-necessity denials from the benefit-cap pattern, and that exclusion is
+correct and stays. The defect is narrower than it looked: the
+*coverage-determination* family has exactly one member (contractual benefit-cap
+exhaustion, L246+), and its other subtypes — compendia non-listing, unmet
+documented step, procedural finality, an NCD's stated condition — have no
+pattern at all. The agent is not refusing judgments it shouldn't make; it is
+failing to make administrative determinations it already makes in one narrow
+case. chg-29 fills that family in. It does not grant a new adjudication power.
+
 #### Statistical caveat, stated so it is not lost
 
 n=5 in-sample and n=2 held-out. At n=7 total the Wilson interval on the DENY
