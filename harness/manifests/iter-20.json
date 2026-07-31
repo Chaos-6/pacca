@@ -74,5 +74,20 @@
         "result": "GC-026, GC-027, GC-034 and GC-036 each returned IN_REVIEW at 0.00 confidence against an expected DENIED, judge score 2 in every case; GC-035 (benefit cap) returned DENIED at score 5. Gate 85.7% (36/42). The memory states at L256 that the benefit-cap entry is the only one whose shortcut outcome is DENIED, and L318-323 excludes medical-necessity denials from it, leaving the rest of the coverage-determination family with no pattern."
       }
     }
+  ],
+  "verdicts": [
+    {
+      "change_id": "chg-29",
+      "previous_iteration_tag": "harness-iter-20",
+      "outcome": "rollback",
+      "verified_fixes": [],
+      "missed_fixes": [
+        "Predicted fix 1 failed outright. The live gate at merge HEAD returned results byte-identical to the baseline: GC-026/027/034/036 still IN_REVIEW at 0.00 confidence, GC-035 still DENIED at score 5, gate still 85.7% (36/42), same failed-case list. In-sample DENY stayed 1/5.",
+        "Predicted fixes 2 and 3 (no drift in the other strata; GC-029 still escalating) were satisfied, but vacuously -- nothing about the system's behaviour changed, so they demonstrate nothing about the change.",
+        "The change was inert by construction and could not have worked. ClinicalRiskDetector pre-escalates all four target cases (conflicting_guidelines on GC-026 and GC-027, experimental_treatment on GC-034, prior_denial_same_service on GC-036), and _run_cases_through_pipeline short-circuits on flags.should_pre_escalate, setting IN_REVIEW with confidence 0.0 and a rationale synthesised from flags.reasons. The DecisionAgent -- and therefore the entire institutional memory chg-29 edited -- is never invoked. GC-035 is the only DENY case the agent is ever asked about, which is the entire explanation for the pattern this change was written to fix.",
+        "The diagnosis error is the lesson, not the code. The cases' ground truth was verified carefully against NCCN/ASTRO/CMS and ACC/AHA; the CAUSAL PATH was never verified. Two pieces of evidence were misread in the same direction: the 0.00 confidence recurring in every failure is the pipeline's hardcoded value on the pre-escalate path, not agent uncertainty; and the 'invented conflict between aligned guidelines' the judge criticised is the detector's own CONFLICTING_GUIDELINES reason string rendered into the synthetic rationale, not agent reasoning. P-013 was applied to the data and skipped on the mechanism."
+      ],
+      "notes": "Rolled back rather than kept: unverified, no case exercises it, and it added surface plus a prompt-version bump to a safety-critical file for zero measured effect. tests/unit/test_long_term_memory_invariants.py was deliberately retained minus its chg-29 assertion -- those pins protect the medical-necessity carve-out, the uncertainty rule and the cited-basis requirement regardless of future entries, and were the only part worth keeping. chg-28 is vindicated: going from 2 evaluated DENY cases to 5 is what produced GC-035 as a discriminating negative, and GC-035 is the single observation that exposed the real mechanism. The redirect: the defect is in ClinicalRiskDetector, where conflicting_guidelines fires on GC-026/027 whose sources are ALIGNED -- a false positive on a deterministic safety boundary, and a different constraint_level entirely. Whether GC-034 and GC-036 are detector defects or dataset defects is now an open question, since experimental_treatment and prior_denial_same_service firing on them may be correct policy with the expected_outcome being wrong."
+    }
   ]
 }
