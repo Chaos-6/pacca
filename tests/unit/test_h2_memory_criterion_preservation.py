@@ -40,7 +40,7 @@ class TestMemoryInjection:
         """
         Any v2.3+ version is a valid H2-active audit signal. The current
         canonical version is asserted by the iter-4 chg-1 test class
-        (test_decision_support_prompt_version_bumped_to_v26); this test
+        (test_decision_support_prompt_version_bumped_to_v28); this test
         only guards against accidental downgrade below v2.3 (the H2 floor).
         """
         rendered = load_agent_prompt("decision_support", "DecisionSupportAgent")
@@ -460,17 +460,25 @@ class TestBenefitCapDenyMemoryInjection:
         rendered = load_agent_prompt("decision_support", "DecisionSupportAgent")
         assert "Outpatient benefit-cap exhaustion without a documented exception" in rendered
 
-    def test_decision_support_prompt_version_bumped_to_v27(self) -> None:
-        # v2.7 (iter-10 chg-10): evidence-id citation added to the decision prompt.
-        rendered = load_agent_prompt("decision_support", "DecisionSupportAgent")
-        assert "Prompt version: v2.7" in rendered
+    def test_decision_support_prompt_version_bumped_to_v28(self) -> None:
+        """The version must move whenever the injected memory does.
 
-    def test_all_four_h2_entries_present(self) -> None:
+        It reaches audit logs and OTel spans, so a decision made under a changed
+        memory that still reports the old version is unauditable after the fact.
+        v2.7 (iter-10 chg-10): evidence-id citation. v2.8 (iter-20 chg-29): the
+        second deny-class entry, coverage-criteria determination.
+        """
+        rendered = load_agent_prompt("decision_support", "DecisionSupportAgent")
+        assert "Prompt version: v2.8" in rendered
+
+    def test_all_five_h2_entries_present(self) -> None:
         rendered = load_agent_prompt("decision_support", "DecisionSupportAgent")
         assert "First-line pembrolizumab for metastatic NSCLC" in rendered
         assert "First-line biologic DMARD for seropositive RA" in rendered
         assert "Dupilumab for severe eosinophilic asthma" in rendered
         assert "Outpatient benefit-cap exhaustion without a documented exception" in rendered
+        # chg-29 — the second deny-class entry.
+        assert "Coverage-criteria determination" in rendered
 
 
 class TestBenefitCapDenyCriterionPreservation:
