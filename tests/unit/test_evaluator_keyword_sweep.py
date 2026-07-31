@@ -101,7 +101,7 @@ def _all_forbidden_keywords() -> set[str]:
     return keywords
 
 
-def test_dataset_has_101_unique_forbidden_keywords() -> None:
+def test_dataset_has_100_unique_forbidden_keywords() -> None:
     """
     Pins the sweep's denominator. Was 95 at first review; 102 after the
     F2 backfill (chg-25 second review) added 7 morphological variants to
@@ -119,10 +119,15 @@ def test_dataset_has_101_unique_forbidden_keywords() -> None:
     runs; see test_evaluator_constraint_checks.py::
     test_naming_an_absent_criterion_is_not_a_fabrication.
 
+    Now 100: chg-31 corrected GC-036 from DENIED to PRE_FLIGHT_ESCALATE. Its
+    rationale is now the machine-generated pre-flight string rather than agent
+    prose, so its keyword constraints were re-pointed at that text (mirroring
+    GC-008's) and "reconsidered" -- which only that case forbade -- left the set.
+
     If this drifts further, it means cases were added/removed/edited --
     expected over time, not itself a failure signal.
     """
-    assert len(_all_forbidden_keywords()) == 101
+    assert len(_all_forbidden_keywords()) == 100
 
 
 def test_whole_word_hits_never_exceed_substring_hits() -> None:
