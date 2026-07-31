@@ -1,0 +1,92 @@
+{
+  "iteration": 21,
+  "iteration_tag": "harness-iter-21",
+  "iso_date": "2026-07-31",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-20",
+  "summary": "The redirect after chg-29's rollback. chg-30 fixes the real defect: the conflict check's approval marker matched inside its own negation, so any guideline saying 'not recommended' fabricated a conflict with itself and pre-escalated -- making guideline-based DENIED structurally unreachable. chg-31 corrects GC-036, which asserted an outcome the Branch 7 safety boundary forbids. GC-026 now returns DENIED at score 5 with chg-29 still reverted.",
+  "changes": [
+    {
+      "id": "chg-30",
+      "type": "improvement",
+      "description": "Mask GUIDELINE_CONFLICT_MARKERS out of the guidelines text before scanning for GUIDELINE_APPROVAL_MARKERS in _check_conflicting_guidelines, so a phrase cannot count as evidence of both signals. Add three branch-6 regression tests.",
+      "files": [
+        "src/pacca/agents/clinical_risk_detector.py",
+        "tests/unit/test_escalation_tree.py"
+      ],
+      "failure_pattern": "Branch 6 fabricated a conflict out of guidelines containing none, pre-escalating the case so the DecisionAgent was never called. Because a guideline-based denial necessarily says 'not recommended', the effect was systematic rather than occasional: DENIED became structurally unreachable on guideline grounds, and the entire DENY-class failure was misattributed to agent behaviour -- including by a prompt change (chg-29) that was written, shipped, measured as inert, and rolled back.",
+      "root_cause": "Several approval markers are substrings of their negations: 'recommended' inside 'not recommended', 'supported' inside 'not supported'. has_approval and has_rejection both scanned the raw lowercased text, so one unambiguous negative statement satisfied both. GC-026's guidelines contain 'recommended' exactly once, entirely inside 'not recommended' -- verified by regex as 1 occurrence, 1 negated, 0 standalone -- and it pre-escalated on that alone. Same substring-vs-whole-word defect class chg-25 fixed in the evaluator, never carried across to the detector, where it sits on a deterministic safety boundary.",
+      "predicted_fixes": [
+        "GC-026 stops pre-escalating, reaches the DecisionAgent, and returns DENIED. VERIFIED on the live gate at merge HEAD: score 5, status DENIED, correct=True -- and with chg-29 reverted, so no coverage-criteria memory pattern was involved.",
+        "GC-027, GC-034, GC-035 and GC-036 are unaffected; only cases whose sole approval evidence sat inside a negation change. VERIFIED: all four unchanged.",
+        "The documented heuristic false positive is preserved -- GC-027 still escalates -- so this change does not quietly narrow an accepted safety trade-off."
+      ],
+      "risk_cases": [
+        "This reduces escalation, which is the direction that removes a human from the loop. It is defensible only because it is a matching bug rather than a trade-off: nobody chose to have 'recommended' match inside 'not recommended'. Any further narrowing of branch 6 -- notably the aligned-guideline case GC-027 -- is a change to a documented accepted trade-off and needs its own decision.",
+        "Only GC-026 is known to change. Other cases across the 108 whose approval evidence sits solely inside a negation would also stop pre-escalating, and no sweep was run to enumerate them. The blast radius is bounded by construction (a case must have had NO standalone approval language) but was not measured.",
+        "GC-019 flipped from pass to fabrication-detected in the same run, moving the accuracy composition while leaving the total at 85.7% (36/42). It is NOT attributable to chg-30: GC-019's guidelines contain zero conflict markers, so branch 6 never fired on it before or after -- verified deterministically. It is the judge/agent variance chg-25 and chg-26 both flagged as unresolved, and it appeared alongside the sparse-trap gate passing on the same case in the same run.",
+        "The masking is a blunt string replace. A guideline using a conflict marker inside a genuinely approving sentence would lose that text before the approval scan, which could suppress a real conflict signal. No such case exists in the dataset today and none was constructed to probe it."
+      ],
+      "constraint_level": "escalation_branch",
+      "why_this_component": "The behaviour is produced entirely by the deterministic pre-flight detector: the agent was never invoked on these cases, so no prompt, memory or orchestrator change could reach it. chg-29 proved that empirically by having no effect at all. Fixing it anywhere else would have been treating a symptom, which is exactly what the previous change did.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Restore the two-line raw-text scan in _check_conflicting_guidelines and delete the three regression tests. Reverting returns GC-026 to pre-escalation and DENIED to being unreachable on guideline grounds -- safe but useless, so the revert is low risk.",
+      "baseline": {
+        "claim": "Before chg-30, GC-026 pre-escalated with CONFLICTING_GUIDELINES even though its guidelines are aligned, because the approval marker matched inside the conflict marker; the DecisionAgent was never called and DENIED was unreachable.",
+        "verified_by": "Direct ClinicalRiskDetector.evaluate() calls on the five DENY cases; regex count of 'recommended' vs 'not recommended' in GC-026's guidelines_context; live clinical gate at HEAD 24d5025.",
+        "result": "GC-026 pre_escalate=True reasons=['conflicting_guidelines']; 'recommended' occurred once, entirely inside 'not recommended', standalone=0. The gate scored GC-026 IN_REVIEW at 0.00 confidence, judge score 2, against an expected DENIED. In-sample DENY was 1/5."
+      }
+    },
+    {
+      "id": "chg-31",
+      "type": "improvement",
+      "description": "Correct GC-036 from expected_outcome=DENIED / branch NONE to PRE_FLIGHT_ESCALATE / BRANCH_7_PRIOR_DENIAL, and re-point its keyword constraints and judge criteria at the machine-generated pre-flight rationale, mirroring GC-008.",
+      "files": [
+        "tests/clinical/denial_cases.py",
+        "tests/unit/test_evaluator_keyword_sweep.py"
+      ],
+      "failure_pattern": "A golden case asserted an outcome the architecture forbids. GC-036 supplied prior_denial_codes=['J0135'] against procedure_code='J0135' -- the exact input that fires Branch 7 -- while declaring expected_branch=NONE. It could never pass, and its permanent failure was read as an agent defect.",
+      "root_cause": "The case author knew and wrote around it: the clinical_rationale said 'Branch_7 (prior_denial) pre-flight would fire, but the request lacks the new-evidence trigger'. That 'but' is not honoured. CLAUDE.md states the escalation tree OVERRIDES model confidence and is a safety boundary, not a suggestion. Branch 7's own docstring gives its purpose as 'Human review required to determine if circumstances have changed or whether this is a repeat claim' -- exactly the question this case poses. GC-008 encodes the identical scenario and correctly expects PRE_FLIGHT_ESCALATE 'regardless of clinical merit'.",
+      "predicted_fixes": [
+        "GC-036 becomes satisfiable: the pre-flight escalation it triggers is now the expected outcome, and branch-7 coverage rises from 1 case to 2.",
+        "Its constraints stop asserting on text that cannot appear. The pre-flight rationale is machine-generated, so must_include now mirrors GC-008's ['prior denial', 'J0135'] rather than agent prose.",
+        "The judge stops penalising the correct answer. The previous criteria said 'Penalize for ... IN_REVIEW (no new info to review)', which after this correction would have scored the right outcome down."
+      ],
+      "risk_cases": [
+        "The DENY class drops from 7 authored to 6, further weakening a stratum already too small to measure (Wilson about +/-26 pp at n=7, worse at 6). This makes the case for authoring DENY cases stronger, not weaker.",
+        "The counter-argument is real and is recorded in the case rather than dismissed: auto-denying a re-request under doctrine of finality is genuine payer practice. It is rejected here because it is not what Branch 7 does, and because auto-denying a resubmission is where a parser miss compounds -- a provider who resubmits may have added something the extraction dropped. Making PACCA auto-deny repeat claims is a deliberate widening of the automation surface and belongs in a change to the escalation tree, not an expectation encoded in a case.",
+        "'reconsidered' left the global forbidden-keyword set because only this case forbade it, moving the sweep denominator 101 -> 100. Recorded rather than silently absorbed.",
+        "GC-034 remains unresolved and is the same question one branch over: experimental_treatment fires on it via three separate defects (substring matching turning one 'Phase III' into phase i/ii/iii hits, no negation awareness on 'not enrolled in a clinical trial', and 'off-label' miscategorised as experimental when it is a coverage question). Whether the detector or the case is wrong there was deliberately not decided in this iteration."
+      ],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "The defect is in the case, not the code. Branch 7 behaved exactly as designed and as documented, and GC-008 proves the design was understood when it was written. Changing the detector to satisfy GC-036 would have weakened a safety boundary to accommodate a mis-specified expectation -- the inverse of the chg-29 error, and worse.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Restore expected_outcome=DENIED, expected_branch=NONE, the previous keyword constraints and the previous judge criteria, and move the sweep denominator back to 101. The case returns to being permanently unsatisfiable.",
+      "baseline": {
+        "claim": "Before chg-31, GC-036 declared expected_branch=NONE while supplying the exact input that fires Branch 7, making it unsatisfiable.",
+        "verified_by": "ClinicalRiskDetector.evaluate() on GC-036; comparison of its procedure_code against its own prior_denial_codes; comparison with GC-008's expectations; live gate at HEAD 24d5025 and again at ffac16a.",
+        "result": "procedure_code J0135 matches prior_denial_codes ['J0135'] exactly, so pre_escalate=True reasons=['prior_denial_same_service'] deterministically. The gate scored GC-036 IN_REVIEW against expected DENIED on both runs, judge score 2 each time."
+      }
+    }
+  ],
+  "verdicts": [
+    {
+      "change_id": "chg-30",
+      "previous_iteration_tag": "harness-iter-21",
+      "outcome": "keep",
+      "verified_fixes": [
+        "GC-026 returned DENIED at judge score 5, correct=True, on the live gate at merge HEAD -- the first time the DecisionAgent has ever been asked to decide it.",
+        "No other DENY case moved: GC-027, GC-034 and GC-036 pre-escalate exactly as before, GC-035 unchanged. The change touched only what it was scoped to touch.",
+        "The documented false positive was preserved deliberately and verified preserved: GC-027 still escalates."
+      ],
+      "missed_fixes": [
+        "The headline accuracy is unchanged at 85.7% (36/42), which hides the effect rather than showing it: GC-026 moved fail -> pass and GC-019 moved pass -> fail in the same run. Reading the total alone would have shown this change doing nothing.",
+        "GC-019's flip is judge/agent variance, not a chg-30 regression -- its guidelines contain no conflict markers so branch 6 never applied to it. But it means this run cannot claim 'no regressions' from the aggregate; that claim rests on the per-case comparison instead."
+      ],
+      "notes": "The result retroactively settles chg-29. GC-026 was denied correctly with chg-29 REVERTED -- no coverage-criteria memory pattern present -- so the capability chg-29 tried to add already existed. The agent could always make guideline-based coverage denials; it was never consulted. That is the strongest available evidence that the rollback was right and that the original diagnosis was wrong at the component level, not merely incomplete."
+    }
+  ]
+}
