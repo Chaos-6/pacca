@@ -139,6 +139,28 @@ every PR is one path or the other, never ambiguous.
   (though an admin direct-push still bypasses it; see the enforcement note above). P-5
   (chg-10) also promotes this guard to a **runtime** detector (`evidence_grounding.py`):
   a decision citing an evidence id absent from the submission is forced to human review.
+- **Coverage determinations yes; medical-necessity determinations never (2026-07-31).**
+  PACCA may conclude that a **documented, objective coverage criterion is unmet** and
+  `DENY` on that basis — a benefit cap exhausted, an indication absent from the NCCN
+  compendium, a required prior step not documented, a re-request carrying no new
+  evidence, an NCD's own stated condition unmet. Every such denial must cite the
+  **specific unmet criterion** and the **appeal / exception pathway**.
+  It must **never** conclude that a service is *not medically necessary for this
+  patient*. Any conclusion requiring a judgment about severity, appropriateness, or
+  risk/benefit routes to human review.
+  **The operational test:** is the unmet criterion checkable from the record without
+  clinical judgment? "Is this indication in the compendium?" is a lookup. "Is there new
+  evidence since the prior denial?" is a diff. "Does this patient need proton beam?" is
+  medical necessity — never PACCA's call. Where a criterion is stated in the record it
+  is documentary; where PACCA would have to *derive* it (deducing risk stratification
+  from Gleason/PSA/stage, or judging whether a finding constitutes a contraindication),
+  it is clinical, and the case escalates.
+  This boundary is regulatory as well as architectural — adverse medical-necessity
+  determinations in utilization review are generally reserved to a licensed clinician,
+  so confirm the specific requirement with counsel for any deployment jurisdiction.
+  Encoded at `src/pacca/agents/decision_support/long_term_memory.md` L318-323 (the
+  medical-necessity carve-out) and analysed in `docs/EVALUATION.md` ("DENY-class
+  baseline"). David's decision; do not widen it without his.
 - **Tool-use forced** for structured output. Don't switch an agent to free-text parsing.
 - **Pre-write audit trail — ordering AND durability (chg-23).** Correlation-ID-linked event
   pairs (`AuditLogModel` carries `correlation_id`) are written BEFORE any state change;
