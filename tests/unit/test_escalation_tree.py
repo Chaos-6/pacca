@@ -240,6 +240,77 @@ class TestClinicalRiskDetector:
 
         assert EscalationReason.CONFLICTING_GUIDELINES not in flags.reasons
 
+    def test_unambiguous_rejection_alone_is_not_a_conflict(self) -> None:
+        """
+        Branch 6 regression (chg-30): a guideline that ONLY rejects must not
+        register as a conflict with itself.
+
+        The approval marker "recommended" is a substring of the conflict marker
+        "not recommended". So a single, unambiguous negative recommendation
+        satisfied both `has_approval` and `has_rejection` and fabricated a
+        conflict out of a guideline that contains none.
+
+        This is not the documented, accepted heuristic false positive (a
+        restriction that does not apply to this patient). It is the approval
+        test matching inside the negation of itself -- the same
+        substring-vs-whole-word defect chg-25 fixed in the evaluator, sitting
+        here on a deterministic safety boundary.
+
+        The consequence was systematic rather than occasional: a guideline-based
+        denial necessarily says "not recommended", so EVERY such case
+        pre-escalated and the DENY outcome became structurally unreachable.
+        Measured on GC-026, whose context contains "recommended" exactly once,
+        entirely inside "not recommended".
+        """
+        rejection_only = (
+            "ASTRO Model Policy: proton-beam radiation is not recommended over "
+            "conventional intensity-modulated radiation therapy for low-risk "
+            "prostate cancer absent a documented contraindication to IMRT."
+        )
+        case = make_case()
+        flags = self.detector.evaluate(case, guidelines_context=rejection_only)
+
+        assert EscalationReason.CONFLICTING_GUIDELINES not in flags.reasons, (
+            "an unambiguous negative recommendation was read as a conflict -- "
+            "the approval marker matched inside the conflict marker"
+        )
+
+    def test_gc026_real_context_is_not_a_conflict(self) -> None:
+        """The production case that exposed it, pinned verbatim.
+
+        GC-026 expects DENIED. Branch 6 pre-escalated it, so the DecisionAgent
+        was never called and the expected outcome was unreachable regardless of
+        any prompt or memory change.
+        """
+        from tests.clinical.expansion_cases import EXPANSION_CASES
+
+        gc_026 = next(c for c in EXPANSION_CASES if c.case_id == "GC-026")
+        flags = self.detector.evaluate(make_case(), guidelines_context=gc_026.guidelines_context)
+
+        assert EscalationReason.CONFLICTING_GUIDELINES not in flags.reasons
+
+    def test_aligned_guideline_recommending_an_alternative_still_conflicts(self) -> None:
+        """The accepted heuristic false positive is deliberately NOT fixed here.
+
+        GC-027's guideline recommends non-invasive testing AND says invasive
+        cath is not recommended -- two statements about DIFFERENT services in an
+        aligned source. The detector cannot tell that from a genuine
+        source-vs-source conflict, and its docstring says so, accepting the
+        false positive on the grounds that unnecessary review is cheap and a
+        missed conflict is not.
+
+        chg-30 fixes only the substring defect. Narrowing this case is a change
+        to a documented safety trade-off and needs its own decision, so this
+        test pins the CURRENT behaviour to keep that change deliberate rather
+        than accidental.
+        """
+        from tests.clinical.expansion_cases import EXPANSION_CASES
+
+        gc_027 = next(c for c in EXPANSION_CASES if c.case_id == "GC-027")
+        flags = self.detector.evaluate(make_case(), guidelines_context=gc_027.guidelines_context)
+
+        assert EscalationReason.CONFLICTING_GUIDELINES in flags.reasons
+
     def test_empty_guidelines_context_does_not_error(self) -> None:
         """
         Branch 6 edge case: empty guidelines context (no RAG results) should
