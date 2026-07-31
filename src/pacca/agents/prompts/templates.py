@@ -49,19 +49,9 @@ from typing import Any
 
 PROMPT_REGISTRY: dict[str, dict[str, str]] = {
     "DecisionSupportAgent": {
-        "version": "v2.8",
-        "description": "Frontline UM Nurse — guideline alignment + confidence scoring + institutional memory (H2, 5 entries) + evidence-id citation",
-        "changed_in": "v2.8 (iter-20 chg-29): H2 memory — SECOND deny-pattern entry "
-        "(coverage-criteria determination; a named, objective criterion unmet on the "
-        "face of the record — compendia non-listing, unmet documented step, "
-        "procedural finality on a re-request, an NCD's own stated condition; "
-        "GC-034/036/027/026 anchors). Sibling of the benefit-cap entry, NOT a new "
-        "adjudication power: PACCA makes coverage determinations and never "
-        "medical-necessity determinations (David, 2026-07-31 — see CLAUDE.md safety "
-        "invariants). Gated on the stated-vs-derived test: a criterion the record "
-        "states is documentary, one the agent would have to derive is clinical and "
-        "routes IN_REVIEW. Seven anti-patterns flip DENIED -> IN_REVIEW. "
-        "v2.7 (iter-10 chg-10): evidence grounding — the decision must "
+        "version": "v2.7",
+        "description": "Frontline UM Nurse — guideline alignment + confidence scoring + institutional memory (H2, 4 entries) + evidence-id citation",
+        "changed_in": "v2.7 (iter-10 chg-10): evidence grounding — the decision must "
         "populate cited_evidence_ids with the submission evidence ids it relied on, "
         "using only ids present in the case (never invented). The P-5 orchestrator "
         "detector forces human review on any cited id that does not resolve. "

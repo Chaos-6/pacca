@@ -16,6 +16,12 @@ nothing red to stop it.
 The boundary these protect is recorded in CLAUDE.md's safety invariants and
 docs/EVALUATION.md: **PACCA makes coverage determinations and never
 medical-necessity determinations** (David, 2026-07-31).
+
+These pins survive chg-29's rollback deliberately. chg-29 tried to add a
+coverage-criteria deny pattern here and was reverted as inert (the four cases
+it targeted never reach the agent -- pre-flight short-circuits them). The
+guards below protect the file regardless of what any future entry does, and
+they were the only part of that change worth keeping.
 """
 
 from __future__ import annotations
@@ -61,9 +67,9 @@ def test_medical_necessity_denial_is_still_excluded() -> None:
 
     This is the single instruction standing between PACCA and an adverse
     medical-necessity determination — a call reserved to a licensed clinician in
-    utilization review, and one the system is not permitted to make. chg-29 adds
-    a coverage-criteria deny pattern immediately alongside it, which is exactly
-    the edit most likely to erode it by accident.
+    utilization review, and one the system is not permitted to make. The edit most
+    likely to erode it by accident is a new deny pattern added alongside it, which
+    is exactly what chg-29 attempted before being rolled back.
     """
     text = _memory_text().lower()
 
@@ -99,10 +105,12 @@ def test_uncertainty_still_routes_to_review_not_denial() -> None:
 def test_every_deny_pattern_demands_a_cited_basis_and_an_appeal_pathway() -> None:
     """A denial the agent cannot justify in writing is not a denial.
 
-    Both deny patterns require the rationale to name the specific unmet criterion
-    and to point at the appeal / exception route. That requirement is what makes a
-    denial auditable and what gives the member a next step; it is also a practical
-    brake, since a model that cannot write the citation must escalate instead.
+    Every deny pattern must require the rationale to name the specific unmet
+    criterion and to point at the appeal / exception route. That requirement is what
+    makes a denial auditable and what gives the member a next step; it is also a
+    practical brake, since a model that cannot write the citation must escalate
+    instead. There is one deny pattern today (benefit-cap exhaustion); the
+    assertion is written to hold as more are added.
     """
     text = _memory_text().lower()
 
@@ -112,28 +120,4 @@ def test_every_deny_pattern_demands_a_cited_basis_and_an_appeal_pathway() -> Non
     )
     assert "if you cannot write that cited rationale" in text, (
         "the 'no citation, no denial' brake has been removed"
-    )
-
-
-def test_coverage_criteria_deny_pattern_exists() -> None:
-    """chg-29: the coverage-determination family must cover more than benefit caps.
-
-    Before chg-29 the memory held exactly one deny pattern — contractual
-    benefit-cap exhaustion — and said so at L256. Its siblings had no pattern:
-    compendia non-listing, an unmet documented step, procedural finality on a
-    re-request, an NCD's own stated condition. The agent therefore denied where it
-    had a pattern (GC-035, score 5) and escalated at 0.00 confidence where it did
-    not (GC-026/027/034/036), which is what it was told to do.
-    """
-    text = _memory_text().lower()
-
-    assert "coverage-criteria determination" in text, (
-        "no coverage-criteria deny pattern in long_term_memory.md — the "
-        "coverage-determination family still has benefit-cap exhaustion as its "
-        "only member (chg-29)"
-    )
-    assert "checkable from the record without clinical judgment" in text, (
-        "the operational test separating documentary from clinical criteria is "
-        "not stated in the memory, so the boundary is not decidable at the point "
-        "of use"
     )
