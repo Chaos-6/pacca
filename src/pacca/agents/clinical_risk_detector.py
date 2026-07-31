@@ -572,8 +572,31 @@ class ClinicalRiskDetector:
 
         context_lower = guidelines_context.lower()
 
-        has_approval = any(m in context_lower for m in GUIDELINE_APPROVAL_MARKERS)
         has_rejection = any(m in context_lower for m in GUIDELINE_CONFLICT_MARKERS)
+
+        # chg-30: mask the conflict markers before scanning for approval language.
+        #
+        # Several approval markers are substrings of their own negations —
+        # "recommended" inside "not recommended", "supported" inside
+        # "not supported". Scanning the raw text let a single, unambiguous
+        # negative statement satisfy BOTH tests and fabricate a conflict with
+        # itself. GC-026's guidelines contain "recommended" exactly once,
+        # entirely inside "not recommended", and pre-escalated on that alone.
+        #
+        # The consequence was systematic, not occasional: a guideline-based
+        # denial necessarily says "not recommended", so every such case
+        # pre-escalated, the DecisionAgent was never called, and DENIED became
+        # structurally unreachable on guideline grounds.
+        #
+        # This fixes only the substring defect. The heuristic's *documented*
+        # false positive — approval and rejection language about DIFFERENT
+        # services in an aligned source, as in GC-027 — is deliberately left
+        # in place; narrowing that is a change to an accepted safety trade-off,
+        # not a bug fix, and belongs in its own change.
+        masked = context_lower
+        for marker in GUIDELINE_CONFLICT_MARKERS:
+            masked = masked.replace(marker, " ")
+        has_approval = any(m in masked for m in GUIDELINE_APPROVAL_MARKERS)
 
         if has_approval and has_rejection:
             matched_rejections = [m for m in GUIDELINE_CONFLICT_MARKERS if m in context_lower]
