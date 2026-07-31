@@ -5,7 +5,7 @@
   "author": "David Reed",
   "base_model": "claude-sonnet-4-5-20250929",
   "previous_iteration_tag": "harness-iter-19",
-  "summary": "chg-28 makes the DENY class observable before anything tries to fix it. The first matched-mix comparison of in-sample against held-out (iter-19, docs/EVALUATION.md) found no large memorisation effect but surfaced a worse problem per stratum: both in-sample DENY cases fail identically, and 3 of the 7 authored DENY cases were executed by no run at all. Measurement first, behaviour second -- chg-29 cannot be verified against 2 cases.",
+  "summary": "chg-28 made the DENY class observable (4/7 -> 7/7 evaluated); chg-29 fills the gap it exposed. The memory held one deny pattern -- contractual benefit-cap exhaustion -- so the agent denied where it had a pattern (GC-035, score 5) and escalated at 0.00 confidence where it did not (1/5 in-sample DENY). chg-29 adds the sibling coverage-criteria pattern. Governing boundary, David 2026-07-31: PACCA makes coverage determinations, never medical-necessity determinations.",
   "changes": [
     {
       "id": "chg-28",
@@ -37,6 +37,41 @@
         "claim": "Before chg-28, 3 of the 7 authored DENIED-class cases (GC-034, GC-035, GC-036, i.e. all of DENIAL_CASES) were executed by neither the in-sample accuracy gate nor the held-out report, and the 2 DENY cases that were in the gate both failed.",
         "verified_by": "tests/unit/test_dataset_integrity.py::test_every_deny_class_case_is_evaluated run against the pre-wiring tree; per-case output of CI run 30480853423 at HEAD 9b66df4 for the DENY stratum result.",
         "result": "The gate FAILED listing GC-034, GC-035 and GC-036 as executed by no run. The in-sample DENY stratum scored 0/2: GC-026 and GC-027 each returned IN_REVIEW at 0.00 confidence against an expected DENIED, judge score 2, both with the judge finding an invented conflict between guidelines that are aligned in support of denial. The held-out DENY stratum scored 2/2 (n=2)."
+      }
+    },
+    {
+      "id": "chg-29",
+      "type": "improvement",
+      "description": "Add a second deny-class entry to the DecisionAgent's institutional memory: 'Coverage-criteria determination — a named criterion is unmet on the record', covering compendia non-listing, an unmet documented step or sequence, procedural finality on a re-request, and an NCD's own stated condition. Sibling of the existing benefit-cap entry, gated on a stated-vs-derived test. Bump DecisionSupportAgent prompt v2.7 -> v2.8. Pin the memory's safety invariants in a new test module.",
+      "files": [
+        "src/pacca/agents/decision_support/long_term_memory.md",
+        "src/pacca/agents/prompts/templates.py",
+        "tests/unit/test_long_term_memory_invariants.py",
+        "tests/unit/test_h2_memory_criterion_preservation.py"
+      ],
+      "failure_pattern": "The agent would not deny on any ground except a contractual benefit cap. Four DENY cases whose denial reasons are purely documentary -- a compendium lookup, a 60-day document diff, an unmet documented workup sequence, an NCD's stated condition -- each returned IN_REVIEW at 0.00 confidence, three of them justifying it by asserting a conflict between guidelines that the case's own context does not contain. In-sample DENY scored 1/5, and the one success (GC-035, score 5) was the only case requiring no clinical judgment at all.",
+      "root_cause": "Not a reasoning failure: the agent was following instructions. long_term_memory.md held exactly one deny pattern and stated so at L256 ('This is the only entry whose shortcut outcome is DENIED'), anchored on benefit-cap exhaustion. L318-323 then explicitly excluded medical-necessity denials from it -- correctly. But no pattern existed for the OTHER members of the coverage-determination family, so every documentary coverage criterion fell through the gap between 'not a benefit cap' and 'not medical necessity', into three approve-class entries whose anti-patterns say NEVER to DENIED. The agent denied where it had a pattern and escalated where it did not.",
+      "predicted_fixes": [
+        "GC-026, GC-027, GC-034 and GC-036 return DENIED with a rationale naming the specific unmet criterion and its source and noting the appeal pathway. In-sample DENY moves from 1/5 toward 5/5.",
+        "No drift toward denial in the other strata: AUTO_APPROVED holds near 13/14 and IN_REVIEW near 17/18. This is the over-correction guard and the one that matters -- denying a case that warranted review is the failure mode that harms patients.",
+        "GC-029 continues to route IN_REVIEW. It is the discriminating negative: a case that correctly escalates and whose denial would require clinical judgment about a Schedule II request with active substance use. If it flips to DENIED the pattern is too broad regardless of what the DENY stratum does."
+      ],
+      "risk_cases": [
+        "Over-denial is the dangerous direction and it is not symmetric with the failure being fixed. Escalating instead of denying is commercially useless but clinically safe; denying instead of escalating withholds care. Seven anti-patterns flip DENIED -> IN_REVIEW, any one decisive, and the governing rule is restated in full inside the new entry rather than cross-referenced -- a deny pattern that keeps its criteria but loses 'any uncertainty -> IN_REVIEW' is strictly more dangerous than no deny pattern.",
+        "The absence-of-evidence boundary is the subtlest part. Criterion 4 requires the record to establish the criterion unmet AFFIRMATIVELY -- 'documentation is identical to the prior submission' is a finding, 'the notes don't mention it' is a gap. If the model reads a silent record as a negative finding, this pattern becomes an absence-of-evidence denial engine. Not observed, and the anti-patterns name it explicitly, but it is the first thing to check on any over-denial.",
+        "Verification is weak by construction. Even after chg-28 the DENY class is n=7 (Wilson about +/-26 pp), so this change can be shown to flip four known failures and not to have broken the other strata -- it cannot be shown to generalise. Held-out DENY is n=2 and is the only independent check.",
+        "GC-026/027/034/036 are all in-sample, so tuning on them is the contamination channel by definition. The pattern was written against the STRUCTURE of the denial reason (named authority, documentary criterion, stated facts, affirmative negative) rather than against the four cases, but that intent is not verifiable from the outside.",
+        "The memory is prose injected wholesale into the prompt, so it is production behaviour that no type checker or linter sees. test_long_term_memory_invariants.py pins the safety text, but a presence assertion proves an instruction exists, never that the model obeys it."
+      ],
+      "constraint_level": "long_term_memory",
+      "why_this_component": "The behaviour is produced by the memory, not by the system prompt or the orchestrator: the agent denies where a memory pattern authorises it and escalates where none does. Fixing it anywhere else would be treating a symptom. Choosing memory over system_prompt also keeps the change reversible as a single file and auditable through the prompt version, and leaves the three NEVER-to-DENIED directives untouched -- they govern insufficiently documented cases and remain correct.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Revert the long_term_memory.md commit and the v2.8 version bump; the two test commits then fail and are reverted with them. No schema change and no other src/ file is touched. Rolling back restores the 1/5 in-sample DENY behaviour, which is safe-but-useless rather than dangerous, so this is a low-risk revert.",
+      "baseline": {
+        "claim": "Before chg-29 the agent would not deny on any ground except contractual benefit-cap exhaustion. In-sample DENY was 1/5, the single success being the only case requiring no clinical judgment.",
+        "verified_by": "Live clinical gate at HEAD 24d5025 with the full DENY class wired in by chg-28 (make test-clinical, 42 cases), plus reading src/pacca/agents/decision_support/long_term_memory.md L246-324.",
+        "result": "GC-026, GC-027, GC-034 and GC-036 each returned IN_REVIEW at 0.00 confidence against an expected DENIED, judge score 2 in every case; GC-035 (benefit cap) returned DENIED at score 5. Gate 85.7% (36/42). The memory states at L256 that the benefit-cap entry is the only one whose shortcut outcome is DENIED, and L318-323 excludes medical-necessity denials from it, leaving the rest of the coverage-determination family with no pattern."
       }
     }
   ]
