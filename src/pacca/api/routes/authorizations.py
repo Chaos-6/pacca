@@ -646,6 +646,46 @@ async def submit_authorization(
         # cross-case leak fail-closes to human review — then persist. Now that the
         # persistence layer is repaired, this is a REAL deny-capable call site
         # (unlike the always-allow single-collection RAG guard below).
+        # ── BRANCH 7 DATA SOURCE (chg-32) ─────────────────────────────────────
+        # Until now this was empty on every real submission. Branch 7
+        # (prior_denial_same_service) matches the current procedure code against
+        # `prior_denial_codes`; the Orchestrator defaults it to `[]` and no route
+        # populated it, so a deterministic check in the seven-branch escalation
+        # tree could not fire in production. It fired only in the evaluation
+        # harness, where each golden case hands it the codes directly — the
+        # harness supplied what production did not, so the golden set could never
+        # have detected the gap.
+        #
+        # PLACEMENT IS LOAD-BEARING. This read lives INSIDE T1, before the commit
+        # below, so the transaction it autobegins is closed by that commit like
+        # every other statement here. Putting it after the commit — next to the
+        # orchestrator call, where it reads more naturally — reopens a read
+        # transaction that stays open across the LLM window, which is precisely
+        # the connection-hold chg-24 measured at 0.54s and removed. The comment
+        # on that commit says nothing between it and T2 may touch this session;
+        # this obeys it.
+        #
+        # First READ in the prior-auth scope and the first call touching rows
+        # outside the current request, so it is guarded like the writes:
+        # `patient_ref` binds to the run's subject_ref, making a cross-patient
+        # read a deny-capable ScopeViolation rather than a silent leak. Such a
+        # leak would expose another patient's history AND escalate a clean case
+        # on someone else's record.
+        await enforce_scope(
+            intent,
+            "db.read_prior_denials",
+            audit=audit,
+            mode=get_settings().scope_guard_mode,
+            patient_ref=request.patient_id,
+        )
+        prior_denial_codes = await AuthorizationRepository(session).get_denied_procedure_codes(
+            request.patient_id,
+            # Excluded even though the current row is not yet written on the
+            # normal path: the resume path re-enters with the request already
+            # persisted from the earlier attempt.
+            exclude_request_id=request.request_id,
+        )
+
         await enforce_scope(
             intent,
             "db.write_request",
@@ -783,6 +823,7 @@ async def submit_authorization(
             decision_ctx,
             audit=audit,
             correlation_id=correlation_id,
+            prior_denial_codes=prior_denial_codes,
         )
 
         # Calculate how long the full AI pipeline took (in milliseconds)
