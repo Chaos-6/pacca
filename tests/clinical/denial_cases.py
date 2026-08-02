@@ -59,25 +59,58 @@ DENIAL_CASES: list[GoldenCase] = [
             "off-label use is not covered. Clinical-trial enrollment is the "
             "appropriate path for this patient."
         ),
-        expected_outcome=ExpectedOutcome.DENIED,
-        expected_branch=EscalationBranch.NONE,
-        reasoning_must_include=["off-label", "compendia", "NCCN"],
-        # chg-25 review (F2): "appropriately"/"appropriateness" backfilled --
-        # whole-word matching no longer catches them implicitly from
-        # "appropriate".
+        # chg-33: was DENIED / NONE. David's call, 2026-08-01: this case should
+        # pre-flight escalate. Off-label oncology immunotherapy in a patient who
+        # has progressed through two lines, with no compendia support, is a
+        # human-review case on the merits regardless of how clear the coverage
+        # position reads.
+        expected_outcome=ExpectedOutcome.PRE_FLIGHT_ESCALATE,
+        expected_branch=EscalationBranch.BRANCH_4_EXPERIMENTAL,
+        # Constraints target the machine-generated pre-flight rationale
+        # ("Pre-flight escalation triggered. Reasons: ['experimental_treatment']
+        # ... Requires human review."), not agent prose. The previous list
+        # ("off-label", "compendia", "NCCN") asserted words the agent never gets
+        # the chance to write, since it is never called.
+        reasoning_must_include=["experimental", "human review"],
+        # UNCHANGED, deliberately. An earlier draft of this change replaced these
+        # on the theory that they conflicted with the new expected outcome. They
+        # do not: the pre-flight rationale contains none of them, and the list
+        # carries chg-25's F2 morphological backfill ("appropriately",
+        # "appropriateness"), which test_gc_034_and_gc_105_appropriately_variant_
+        # now_caught pins. Replacing them would have silently dropped that
+        # coverage to fix a conflict that did not exist.
         reasoning_must_not_include=["approved", "appropriate", "appropriately", "appropriateness"],
         clinical_rationale=(
-            "Off-label oncology immunotherapy in a tumor type without NCCN "
-            "compendia support and without MSI-high / TMB-high status that "
-            "would qualify under tissue-agnostic indications. CMS NCD + "
-            "commercial policy align: no compendia, no coverage. The clinical "
-            "redirect is to a clinical trial, not authorization."
+            "Off-label oncology immunotherapy with no NCCN compendia support "
+            "and without MSI-high / TMB-high status that would qualify under "
+            "tissue-agnostic indications. Escalates to human review rather than "
+            "being adjudicated automatically.\n\n"
+            "CAVEAT, recorded because it is load-bearing: the OUTCOME here is "
+            "right but the MECHANISM currently producing it is not. Branch 4 "
+            "fires on this case through three defects, all verified 2026-07-31: "
+            "substring matching turns one 'No published Phase III data' into "
+            "'phase i' + 'phase ii' + 'phase iii' hits; there is no negation "
+            "awareness, so 'Patient is not enrolled in a clinical trial' matches "
+            "'clinical trial'; and 'off-label' sits in the experimental keyword "
+            "list although off-label use of an FDA-approved drug is a coverage "
+            "question, not an experimental one. Every trigger is a false "
+            "positive that happens to reach the right answer.\n\n"
+            "So this expectation is COUPLED to those defects. Fixing branch 4 "
+            "may stop this case escalating, at which point the right branch for "
+            "it must be decided rather than assumed. The branch-4 coupling "
+            "test in tests/unit/test_escalation_tree.py exists to make that "
+            "moment loud. (Named in prose rather than as an identifier on "
+            "purpose: this field feeds the keyword-sweep corpus, and an "
+            "underscored name registers as a substring hit without a "
+            "whole-word one -- manufacturing exactly the false-positive "
+            "exposure that sweep measures.)"
         ),
         judge_scoring_criteria=(
-            "Score highly if rationale identifies the off-label status, the "
-            "absence of compendia support, and recommends trial enrollment "
-            "as the redirect. Penalize for auto-approval or IN_REVIEW — the "
-            "guideline position is unambiguous."
+            "Score highly if the system routes to human review citing the "
+            "experimental/investigational flag. As in GC-006 and GC-009, the "
+            "coverage merits are irrelevant here -- the pre-flight fires first "
+            "and a human weighs it. Penalize for autonomous approval or denial "
+            "without human review."
         ),
     ),
     # ─────────────────────────────────────────────────────────────────────────
