@@ -202,13 +202,22 @@ async def test_submit_commits_with_zero_orphaned_audit_rows(pg_session: AsyncSes
 
     assert request_rows == 1, "the parent authorization_requests row was not persisted"
     assert decision_rows == 1, "the decision row was not persisted"
-    # The happy path writes exactly 7 audit.log() calls: intent.declared,
-    # authorization_submitted, scope.allow (db.write_request), scope.allow x2
-    # (rag.query x nccn_guidelines/case_precedents), authorization_decision_made,
-    # scope.allow (db.write_decision) — all 7 must persist, not just "some".
-    assert audit_rows == 7, f"expected exactly 7 audit rows on the happy path, got {audit_rows}"
-    assert audit_rows_linked == 7, (
-        f"expected all 7 audit rows to carry request_id={req.request_id!r} intact, "
+    # The happy path writes exactly 8 audit.log() calls: intent.declared,
+    # authorization_submitted, scope.allow (db.read_prior_denials), scope.allow
+    # (db.write_request), scope.allow x2 (rag.query x nccn_guidelines /
+    # case_precedents), authorization_decision_made, scope.allow
+    # (db.write_decision) — all 8 must persist, not just "some".
+    #
+    # 7 -> 8 at chg-32, which added the prior-denial read. The count rises with
+    # a named guarded call and must never fall without one: this assertion's job
+    # is to prove every audit row SURVIVES (the chg-23 durability property), so
+    # a silent drop is the failure it exists to catch.
+    assert audit_rows == 8, f"expected exactly 8 audit rows on the happy path, got {audit_rows}"
+    # Also 8: enforce_scope takes request_id from the INTENT, not from the
+    # guarded call's kwargs, so every scope.allow row is linkable regardless of
+    # which identifiers that particular call passes.
+    assert audit_rows_linked == 8, (
+        f"expected all 8 audit rows to carry request_id={req.request_id!r} intact, "
         f"only {audit_rows_linked} did"
     )
     assert orphans == 0, "an audit row references a non-existent request"

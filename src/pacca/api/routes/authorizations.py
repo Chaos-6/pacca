@@ -676,6 +676,11 @@ async def submit_authorization(
             "db.read_prior_denials",
             audit=audit,
             mode=get_settings().scope_guard_mode,
+            # Both identifiers, matching the write guard below: request_id and
+            # patient_ref each bind to an IntentRecord field, so a mismatch on
+            # either is a cross-case leak the guard fail-closes rather than a
+            # check it happens not to perform.
+            request_id=request.request_id,
             patient_ref=request.patient_id,
         )
         prior_denial_codes = await AuthorizationRepository(session).get_denied_procedure_codes(
