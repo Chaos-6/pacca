@@ -40,6 +40,20 @@ PRIOR_AUTH_ALLOWED_ACTIONS: list[str] = [
     "rag.query",
     "db.write_request",
     "db.write_decision",
+    # chg-32: Branch 7's data source. This is the first READ in the prior-auth
+    # scope, and the first action that touches rows outside the current request
+    # -- so declaring it is the point. Branch 7 (prior_denial_same_service) has
+    # never been able to fire in production because nothing populated
+    # `prior_denial_codes`; wiring it means one run now reads that patient's
+    # earlier authorization history.
+    #
+    # Minimum-necessary holds because the widening is bounded to the SAME
+    # patient: `get_denied_procedure_codes` takes patient_id as its sole
+    # selector and returns procedure codes only -- no diagnoses, no notes, no
+    # other patient's rows. A leak across patients would not just expose data,
+    # it would escalate a clean case on someone else's record, which is why the
+    # guard sits on this call rather than trusting the query.
+    "db.read_prior_denials",
     "audit.append",
 ]
 PRIOR_AUTH_EXPECTED_EFFECTS: list[str] = [

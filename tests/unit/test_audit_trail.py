@@ -34,6 +34,23 @@ from pacca.models.clinical import ClinicalCase, EvidenceItem
 from pacca.models.enums import AuthorizationStatus, EvidenceSourceType, ReviewTier
 
 
+def _mock_session() -> AsyncMock:
+    """An AsyncMock session whose `execute()` behaves like a real one.
+
+    `AsyncSession.execute()` is async and returns a `Result`, but `Result.all()`
+    is SYNC. A bare `AsyncMock()` makes every attribute async, so `.all()` hands
+    back a coroutine and any caller doing `for row in result.all()` dies with
+    "'coroutine' object is not iterable" -- a failure of the mock, not the code.
+
+    That never mattered until chg-32 wired Branch 7's prior-denial lookup into
+    the submit route, adding the first SELECT on this path. Returning a MagicMock
+    from `execute()` restores the real shape: sync `.all()`, iterating to empty.
+    """
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=MagicMock())
+    return session
+
+
 def _healthy_outcome(text: str) -> RetrievalOutcome:
     """A non-degraded RetrievalOutcome (chg-19) — the mock fill-in for
     rag_engine.query() in tests that are not exercising RAG degradation."""
@@ -176,7 +193,7 @@ class TestAuditTrailWiring:
 
             # Create a fake async session (we are not testing DB writes here,
             # just that audit.log() is called)
-            mock_session = AsyncMock()
+            mock_session = _mock_session()
 
             # Call the route function directly (no HTTP overhead in unit tests)
             await submit_authorization(request=req, session=mock_session)
@@ -223,7 +240,7 @@ class TestAuditTrailWiring:
             from pacca.models.authorization import AuthorizationRequest
 
             req = AuthorizationRequest(**sample_request)
-            mock_session = AsyncMock()
+            mock_session = _mock_session()
             await submit_authorization(request=req, session=mock_session)
 
         # intent.declared is event #0; the submission record is #1 — both logged
@@ -240,9 +257,16 @@ class TestAuditTrailWiring:
     @pytest.mark.asyncio
     async def test_run_sites_are_scope_guarded(self, sample_request, mock_auto_approved_decision):
         """Every guarded run site passes the minimum-necessary scope guard (P-4):
-        the two DB writes (db.write_request, db.write_decision) and the RAG query
-        each log a `scope.allow` for a legitimate in-scope call (enforce mode does
-        not fire, since the run passes its own identifiers + allowed collection)."""
+        the prior-denial read, the two DB writes and the RAG query each log a
+        `scope.allow` for a legitimate in-scope call (enforce mode does not fire,
+        since the run passes its own identifiers + allowed collection).
+
+        Asserted as an ordered list, not a set, because the order IS the run's
+        shape: chg-32's `db.read_prior_denials` must come first, inside T1 and
+        before the request write, so the transaction the SELECT autobegins is
+        closed by T1's commit rather than staying open across the LLM window.
+        A reordering that moved it after the commit would still be "guarded" but
+        would reintroduce the connection-hold chg-24 removed."""
         audit_log_calls = []
 
         async def capture_log(**kwargs):
@@ -268,7 +292,7 @@ class TestAuditTrailWiring:
             from pacca.models.authorization import AuthorizationRequest
 
             req = AuthorizationRequest(**sample_request)
-            await submit_authorization(request=req, session=AsyncMock())
+            await submit_authorization(request=req, session=_mock_session())
 
         guarded = [
             c["details"]["guarded_action"] for c in audit_log_calls if c["action"] == "scope.allow"
@@ -277,6 +301,7 @@ class TestAuditTrailWiring:
         # once per real collection the retriever reads (nccn_guidelines +
         # case_precedents), so it appears twice (#2).
         assert guarded == [
+            "db.read_prior_denials",
             "db.write_request",
             "rag.query",
             "rag.query",
@@ -327,7 +352,7 @@ class TestAuditTrailWiring:
             from pacca.models.authorization import AuthorizationRequest
 
             req = AuthorizationRequest(**sample_request)
-            result = await submit_authorization(request=req, session=AsyncMock())
+            result = await submit_authorization(request=req, session=_mock_session())
 
         # Fail-closed: routed to human review, not a silent continue or 500.
         assert result.status == AuthorizationStatus.IN_REVIEW
@@ -372,7 +397,7 @@ class TestAuditTrailWiring:
             from pacca.models.authorization import AuthorizationRequest
 
             req = AuthorizationRequest(**sample_request)
-            mock_session = AsyncMock()
+            mock_session = _mock_session()
             await submit_authorization(request=req, session=mock_session)
 
         first = audit_log_calls[0]
@@ -426,7 +451,7 @@ class TestAuditTrailWiring:
             from pacca.models.authorization import AuthorizationRequest
 
             req = AuthorizationRequest(**sample_request)
-            mock_session = AsyncMock()
+            mock_session = _mock_session()
             await submit_authorization(request=req, session=mock_session)
 
         # All records must have a correlation_id and they must all be the same
@@ -477,7 +502,7 @@ class TestAuditTrailWiring:
             from pacca.models.authorization import AuthorizationRequest
 
             req = AuthorizationRequest(**sample_request)
-            mock_session = AsyncMock()
+            mock_session = _mock_session()
 
             # The route should raise HTTPException(500), not crash silently
             with pytest.raises(HTTPException) as exc_info:
@@ -534,7 +559,7 @@ class TestAuditTrailWiring:
             from pacca.models.authorization import AuthorizationRequest
 
             req = AuthorizationRequest(**sample_request)
-            mock_session = AsyncMock()
+            mock_session = _mock_session()
             result = await submit_authorization(request=req, session=mock_session)
 
         # The decision proceeds normally — this is warn mode, not enforce.
@@ -614,7 +639,7 @@ class TestAuditTrailWiring:
                 from pacca.models.authorization import AuthorizationRequest
 
                 req = AuthorizationRequest(**sample_request)
-                mock_session = AsyncMock()
+                mock_session = _mock_session()
                 result = await submit_authorization(request=req, session=mock_session)
         finally:
             clear_all_overrides()
@@ -677,7 +702,7 @@ class TestAuditTrailWiring:
                 from pacca.models.authorization import AuthorizationRequest
 
                 req = AuthorizationRequest(**sample_request)
-                mock_session = AsyncMock()
+                mock_session = _mock_session()
                 result = await submit_authorization(request=req, session=mock_session)
         finally:
             clear_all_overrides()
@@ -721,7 +746,7 @@ class TestAuditTrailWiring:
                 decision="AUTO_APPROVED",
                 rationale="Motor weakness constitutes neurological emergency",
             )
-            mock_session = AsyncMock()
+            mock_session = _mock_session()
             await learn_from_feedback(feedback=feedback, session=mock_session)
 
         # Must have logged the learning event

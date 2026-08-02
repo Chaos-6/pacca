@@ -1,0 +1,48 @@
+{
+  "iteration": 22,
+  "iteration_tag": "harness-iter-22",
+  "iso_date": "2026-08-01",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-21",
+  "summary": "chg-32 gives Branch 7 the data it has always needed. prior_denial_same_service is one of seven deterministic pre-flight checks and has never been able to fire on a real submission: nothing populated prior_denial_codes. It fired only in the evaluation harness, where each golden case hands it the codes -- so the golden set could not have detected the gap. The lookup is scope-guarded and sits inside T1.",
+  "changes": [
+    {
+      "id": "chg-32",
+      "type": "improvement",
+      "description": "Add AuthorizationRepository.get_denied_procedure_codes (patient-scoped, deduplicated, keyed on the decision's outcome), declare db.read_prior_denials on the prior-auth IntentRecord, and call it from the submit route inside T1 -- passing the result to Orchestrator.process_decision so Branch 7 can fire in production.",
+      "files": [
+        "src/pacca/db/repository.py",
+        "src/pacca/models/intent.py",
+        "src/pacca/api/routes/authorizations.py",
+        "tests/unit/test_prior_denial_lookup.py",
+        "tests/unit/test_audit_trail.py",
+        "tests/unit/test_txn_boundaries.py"
+      ],
+      "failure_pattern": "A deterministic safety check in the seven-branch escalation tree was unreachable in production. CLAUDE.md treats that tree as a boundary that overrides model confidence, and one of its branches could not trigger at all on a real submission -- while appearing fully tested, because the evaluation harness feeds each golden case its own prior_denial_codes. The harness supplied what production did not, so no amount of golden-set passing could have surfaced it.",
+      "root_cause": "Orchestrator.process_decision accepts prior_denial_codes and defaults it to []; no route ever passed it. The detector's own docstring describes the missing AuthorizationRepository query and calls it 'a Week 3 enhancement'. The gap was documented at the point of the defect and still shipped, because nothing tested the production path -- only the harness path, which bypasses it.",
+      "predicted_fixes": [
+        "Branch 7 fires on a real submission when the same patient has a prior denial for the same procedure code. Provable offline: tests/unit/test_prior_denial_lookup.py covers the lookup against real SQLite, and the ordered guard-site assertion proves the call is made on the submit path.",
+        "A cross-patient read is a deny-capable ScopeViolation rather than a silent leak, because patient_ref binds to the run's subject_ref through the P-4 guard.",
+        "No transaction is held across the LLM window. The read sits inside T1 and is closed by T1's existing commit; test_no_transaction_open_on_route_session_during_orchestrator_call still passes and the guarded-action list is asserted in order to keep it that way."
+      ],
+      "risk_cases": [
+        "OPERATIONAL, and the largest: Branch 7 has never fired in production, so nobody has observed its escalation volume. Enabling a dormant safety check can only increase IN_REVIEW routing, and by an unknown amount -- it depends entirely on how often patients resubmit denied services, which no one has measured because the data was never read. Worth watching the escalation rate after deploy rather than assuming it is negligible.",
+        "The lookup is not fail-closed. If the query raises, the submission surfaces the error rather than escalating; a failure to CONFIRM the absence of a prior denial is treated as an error, not as 'cannot rule one out'. The RAG-degraded path (chg-19/20) established the opposite pattern -- audit the degradation and optionally escalate -- and this read has no equivalent. Deliberately out of scope here; it needs its own change and a decision on which posture is right.",
+        "Placement is load-bearing and was wrong on the first attempt. Written next to the orchestrator call it reads better, but a SELECT there autobegins a read transaction that stays open across the LLM window -- the exact 0.54s connection hold chg-24 removed, and the comment on T1's commit warns against it explicitly. The ordered guarded-action assertion exists to catch a future reordering that reintroduces it.",
+        "Verified on SQLite only, locally. Per P-009 that is a smoke test, not evidence, for anything touching transactions; the required Postgres integration CI job on this PR is the real check.",
+        "The clinical gate cannot verify this change at all. It runs the harness pipeline, which supplies prior_denial_codes directly and never exercises the route -- the same blindness that hid the defect. Verification is unit plus real-Postgres integration, and the eval harness remains unable to detect a regression here."
+      ],
+      "constraint_level": "escalation_branch",
+      "why_this_component": "The branch itself is correct and was never the problem; its input was missing. Fixing it anywhere else -- loosening the detector, or expecting escalation in the dataset -- would have accommodated a data gap by weakening a safety boundary, which is the inverse of the chg-29 error and worse.",
+      "phi_impact": "direct",
+      "audit_relevant": true,
+      "rollback_plan": "Revert the route wiring commit; the repository method and the intent action become unused but harmless, and can be left or reverted with it. Rolling back returns Branch 7 to being unreachable in production -- which is the status quo ante, not a new risk.",
+      "baseline": {
+        "claim": "Before chg-32 no caller populated prior_denial_codes, so Branch 7 could not fire on any real submission.",
+        "verified_by": "grep for prior_denial_codes across src/pacca/; reading Orchestrator.process_decision's default; reading ClinicalRiskDetector._check_prior_denial's docstring.",
+        "result": "The only matches outside the SME tooling were the orchestrator's own parameter (defaulting to None -> []) and its docstring. The submit route never passed it. The detector's docstring states: 'In this prototype, the Orchestrator passes an empty list by default... designed as a Week 3 enhancement.'"
+      }
+    }
+  ]
+}

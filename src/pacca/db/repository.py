@@ -233,6 +233,70 @@ class AuthorizationRepository:
         result = await self.session.execute(query)
         return [(decision, request) for decision, request in result.all()]
 
+    async def get_denied_procedure_codes(
+        self,
+        patient_id: str,
+        *,
+        exclude_request_id: str | None = None,
+    ) -> list[str]:
+        """Procedure codes previously DENIED for this patient.
+
+        This is Branch 7's data source, and until chg-32 it did not exist.
+        `ClinicalRiskDetector._check_prior_denial` matches the current procedure
+        code against `prior_denial_codes`, the Orchestrator defaults that
+        parameter to `[]`, and no route ever populated it — so a deterministic
+        safety check in the seven-branch escalation tree could not fire on a real
+        submission. It fired only in the evaluation harness, where golden cases
+        hand it the codes directly. The detector's own docstring describes this
+        query as the missing piece.
+
+        **PHI boundary.** This deliberately reads rows belonging to OTHER
+        authorization requests, which is a genuine widening of what a single run
+        touches — the reason the caller must declare `db.read_prior_denials` on
+        its IntentRecord and pass through the P-4 scope guard. The widening is
+        bounded to one patient's own history: `patient_id` is the sole selector
+        and there is no code path that returns another patient's rows. A leak
+        would not merely expose data, it would fire Branch 7 on a clean case
+        using someone else's record.
+
+        Keyed on the DECISION's `outcome`, not the request's `status` column,
+        for the same reason `list_escalated_for_review` is: a request whose
+        status-advance failed independently of its decision write still has a
+        durable decision row, and a denial that happened must not be forgotten
+        because a second UPDATE did not land.
+
+        Args:
+            patient_id: The patient whose history to search. Sole selector.
+            exclude_request_id: Omit this request from the search. The submit
+                route persists the incoming request before the orchestrator
+                runs, so the current row already exists by lookup time and a
+                request could otherwise match itself.
+
+        Returns:
+            Distinct procedure codes, deduplicated. Repeated denials of one
+            service are one code — `_check_prior_denial` does a membership test,
+            and duplicates would only inflate the audit detail string into
+            reading as though several services had been refused.
+        """
+        query = (
+            select(AuthorizationRequestModel.treatment_code)
+            .join(
+                AuthorizationDecisionModel,
+                AuthorizationDecisionModel.request_id == AuthorizationRequestModel.request_id,
+            )
+            .where(
+                AuthorizationRequestModel.patient_id == patient_id,
+                AuthorizationDecisionModel.outcome == AuthorizationStatus.DENIED.value,
+            )
+            .distinct()
+        )
+
+        if exclude_request_id is not None:
+            query = query.where(AuthorizationRequestModel.request_id != exclude_request_id)
+
+        result = await self.session.execute(query)
+        return [code for (code,) in result.all()]
+
     async def count_requests(
         self,
         status: AuthorizationStatus | None = None,

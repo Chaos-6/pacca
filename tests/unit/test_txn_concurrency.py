@@ -114,7 +114,9 @@ async def _run_concurrent_pair(db_url: str, monkeypatch) -> dict:
     a_reached_llm = asyncio.Event()
     b_may_release_a = asyncio.Event()
 
-    async def mock_process_decision(decision_ctx, *, audit, correlation_id):
+    async def mock_process_decision(decision_ctx, *, audit, correlation_id, **_kwargs):
+        # **_kwargs so a new orchestrator argument does not break stubs that
+        # only care that the call happened (chg-32 added prior_denial_codes).
         if decision_ctx.case.patient_id == PATIENT_A:
             a_reached_llm.set()
             await b_may_release_a.wait()

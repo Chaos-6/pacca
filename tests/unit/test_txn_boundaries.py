@@ -98,7 +98,9 @@ async def test_t1_committed_and_visible_to_independent_connection_before_orchest
 
     captured = {}
 
-    async def mock_process_decision(decision_ctx, *, audit, correlation_id):
+    async def mock_process_decision(decision_ctx, *, audit, correlation_id, **_kwargs):
+        # **_kwargs so a new orchestrator argument does not break stubs that
+        # only care that the call happened (chg-32 added prior_denial_codes).
         result = await reader_session.execute(
             select(AuthorizationRequestModel).where(
                 AuthorizationRequestModel.request_id == "AUTH-TXN-1"
@@ -139,7 +141,9 @@ async def test_no_transaction_open_on_route_session_during_orchestrator_call(eng
 
     captured = {}
 
-    async def mock_process_decision(decision_ctx, *, audit, correlation_id):
+    async def mock_process_decision(decision_ctx, *, audit, correlation_id, **_kwargs):
+        # **_kwargs so a new orchestrator argument does not break stubs that
+        # only care that the call happened (chg-32 added prior_denial_codes).
         captured["in_transaction"] = route_session.in_transaction()
         return AuthorizationDecision(
             status=AuthorizationStatus.AUTO_APPROVED,
@@ -196,7 +200,9 @@ async def test_no_transaction_open_during_orchestrator_call_on_resume_path(engin
 
     captured = {}
 
-    async def mock_process_decision(decision_ctx, *, audit, correlation_id):
+    async def mock_process_decision(decision_ctx, *, audit, correlation_id, **_kwargs):
+        # **_kwargs so a new orchestrator argument does not break stubs that
+        # only care that the call happened (chg-32 added prior_denial_codes).
         captured["in_transaction"] = route_session.in_transaction()
         return AuthorizationDecision(
             status=AuthorizationStatus.AUTO_APPROVED,
@@ -224,16 +230,22 @@ async def test_no_transaction_open_during_orchestrator_call_on_resume_path(engin
 
 @pytest.mark.asyncio
 async def test_enforce_scope_still_wraps_every_write(engine):
-    """Spec §3.3: five `enforce_scope` call sites existed before chg-24 (four
-    DB writes + the RAG query) and must survive the restructuring. chg-24
-    extracted three helper functions out of `submit_authorization` to stay
-    within ruff's statement/branch budget, so two of the five sites
-    (db.write_decision in the RAG-degraded and ScopeViolation escalation
-    exits) now live in `_handle_rag_degraded_escalation` /
-    `_persist_scope_violation_escalation` rather than inline in the route.
-    Counting across all four functions' source (not just the route's own
-    text) is the faithful update of the original invariant -- the guarded
-    envelope is unchanged, only which function's text contains the call.
+    """Spec §3.3: the guarded envelope must never shrink silently.
+
+    Five call sites existed before chg-24 (four DB writes + the RAG query).
+    chg-24 extracted three helpers out of `submit_authorization` to stay within
+    ruff's statement/branch budget, so two of them (db.write_decision on the
+    RAG-degraded and ScopeViolation escalation exits) now live in
+    `_handle_rag_degraded_escalation` / `_persist_scope_violation_escalation`.
+    Counting across all four functions' source rather than the route's own text
+    is the faithful form of the original invariant: the envelope is unchanged,
+    only which function's text contains the call.
+
+    SIX as of chg-32, which added `db.read_prior_denials` -- the first READ in
+    the prior-auth scope and the first guarded call that touches rows outside
+    the current request. The count moves UP with a named reason; it must never
+    move down without one, because a shrinking count is guard coverage being
+    removed.
     """
     sources = "".join(
         inspect.getsource(fn)
@@ -245,9 +257,10 @@ async def test_enforce_scope_still_wraps_every_write(engine):
         )
     )
     count = sources.count("await enforce_scope(")
-    assert count == 5, (
-        f"expected exactly 5 enforce_scope call sites across the submit path "
-        f"(4 DB writes + the RAG query), found {count}"
+    assert count == 6, (
+        f"expected exactly 6 enforce_scope call sites across the submit path "
+        f"(4 DB writes + the RAG query + the chg-32 prior-denial read), "
+        f"found {count}"
     )
 
 

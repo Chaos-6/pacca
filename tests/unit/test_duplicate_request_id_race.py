@@ -114,7 +114,9 @@ async def test_concurrent_duplicate_while_first_in_flight_gets_409_not_second_de
     b_may_release_a = asyncio.Event()
     orchestrator_call_count = 0
 
-    async def mock_process_decision(decision_ctx, *, audit, correlation_id):
+    async def mock_process_decision(decision_ctx, *, audit, correlation_id, **_kwargs):
+        # **_kwargs so a new orchestrator argument does not break stubs that
+        # only care that the call happened (chg-32 added prior_denial_codes).
         nonlocal orchestrator_call_count
         orchestrator_call_count += 1
         a_reached_llm.set()
