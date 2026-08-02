@@ -311,6 +311,69 @@ class TestClinicalRiskDetector:
 
         assert EscalationReason.CONFLICTING_GUIDELINES in flags.reasons
 
+    def test_gc034_escalates_but_only_via_defective_keyword_hits(self) -> None:
+        """GC-034 pre-escalates for the RIGHT outcome via the WRONG reasons.
+
+        David's call (2026-08-01): this case should route to human review. That
+        is right on the merits -- off-label oncology immunotherapy after two
+        lines, with no compendia support, is a human-review case.
+
+        But every keyword that fires Branch 4 on it is a false positive:
+
+          * "No published Phase III data" -> matches 'phase i', 'phase ii' AND
+            'phase iii', because the scan is substring-based. One phrase, three
+            hits, and the phrase asserts evidence is ABSENT.
+          * "Patient is not enrolled in a clinical trial" -> matches
+            'clinical trial'. There is no negation awareness; the sentence says
+            the opposite of what the match implies.
+          * "requesting nivolumab off-label" -> matches 'off-label', which sits
+            in EXPERIMENTAL_DIAGNOSIS_KEYWORDS although off-label use of an
+            FDA-approved drug is a COVERAGE question, not an experimental one.
+            Same category error as the coverage/medical-necessity boundary one
+            layer up (CLAUDE.md safety invariants).
+
+        So GC-034's expected_outcome is COUPLED to those defects. This test
+        exists to make that coupling loud: when Branch 4 is repaired -- whole-word
+        matching, negation awareness, or reclassifying 'off-label' -- this goes
+        red, and the right branch for GC-034 must then be DECIDED rather than
+        assumed. A silent flip to no-escalation would leave the case failing for
+        an unrelated-looking reason months later.
+
+        None of the three defects is fixed here. The 'off-label' reclassification
+        is a clinical-category call and is parked pending a clinician.
+        """
+        from pacca.agents.clinical_risk_detector import EXPERIMENTAL_DIAGNOSIS_KEYWORDS
+        from tests.clinical.denial_cases import DENIAL_CASES
+
+        gc_034 = next(c for c in DENIAL_CASES if c.case_id == "GC-034")
+        case = make_case()
+        case.evidence[0].original_text = gc_034.clinical_notes
+        case.evidence[0].description = gc_034.clinical_notes[:200]
+
+        flags = self.detector.evaluate(case, guidelines_context=gc_034.guidelines_context)
+
+        assert EscalationReason.EXPERIMENTAL_TREATMENT in flags.reasons, (
+            "GC-034 no longer pre-escalates via Branch 4. If Branch 4 was just "
+            "repaired, that is expected -- and GC-034's expected_outcome must now "
+            "be re-decided rather than left as PRE_FLIGHT_ESCALATE / "
+            "BRANCH_4_EXPERIMENTAL. See the case's clinical_rationale."
+        )
+
+        text = gc_034.clinical_notes.lower()
+        hits = [kw for kw in EXPERIMENTAL_DIAGNOSIS_KEYWORDS if kw in text]
+        assert {"phase i", "phase ii", "phase iii"} <= set(hits), (
+            "the substring triple-hit from one 'Phase III' is gone -- Branch 4's "
+            "matching was narrowed; re-decide GC-034"
+        )
+        assert "clinical trial" in hits, (
+            "the negated 'not enrolled in a clinical trial' no longer matches -- "
+            "negation awareness was added; re-decide GC-034"
+        )
+        assert "off-label" in hits, (
+            "'off-label' no longer counts as experimental -- the category was "
+            "corrected; re-decide GC-034"
+        )
+
     def test_empty_guidelines_context_does_not_error(self) -> None:
         """
         Branch 6 edge case: empty guidelines context (no RAG results) should
