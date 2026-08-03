@@ -12,6 +12,15 @@
 
 ## Index
 
+- [iter-23 — chg-33: GC-034 expects PRE_FLIGHT_ESCALATE](#iter-23-gc034)
+- [iter-22 — chg-32: wire prior_denial_codes so Branch 7 can fire](#iter-22-branch7-data)
+- [iter-21 — chg-30/31: the redirect after chg-29's rollback](#iter-21-branch6-substring)
+- [iter-20 — chg-28/29: make the DENY class observable, then fail to fix it (first ROLLBACK)](#iter-20-deny-class)
+- [iter-19 — chg-26/27: two repairs to the evaluation instrument](#iter-19-evaluator-repairs)
+- [iter-18 — chg-25: separate what is checkable from what is judged](#iter-18-judge-separation)
+- [iter-17 — chg-24: bound the submit transaction to the work](#iter-17-transaction-bounds)
+- [iter-16 — chg-21/22/23: three runtime defects from the 2026-07-27 audit](#iter-16-runtime-defects)
+- [iter-15 — chg-19/20: make RAG degradation visible](#iter-15-rag-visibility)
 - [iter-14 — chg-17/18: make the RAG retrieval path real (import-chain repair + collection/filter/scoring fixes)](#iter-14-rag-real)
 - [iter-13 — chg-14/15/16: wire + govern the case_precedents institutional-memory RAG collection](#iter-13-precedent-rag)
 - [iter-12 — chg-13: deferrable audit FK, fixes Postgres FK violation (B3)](#iter-12-deferrable-audit-fk)
@@ -28,6 +37,354 @@
 - [Correction (2026-05-22) — iter-0 trajectory instrumentation record](#correction-iter0-trajectory)
 - [iter-1 — chg-1: Decision Support and Medical Director prompt extraction (Phase H1)](#chg-1-iter-1)
 - [iter-0 — Baseline Crystallization (seed)](#iter-0-baseline-crystallization)
+
+---
+
+<a name="iter-23-gc034"></a>
+
+## iter-23 — GC-034 expects PRE_FLIGHT_ESCALATE, 1 change
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-23` |
+| Date | 2026-08-02 |
+| Author | David Reed |
+| Constraint levels touched | `evaluation_harness` (chg-33) |
+| Behavioral surface modified | NO — case data and tests only |
+| Changes | 1 |
+| Verdict | pending |
+
+**Description.** The second case (after chg-31's GC-036) found asserting an outcome a
+pre-flight boundary forbids. GC-034 expected `DENIED` while its own clinical notes fire the
+experimental-treatment check, so the DecisionAgent is never called and the expectation could
+never be met. Corrected to `PRE_FLIGHT_ESCALATE` per David's call. Full manifest:
+[`harness/manifests/iter-23.json`](../harness/manifests/iter-23.json).
+
+### The outcome is right; the mechanism is not
+
+Branch 4 fires here through three separate defects: substring matching turns one *"No published
+Phase III data"* into `phase i` + `phase ii` + `phase iii` hits; there is no negation awareness,
+so *"Patient is **not enrolled** in a clinical trial"* matches `clinical trial`; and `off-label`
+sits in the experimental keyword list although off-label use of an approved drug is a coverage
+question. Every trigger is a false positive that happens to reach the right answer.
+
+The expectation is therefore **coupled to three open bugs**, and a test pins that coupling so
+repairing branch 4 goes red with instructions rather than flipping the case silently.
+
+### A near-miss worth keeping
+
+An earlier draft replaced GC-034's `reasoning_must_not_include` on the premise that
+`experimental`/`off-label` were forbidden there and would now conflict. They were not — the list
+was `["approved", "appropriate", "appropriately", "appropriateness"]`, carrying chg-25's F2
+backfill. The replacement would have silently deleted that coverage. A test caught it. The
+failure mode — rewriting a constraint list *while* changing an outcome — is the transferable
+lesson, not the specific keyword.
+
+---
+
+<a name="iter-22-branch7-data"></a>
+
+## iter-22 — Wire prior_denial_codes so Branch 7 can fire, 1 change
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-22` |
+| Date | 2026-08-01 |
+| Author | David Reed |
+| Constraint levels touched | `escalation_branch` (chg-32) |
+| Behavioral surface modified | YES — a dormant pre-flight branch becomes reachable in production |
+| Changes | 1 |
+| Verdict | pending |
+
+**Description.** Branch 7 (`prior_denial_same_service`) is one of seven deterministic pre-flight
+checks on a boundary CLAUDE.md says overrides model confidence — and it had **never been able to
+fire on a real submission**. `Orchestrator.process_decision` defaults `prior_denial_codes` to
+`[]` and no route populated it. Adds a patient-scoped repository lookup, declares
+`db.read_prior_denials` on the IntentRecord, and calls it under the P-4 guard. Full manifest:
+[`harness/manifests/iter-22.json`](../harness/manifests/iter-22.json).
+
+### What the evaluation harness structurally could not detect
+
+The branch fired only in the golden-set harness, where each case hands it the codes directly.
+**The harness supplied what production did not**, so no amount of golden-set passing could have
+surfaced the gap — a safety check that cannot trigger, passing tests that feed it its own input.
+The detector's own docstring had described the missing query for months and called it "a Week 3
+enhancement". The gap was documented at the point of the defect and still shipped, because
+nothing tested the production path.
+
+### Placement was load-bearing and wrong on the first attempt
+
+Written next to the orchestrator call it reads better, but a `SELECT` there autobegins a read
+transaction that stays open across the LLM window — the 0.54s connection hold chg-24 measured and
+removed. The comment on T1's commit says *"Nothing between here and T2 touches this session."*
+The lookup now sits inside T1, and `test_run_sites_are_scope_guarded` asserts the guarded actions
+as an **ordered** list so a reordering that reintroduces the hold fails rather than passing as
+"still guarded".
+
+### Limitations
+
+The clinical gate cannot verify this change at all — it runs the harness pipeline, which supplies
+the codes directly and never touches the route. Verification is unit plus real-Postgres
+integration. The eval harness remains unable to detect a regression here. Separately, the lookup
+is **not fail-closed**: if the query raises, the submission errors rather than escalating, so a
+failure to *confirm* the absence of a prior denial is treated as an error rather than "cannot
+rule one out". The RAG-degraded path took the opposite posture; reconciling them is open.
+
+---
+
+<a name="iter-21-branch6-substring"></a>
+
+## iter-21 — The redirect after chg-29's rollback, 2 changes
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-21` |
+| Date | 2026-07-31 |
+| Author | David Reed |
+| Constraint levels touched | `escalation_branch` (chg-30), `evaluation_harness` (chg-31) |
+| Behavioral surface modified | YES — chg-30 changes what pre-escalates |
+| Changes | 2 |
+| Verdict | chg-30 **KEEP** |
+
+**Description.** chg-30 fixes the defect chg-29 was written for and missed: several approval
+markers are substrings of their own negations (`recommended` inside `not recommended`), so a
+single unambiguous negative statement satisfied both `has_approval` and `has_rejection` and
+fabricated a conflict with itself. chg-31 corrects GC-036 to `PRE_FLIGHT_ESCALATE`. Full
+manifest: [`harness/manifests/iter-21.json`](../harness/manifests/iter-21.json).
+
+### Why the aggregate hid the result
+
+The headline accuracy was **unchanged at 85.7% (36/42)** before and after. Reading the total
+alone would show chg-30 doing nothing. GC-026 moved fail→pass and GC-019 moved pass→fail in the
+same run, netting zero. The "no regression" claim rests on the per-case comparison, not the
+aggregate — and GC-019's flip is judge/agent variance, verified unattributable because its
+guidelines contain no conflict markers at all.
+
+### What it settled about the previous iteration
+
+GC-026 was denied correctly at score 5 **with chg-29 reverted**. The capability chg-29 tried to
+add to institutional memory already existed; the agent had simply never been consulted. That is
+the strongest available evidence that the rollback was right and that the original diagnosis was
+wrong at the component level rather than merely incomplete.
+
+### Blast radius, measured later
+
+chg-30 shipped admitting its blast radius was unmeasured. The sweep (2026-08-03) found **exactly
+two** cases changed: GC-026 and GC-085 — the latter's only approval hit being `indicated` inside
+`contraindicated`, the same defect in a case nobody had examined. No held-out case changed.
+GC-085 sits in neither the gate nor the holdout, so that correctness improvement is invisible to
+every evaluation run.
+
+---
+
+<a name="iter-20-deny-class"></a>
+
+## iter-20 — Make the DENY class observable, then fail to fix it, 2 changes
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-20` |
+| Date | 2026-07-30 |
+| Author | David Reed |
+| Constraint levels touched | `evaluation_harness` (chg-28), `long_term_memory` (chg-29) |
+| Behavioral surface modified | chg-29 YES (reverted); chg-28 NO |
+| Changes | 2 |
+| Verdict | chg-29 **ROLLBACK** — PACCA's first |
+
+**Description.** chg-28 wired `DENIAL_CASES` into the accuracy gate, taking DENY-class coverage
+from 4/7 to 7/7. chg-29 then added a coverage-criteria deny pattern to institutional memory and
+**had no effect whatsoever**. Full manifest:
+[`harness/manifests/iter-20.json`](../harness/manifests/iter-20.json).
+
+### The first rollback, and why it was worth having
+
+The live gate returned results byte-identical to the baseline. chg-29 was inert *by
+construction*: `ClinicalRiskDetector` pre-escalates all four target cases, and the pipeline
+short-circuits before the DecisionAgent runs. The memory file it edited was never read for those
+cases.
+
+Two signals had been misread in the same direction. The recurring **0.00 confidence** was the
+pipeline's hardcoded value on the pre-escalate path, not agent uncertainty. The "invented
+conflict between aligned guidelines" the judge criticised was the *detector's own reason string*
+rendered into a synthetic rationale — the judge was grading machine-generated text and reasonably
+critiquing it as if an agent had written it. The cases' ground truth was verified carefully; the
+causal path never was. P-013 applied to the data and skipped on the mechanism.
+
+### What chg-28 bought
+
+Going from 2 evaluated DENY cases to 5 produced GC-035 as a **discriminating negative** — the one
+DENY case the agent is actually consulted about, and the only one it gets right. That single
+observation is what exposed the mechanism. The measurement change paid for itself by invalidating
+the behavioural change that followed it.
+
+### Limitations
+
+At n=7 the DENY stratum's Wilson interval is about ±26 pp. The class is now *observable*, not
+*measurable*, and no DENY-rate claim is licensed by it.
+
+---
+
+<a name="iter-19-evaluator-repairs"></a>
+
+## iter-19 — Two repairs to the evaluation instrument, 2 changes
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-19` |
+| Date | 2026-07-29 |
+| Author | David Reed |
+| Constraint levels touched | `evaluation_harness` (chg-26, chg-27) |
+| Behavioral surface modified | NO — evaluator and case data |
+| Changes | 2 |
+| Verdict | chg-25 **IMPROVE** |
+
+**Description.** chg-26 removes `PD-L1 TPS` from GC-018's trap list; chg-27 renumbers three
+colliding case ids and adds an object-level dataset integrity gate. Full manifest:
+[`harness/manifests/iter-19.json`](../harness/manifests/iter-19.json).
+
+### Moving a check changes what the check means
+
+GC-018's trap keywords were authored for an LLM judge, which reads them semantically — a judge
+distinguishes *"PD-L1 TPS: NOT documented"* from *"PD-L1 TPS is 62%"*. chg-25 correctly moved
+keyword checking into a string matcher, which cannot. Moving the **reader** silently redefined
+the keyword, and the repo's strictest assertion began failing builds on correct behaviour, at 1
+in 6 live runs. The rule now in the authoring guide: forbid assertions, never bare criterion
+names.
+
+### Counting the wrong noun
+
+chg-27's finding generalises further. Every measurement of the dataset counted unique **ids** —
+`all_dataset_case_ids()` returns a `frozenset[str]` — so three ids each identifying two different
+clinical cases collapsed into one, and 108 case objects were reported as 105 for seven weeks.
+Both authoring PRs had asked "is this id free?", both checked, and both got yes from an
+instrument that had already absorbed the cases they were asking about.
+
+Correcting the count exposed a larger fact: only **71 of 108** cases are executed by any
+evaluation run. Recorded as a report rather than a gate, per the maintainer's framing that the
+2026-05-28 breadth batch was authored as holdout reserve.
+
+---
+
+<a name="iter-18-judge-separation"></a>
+
+## iter-18 — Separate what is checkable from what is judged, 1 change
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-18` |
+| Date | 2026-07-28 |
+| Author | David Reed |
+| Constraint levels touched | `evaluation_harness` (chg-25) |
+| Behavioral surface modified | NO — evaluator only |
+| Changes | 1 |
+| Verdict | chg-24 **KEEP** |
+
+**Description.** *(Reconstructed from the manifest — this iteration predates the current
+session's direct record.)* PACCA's headline anti-hallucination metric was an LLM's self-reported
+boolean, produced from a prompt that labelled keyword constraints as "hallucination markers".
+GC-028 produced the same violation and the same decision across two runs; the judge called it an
+anti-pattern once and a hallucination the next, flipping the count 0→1 with no system change, and
+`correct_outcome` flipped with it. chg-25 introduces a three-tier evaluator: deterministic
+keyword checks, deterministic outcome/grounding checks reusing the runtime detector, and a judge
+confined to reasoning quality and fabrication. Full manifest:
+[`harness/manifests/iter-18.json`](../harness/manifests/iter-18.json).
+
+### Why this was the right constraint level
+
+The evaluator is the instrument every other number depends on. A metric that moves without the
+system moving is not a measurement, and it defeats audit: a reviewer asking "how many
+hallucinations" got a number that differed between two runs of unchanged code.
+
+---
+
+<a name="iter-17-transaction-bounds"></a>
+
+## iter-17 — Bound the submit transaction to the work, 1 change
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-17` |
+| Date | 2026-07-28 |
+| Author | David Reed |
+| Constraint levels touched | `tool_implementation` (chg-24) |
+| Behavioral surface modified | NO — persistence boundaries |
+| Changes | 1 |
+| Verdict | chg-21, chg-22, chg-23 all **KEEP** |
+
+**Description.** *(Reconstructed from the manifest.)* `submit_authorization` held a DB write
+transaction open across the Claude API calls (~23s), making SQLite concurrency literally 1 and
+pinning a Postgres connection idle-in-transaction for the duration of every request. chg-24
+bounds the transaction to the work rather than the request. Full manifest:
+[`harness/manifests/iter-17.json`](../harness/manifests/iter-17.json).
+
+### The finding that outlived the change
+
+chg-24's spec named two states for a duplicate submission; a third existed *in flight*, and the
+race produced two decisions followed by a permanent 500. That is the instance behind
+AGENT_LESSONS **P-013** — a load-bearing claim about current behaviour must be measured, not
+asserted — which has since caught three further defects, including chg-29's rollback.
+
+---
+
+<a name="iter-16-runtime-defects"></a>
+
+## iter-16 — Three runtime defects from the 2026-07-27 audit, 3 changes
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-16` |
+| Date | 2026-07-28 |
+| Author | David Reed |
+| Constraint levels touched | multiple (chg-21, chg-22, chg-23) |
+| Behavioral surface modified | YES — retry policy, escalation persistence, audit durability |
+| Changes | 3 |
+| Verdict | chg-19, chg-20 both **KEEP** |
+
+**Description.** *(Reconstructed from the manifest.)* chg-21: 5xx/529 responses were not retried,
+and the SDK's own hidden retry loop multiplied attempts under a second backoff schedule. chg-22:
+a `ScopeViolation` escalation was not persisted, so a fail-closed case never reached the review
+queue. chg-23: audit writes shared the business transaction, so a rolled-back request erased the
+record documenting it. Full manifest:
+[`harness/manifests/iter-16.json`](../harness/manifests/iter-16.json).
+
+### Found by adversarial validation, not by the suite
+
+All three were surfaced by deliberate adversarial review rather than by a failing test — the
+pattern behind the maintainer's Designer/Executor/Validator workflow. chg-23 in particular
+produced AGENT_LESSONS **P-009**: SQLite proves nothing about FK behaviour, and a
+`PRAGMA`-forced SQLite test confirmed the wrong thing. The real-Postgres integration tier caught
+what 890 unit tests did not.
+
+---
+
+<a name="iter-15-rag-visibility"></a>
+
+## iter-15 — Make RAG degradation visible, 2 changes
+
+| Field | Value |
+|-------|-------|
+| Iteration tag | `harness-iter-15` |
+| Date | 2026-07-27 |
+| Author | David Reed |
+| Constraint levels touched | `tool_implementation` (chg-19), `escalation_branch` (chg-20) |
+| Behavioral surface modified | YES — chg-20 adds a degradation-triggered escalation |
+| Changes | 2 |
+| Verdict | pending at the time; both **KEEP** at iter-16 |
+
+**Description.** *(Reconstructed from the manifest.)* Closes the silent-fallback pattern iter-14
+fixed one instance of. chg-19 makes `GuidelineRetriever.query()` return a `RetrievalOutcome`
+rather than a bare `str`, covering both guideline-retrieval fallback and a separate
+precedents-failure axis, so degradation is observable instead of inferred. chg-20 audits every
+degradation before deciding whether to proceed, and adds an opt-in escalation
+(`rag_degraded_escalates`). Full manifest:
+[`harness/manifests/iter-15.json`](../harness/manifests/iter-15.json).
+
+### The generalisable shape
+
+A `str` return type cannot express "this succeeded, but not the way you think". Both iter-14 and
+iter-15 are instances of the same failure: a fallback path that works, returns something
+plausible, and reports nothing — so nobody learns the primary path is broken. The fix is a return
+type with room for the degraded case, not more logging.
 
 ---
 

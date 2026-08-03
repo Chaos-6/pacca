@@ -42,7 +42,23 @@ Before a behavioral change:
 4. Add a matching entry to `harness/manifests/iter-N.json` per
    `harness/manifests/change_manifest.schema.json`. Include `phi_impact` and
    `audit_relevant` fields — they are required for healthcare governance.
-5. Record a verdict in `docs/DECISIONS.md` at the next evaluation round.
+5. Record the verdict. **Two artifacts, two purposes — this instruction used to name only
+   the second, which is why it decayed:**
+   - **Structured verdict → `harness/manifests/iter-N.json`, `verdicts[]`** (`change_id`,
+     `outcome` of keep/improve/rollback, `verified_fixes`, `missed_fixes`, `notes`), recorded at
+     the next evaluation round. This is the SSOT and is schema-validated by the required
+     `validate-manifests` CI check.
+   - **Narrative entry → `docs/DECISIONS.md`**, a `## iter-N — <title>` section holding what a
+     schema cannot: why the iteration was shaped as it was, what an unexplained red test meant,
+     what the evaluation could *not* establish. Enforced by
+     `tests/harness/test_decisions_log_coverage.py`, which fails when a manifest has no matching
+     section.
+
+   Both are required. The narrative log previously stopped at iter-14 while manifests ran to
+   iter-24 — not from neglect but from enforcement asymmetry: one had a schema, a validator and
+   a CI gate, the other was prose. It is now gated too. (`docs/ITERATIONS.md` is a third,
+   older narrative log, stalled at iter-7; revive-or-retire is an open decision and it is NOT
+   currently required.)
 
 > **Enforcement status — P-6 complete, with one bypass (verified 2026-07-29).** CI runs a
 > **`validate-manifests`** job (`python -m pacca.harness.validate_manifest --all`, every PR)
@@ -56,12 +72,17 @@ Before a behavioral change:
 > `Postgres integration (SQLite-masked bugs — B2/B3)`. A missing manifest now blocks a
 > merge, not just a job.
 >
-> **The bypass, stated plainly:** `enforce_admins` is **false** and no PR review is
-> required, so an admin (David) pushing straight to `main` skips all five checks — GitHub
-> prints "5 of 5 required status checks are expected" and accepts the push anyway. That
-> path was used on 2026-07-29 to land a 118-commit local backlog. `strict` is also false,
-> so a branch need not be current with `main` before merging. Protection is real for the
-> PR path and advisory for the admin path; don't cite it as an unconditional gate.
+> **The bypass is CLOSED as of 2026-08-01.** `enforce_admins` is now **true**: the five
+> required checks apply to everyone, including admins, and there is no longer a path that
+> lands code on `main` without them. Before that it was false, and an admin push skipped
+> all five — GitHub printed "5 of 5 required status checks are expected" and accepted the
+> push anyway. That path was used on 2026-07-29 to land a 118-commit local backlog, which
+> is how a red `Tests` job went unnoticed for two days.
+>
+> Two residual notes. No PR **review** is required, so a single author can still self-merge
+> once CI is green — the gate is automated checks, not a second pair of eyes. And `strict`
+> is false, so a branch need not be current with `main` before merging; a change can pass
+> against a stale base.
 
 Non-behavioral changes (refactors, docs, test additions that don't change behavior)
 follow the standard PR flow and skip the manifest. The PR template forces the choice —
@@ -89,10 +110,12 @@ every PR is one path or the other, never ambiguous.
   `enforce_scope(intent, action, **call_args)`, a fail-closed call-site *wrapper*
   (there is no middleware loader) that denies out-of-scope tool/DB/RAG calls against
   the `IntentRecord` and raises `ScopeViolation` → `EscalationReason.SCOPE_VIOLATION`.
-  **As built (chg-8 → chg-9, +1 site at chg-20, +1 at chg-22):** wired into the submit
-  route in **enforce** mode at five sites — three in `submit_authorization` itself and two in
-  the escalation helpers it calls (`_handle_rag_degraded_escalation`,
-  `_persist_scope_violation_escalation`), extracted at chg-24. Four identifier-checked DB writes
+  **As built (chg-8 → chg-9, +1 at chg-20, +1 at chg-22, +1 at chg-32):** wired into the
+  submit route in **enforce** mode at six sites — four in `submit_authorization` itself and two
+  in the escalation helpers it calls (`_handle_rag_degraded_escalation`,
+  `_persist_scope_violation_escalation`), extracted at chg-24. chg-32 added
+  `db.read_prior_denials`, the first READ in the scope and the first guarded call touching rows
+  outside the current request. Four identifier-checked DB writes
   (`db.write_request`; `db.write_decision` at the normal-flow persist; again at the
   RAG-degraded escalation persist; again at the scope-violation escalation persist) and
   the RAG query. `learn_from_feedback` carries a sixth site (`rag.write_precedent`) under
