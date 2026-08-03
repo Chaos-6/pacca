@@ -189,12 +189,26 @@ def test_exact_set_of_keywords_with_false_positive_exposure_in_current_dataset()
 
 
 def test_age_keyword_hit_counts_before_and_after() -> None:
-    """Pins the headline number from the review: "age" drops from 152
+    """Pins the headline number from the review: "age" drops from 153
     substring hits to 42 whole-word hits across the full case corpus --
-    the other 110 were false positives from words like "coverage",
-    "average", "stage", "agent"."""
+    the other 111 were false positives from words like "coverage",
+    "average", "stage", "agent".
+
+    152 -> 153 at chg-33, which rewrote GC-034's clinical_rationale and added
+    the word "coverage". Note what that implies: `_corpus()` includes
+    `clinical_rationale` and `judge_scoring_criteria`, which are AUTHOR-facing
+    prose the model never sees. So editing a case's documentation moves a
+    measurement about matcher behaviour, and the ratio is diluted by text that
+    could never produce a real false positive.
+
+    That is a smell worth revisiting -- the corpus arguably belongs restricted
+    to model-visible fields (`clinical_notes`, `guidelines_context`) -- but
+    narrowing it changes every number in this file and is its own change. Left
+    as-is deliberately; the pin's job is to catch a matcher regression, and it
+    still does, it just also moves when prose does.
+    """
     corpus = _corpus()
-    assert _substring_hits("age", corpus) == 152
+    assert _substring_hits("age", corpus) == 153
     assert _whole_word_hits("age", corpus) == 42
 
 

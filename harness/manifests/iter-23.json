@@ -1,0 +1,46 @@
+{
+  "iteration": 23,
+  "iteration_tag": "harness-iter-23",
+  "iso_date": "2026-08-02",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-22",
+  "summary": "chg-33 corrects GC-034 from DENIED to PRE_FLIGHT_ESCALATE per David's call -- the second case (after chg-31's GC-036) found asserting an outcome a pre-flight safety boundary forbids. The outcome is right on the merits, but the mechanism producing it is not: branch 4 fires here through three separate keyword defects, so the expectation is explicitly coupled to bugs that remain open, and a test pins that coupling.",
+  "changes": [
+    {
+      "id": "chg-33",
+      "type": "improvement",
+      "description": "Correct GC-034's expected_outcome to PRE_FLIGHT_ESCALATE / BRANCH_4_EXPERIMENTAL, re-point reasoning_must_include at the machine-generated pre-flight rationale, and rewrite judge_scoring_criteria which previously penalised the now-correct outcome. Add a coupling test pinning that branch 4 currently fires on this case only through three defective keyword hits.",
+      "files": [
+        "tests/clinical/denial_cases.py",
+        "tests/unit/test_escalation_tree.py",
+        "tests/unit/test_evaluator_keyword_sweep.py"
+      ],
+      "failure_pattern": "A second golden case asserted an outcome the architecture forbids. GC-034 expected DENIED while its own clinical_notes trip the experimental-treatment pre-flight, so the DecisionAgent is never called and the expectation could never be met. Its permanent failure had been read as an agent defect, exactly as GC-036's was.",
+      "root_cause": "The dataset and the pre-flight tree disagree about who decides. GC-034's author reasoned from the coverage merits -- no compendia listing, therefore not covered, therefore DENIED -- without accounting for branch 4 firing first. CLAUDE.md is explicit that the escalation tree overrides; a case cannot opt out by asserting a different outcome. Compounding it, judge_scoring_criteria said 'Penalize for auto-approval or IN_REVIEW', so even a correct escalation would have scored badly.",
+      "predicted_fixes": [
+        "GC-034 becomes satisfiable: the escalation it triggers is now the expected outcome, and branch-4 coverage rises from 2 cases (GC-006, GC-009) to 3.",
+        "Its constraints stop asserting on text that cannot appear. must_include targets the pre-flight rationale rather than agent prose the agent is never invoked to write.",
+        "The judge stops penalising the correct answer.",
+        "The coupling to branch 4's defects is made loud rather than implicit: repairing branch 4 turns the new test red with a message saying GC-034's expectation must be re-decided."
+      ],
+      "risk_cases": [
+        "The expectation rests on three open defects, and that is stated rather than hidden. Branch 4 fires here via substring matching (one 'No published Phase III data' -> phase i + ii + iii), no negation awareness ('Patient is not enrolled in a clinical trial' matches 'clinical trial'), and 'off-label' classified as experimental when it is a coverage question. Every trigger is a false positive that reaches the right answer by accident. Fixing any of them may stop this case escalating.",
+        "DENY-class authored cases drop from 6 to 5. The stratum was already unmeasurable (Wilson about +/-26 pp at n=7, worse now), so this further weakens a measurement that was already not licensing any claim. It strengthens rather than weakens the case for authoring DENY cases.",
+        "The 'off-label' reclassification is parked pending a clinician and is the defect most likely to change this case's answer. Off-label use of an FDA-approved drug is a coverage determination under the boundary David set on 2026-07-31; leaving it in the experimental keyword list is a known category error being carried deliberately, not an oversight.",
+        "An earlier draft of this change replaced GC-034's reasoning_must_not_include on a false premise -- that 'experimental'/'off-label' were forbidden there and would now conflict. They were not. The replacement would have silently dropped chg-25's F2 morphological backfill ('appropriately', 'appropriateness'). test_gc_034_and_gc_105_appropriately_variant_now_caught went red and caught it. The list is unchanged; the near-miss is recorded because the failure mode -- rewriting a constraint list while changing an outcome -- will recur.",
+        "Corpus sensitivity surfaced twice while making this change: the keyword sweep's corpus includes clinical_rationale and judge_scoring_criteria, author-facing prose the model never sees, so editing a case's documentation moves a matcher measurement. Once via the word 'coverage' (pin 152 -> 153) and once via a Python identifier in prose, whose underscore produced a substring hit with no whole-word hit -- manufacturing the exact exposure the sweep exists to measure. Recorded in the test docstring; narrowing the corpus to model-visible fields is its own change."
+      ],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "The defect is in the case, not the detector. Branch 4's OUTCOME on this case is what David wants; only its reasoning is defective. Changing the detector to make GC-034's old DENIED expectation pass would have weakened a safety boundary to accommodate a mis-specified case -- the inverse of the chg-29 error. The detector defects are real and tracked, but they are a separate change with a clinical decision inside it.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Restore expected_outcome=DENIED, expected_branch=NONE, the previous must_include and judge criteria, and delete the coupling test. The case returns to being permanently unsatisfiable, so the revert restores a known-broken state rather than a working one.",
+      "baseline": {
+        "claim": "Before chg-33, GC-034 expected DENIED while its own clinical notes fire the experimental-treatment pre-flight, so the DecisionAgent was never called and the case could not pass.",
+        "verified_by": "ClinicalRiskDetector.evaluate() on GC-034; keyword-scan inspection of EXPERIMENTAL_DIAGNOSIS_KEYWORDS against its clinical_notes; two live clinical gate runs.",
+        "result": "pre_escalate=True reasons=['experimental_treatment'] deterministically, via five keyword hits ('phase ii', 'clinical trial', 'phase iii', 'phase i', 'off-label') of which all five are false positives. The gate scored GC-034 IN_REVIEW at 0.00 confidence against expected DENIED, judge score 2, on both runs."
+      }
+    }
+  ]
+}
