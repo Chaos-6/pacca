@@ -1,5 +1,14 @@
 # PACCA Harness Engineering — Iteration Narratives
 
+> **⚠️ Status (2026-08-03): stalled at iter-7, last updated 2026-05-31.** The live
+> per-iteration record is [`DECISIONS.md`](DECISIONS.md) (narrative, enforced by
+> `tests/harness/test_decisions_log_coverage.py`) plus
+> [`harness/manifests/`](../harness/manifests/) (structured verdicts, enforced by the
+> `validate-manifests` CI check). This file is NOT currently required and is 17 iterations
+> behind. Reviving it — or retiring it in favour of DECISIONS.md, whose role overlaps it almost
+> entirely — is an open decision, recorded here rather than left for a reader to discover by
+> noticing the dates.
+
 > **What this is:** the narrative log of PACCA's harness engineering cycle. Each iteration tag (`harness-iter-N`) gets a section structured in the format of Lin et al., *Agentic Harness Engineering* (arXiv:2604.25850, 2026), Appendix C: failure pattern → change shipped → trajectory before/after on a representative case → eval delta.
 >
 > **What this is for:** the engineering narrative that complements the audit log in [`DECISIONS.md`](./DECISIONS.md). DECISIONS.md is the structured record (manifest + verdict). This file is the story — what the failure looked like in the trajectory log, why we believed the chosen constraint level was right, what the passing case looked like after the fix, and what the eval delta confirmed or rejected. A reader who wants the data goes to DECISIONS.md; a reader who wants the reasoning comes here.
