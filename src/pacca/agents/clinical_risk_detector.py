@@ -566,6 +566,51 @@ class ClinicalRiskDetector:
 
           False positives (unnecessary human review) are acceptable.
           False negatives (missed conflicts reaching autonomous decisions) are not.
+
+        chg-34 — the trade-off, re-examined and DELIBERATELY KEPT:
+          That last line is still the right posture, but the false positives are
+          not randomly distributed, and that was not anticipated. Well-written
+          clinical guidance is structurally "do X, don't do Y", so approval and
+          rejection language co-occur in almost every denial-shaped context. The
+          check therefore fires hardest on the cases where the guidance is
+          CLEAREST, and the practical consequence is systemic rather than noisy:
+          a guideline-based DENIED is effectively unreachable, because the
+          pre-flight escalates before the DecisionAgent is ever called.
+
+          Narrowing the marker list was investigated and REJECTED. The obvious
+          split -- keep "conflicting evidence" / "guideline discordant" /
+          "insufficient evidence", drop "not recommended" / "not supported" /
+          "avoid" -- fails, because a genuine two-source conflict is worded
+          identically to an aligned one:
+
+              "NCCN: pembrolizumab is recommended as Category 1 ...
+               CMS:  treatment is not recommended for patients with ..."
+
+          Dropping those markers would blind the check to that, trading the
+          acceptable failure direction for the unacceptable one. The
+          discriminator is what the polarities REFER TO -- semantic, not lexical
+          -- so no keyword edit can express it.
+
+          The real fix is structural: have retrieval return guidance with source
+          attribution and per-source recommendation polarity, so a conflict is
+          "two sources, opposite polarity, same subject" rather than "both kinds
+          of word appeared". That is a retrieval-layer change, not a detector
+          one, and is the recorded path forward.
+
+          Until then GC-027 pins the current contract as PRE_FLIGHT_ESCALATE,
+          documenting the accepted false positive rather than pretending the
+          system denies a case it does not. This tension sits against the
+          decision that PACCA makes coverage determinations (CLAUDE.md safety
+          invariants) and is the reason to revisit it.
+
+          Note on "contraindicated": it is in the marker list but detects the
+          WORD, not the clinical fact. In GC-085 the guideline reads "cetuximab
+          + radiation is appropriate ... when cisplatin is contraindicated" --
+          a contraindication to the ALTERNATIVE, i.e. the reason the requested
+          therapy qualifies. A real contraindication check would have to read
+          the patient record, not the guideline text. Kept because it currently
+          contributes only when paired with a separate approval marker, which no
+          case in the dataset does, so it costs nothing today.
         """
         if not guidelines_context:
             return
