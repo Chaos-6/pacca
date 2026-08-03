@@ -1,0 +1,44 @@
+{
+  "iteration": 24,
+  "iteration_tag": "harness-iter-24",
+  "iso_date": "2026-08-03",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-23",
+  "summary": "chg-34 resolves the branch-6 question by NOT changing branch 6. The proposed marker split was investigated and rejected: a genuine two-source conflict is worded identically to an aligned guideline, so dropping 'not recommended' would blind the check to real conflicts -- trading the acceptable failure direction for the unacceptable one. GC-027 is corrected to pin the current contract, and the accepted false positive plus its systemic cost are recorded on the check itself.",
+  "changes": [
+    {
+      "id": "chg-34",
+      "type": "improvement",
+      "description": "Correct GC-027 to PRE_FLIGHT_ESCALATE / BRANCH_6_CONFLICTING and re-point its must_include at the pre-flight rationale; rewrite judge_scoring_criteria which penalised the now-correct outcome. Record the branch-6 trade-off, the rejected fix and the real path forward in _check_conflicting_guidelines' docstring. No detector logic changes.",
+      "files": [
+        "tests/clinical/expansion_cases.py",
+        "src/pacca/agents/clinical_risk_detector.py"
+      ],
+      "failure_pattern": "Branch 6 escalates cases whose guidance is unambiguous and aligned, because it infers conflict from approval and rejection language co-occurring anywhere in the context. Well-written clinical guidance is structurally 'do X, don't do Y', so the check fires hardest where guidance is CLEAREST. The consequence is systemic rather than noisy: a guideline-based DENIED is unreachable, since the pre-flight escalates before the DecisionAgent is called.",
+      "root_cause": "The heuristic tests for the PRESENCE of both polarities, not for what they refer to. A genuine conflict ('NCCN: recommended ... CMS: not recommended' about the same treatment) and an aligned guideline ('non-invasive testing recommended, invasive cath not recommended' about different services) are lexically identical. The discriminator is semantic, and the check is lexical.",
+      "predicted_fixes": [
+        "GC-027 becomes satisfiable: the escalation it triggers is now its expected outcome, and branch-6 coverage rises from 1 case (GC-011) to 2.",
+        "The judge stops penalising the correct answer -- its criteria previously said 'Penalize ... for IN_REVIEW (the guidelines are unambiguous)', which is true clinically and wrong operationally.",
+        "The rejected fix is recorded on the function, so the marker split is not re-proposed. The next reader of Branch 6 reads the docstring, not a manifest."
+      ],
+      "risk_cases": [
+        "This encodes a known-wrong outcome as expected. GC-027 is clinically a denial; the dataset now says escalate. That is deliberate -- the alternative is a case that can never pass -- but it means the golden set no longer asserts the clinically correct answer for this case, and a reader who skips the rationale would take the expectation at face value.",
+        "The systemic cost is unchanged and now explicit: while Branch 6 stands, guideline-based DENIED is unreachable whenever guidance carries both polarities, which is most denial-shaped guidance. That sits in direct tension with the 2026-07-31 decision that PACCA makes coverage determinations. Two of the three deterministic paths to a denial are therefore closed (this and the compendia case GC-034), leaving benefit-cap exhaustion as effectively the only reachable denial class.",
+        "The rejected marker split was rejected on one worked example (the existing genuine-conflict test's context). That example is decisive -- it shows the split breaks real conflict detection -- but no sweep was run to quantify how many real conflicts are worded that way versus explicitly ('conflicting evidence'). The conclusion is sound; the magnitude is unmeasured.",
+        "'contraindicated' remains in the marker list although it detects the word rather than the clinical fact (GC-085: 'appropriate ... when cisplatin is contraindicated' describes eligibility for the REQUESTED therapy). Kept because it contributes only when paired with a separate approval marker, which no case currently does -- so it is inert rather than correct, and would need revisiting if a case ever pairs them.",
+        "The structural fix named as the way forward -- per-source recommendation polarity from retrieval -- is not designed, costed or scheduled here. It is a retrieval-layer change and could be substantial."
+      ],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "The honest place for the change. The detector is coarse by design and its docstring says so; making it less coarse in the only way keywords allow would introduce false negatives on a safety check, which the same docstring names as unacceptable. So the dataset records what the system does, and the detector records why it does it. Neither pretends the clinical answer is escalation.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "Restore GC-027's DENIED / NONE expectation, its previous must_include and judge criteria, and drop the docstring addition. The case returns to being permanently unsatisfiable and the analysis is lost from the code, so the revert is strictly worse unless Branch 6 itself is being replaced at the same time.",
+      "baseline": {
+        "claim": "Before chg-34, GC-027 expected DENIED while Branch 6 pre-escalates it, so the DecisionAgent was never called and the case could not pass. The proposed marker split would have stopped that escalation but also stopped genuine two-source conflicts firing.",
+        "verified_by": "ClinicalRiskDetector.evaluate() on GC-027; marker-set analysis of its guidelines_context; and running the existing test_detects_conflicting_guidelines context through the proposed narrowed marker set.",
+        "result": "GC-027: pre_escalate=True reasons=['conflicting_guidelines'], from approval hit 'recommended' (standalone, about non-invasive testing) plus conflict hit 'not recommended' (about invasive cath) -- two different services in one aligned source. Under the proposed split the genuine two-source conflict context ('NCCN ... recommended' / 'CMS ... not recommended') matched ZERO conflict markers and would not have fired."
+      }
+    }
+  ]
+}
