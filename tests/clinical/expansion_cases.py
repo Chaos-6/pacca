@@ -144,24 +144,58 @@ EXPANSION_CASES: list[GoldenCase] = [
             "Choosing Wisely (ACC, 2012): do not perform invasive cardiac "
             "procedures in low-risk patients with atypical chest pain."
         ),
-        expected_outcome=ExpectedOutcome.DENIED,
-        expected_branch=EscalationBranch.NONE,
-        reasoning_must_include=["non-invasive", "atypical", "low"],
+        # chg-34: was DENIED / NONE. This case documents an ACCEPTED TRADE-OFF,
+        # not a clinically correct escalation, and the distinction matters.
+        #
+        # On the merits the guidance is unambiguous and aligned: ACC/AHA and
+        # Choosing Wisely both say non-invasive testing first, invasive cath not
+        # first-line. Denial is the clinically right answer. But Branch 6 fires,
+        # because its heuristic infers "conflict" from approval AND rejection
+        # language co-occurring anywhere in the context -- and well-written
+        # guidance is structurally "do X, don't do Y". The check cannot tell that
+        # from two sources disagreeing about the same thing.
+        #
+        # Narrowing it was investigated and rejected (David, 2026-08-03, option
+        # A): a genuine two-source conflict is expressed with exactly the same
+        # words -- "NCCN: recommended ... CMS: not recommended" -- so removing
+        # those markers would drop real conflicts, and Branch 6's docstring is
+        # explicit that false negatives are the unacceptable direction. The
+        # discriminator is semantic, not lexical, and fixing it properly means
+        # structured per-source retrieval rather than a keyword edit.
+        #
+        # The cost is recorded rather than hidden: while this holds, a
+        # guideline-based DENIED is unreachable whenever guidance carries both
+        # polarities, which is most denial-shaped guidance. That sits in tension
+        # with the decision that PACCA makes coverage determinations (CLAUDE.md
+        # safety invariants) and is the reason to revisit retrieval later.
+        expected_outcome=ExpectedOutcome.PRE_FLIGHT_ESCALATE,
+        expected_branch=EscalationBranch.BRANCH_6_CONFLICTING,
+        # Targets the machine-generated pre-flight rationale, not agent prose --
+        # the agent is never called. must_not_include is UNCHANGED: neither
+        # "approved" nor "high risk" appears in that rationale, so there was no
+        # conflict to resolve and no reason to disturb it.
+        reasoning_must_include=["conflicting", "human review"],
         reasoning_must_not_include=["approved", "high risk"],
         clinical_rationale=(
             "Low pre-test probability, atypical features, zero cardiac risk "
             "factors, no prior non-invasive workup. ACC/AHA explicitly "
             "recommend stress testing or coronary CTA first in this "
-            "population; invasive cath is not first-line. Denial is "
-            "appropriate; ordering provider should be redirected to stress "
-            "testing or coronary CTA."
+            "population; invasive cath is not first-line.\n\n"
+            "Clinically this is a denial. The system escalates instead, because "
+            "Branch 6 reads the aligned 'recommended / not recommended' pair as "
+            "a conflict. That is a known false positive, accepted deliberately "
+            "rather than fixed, because the only keyword-level fix would blind "
+            "the check to genuine two-source conflicts, which are worded "
+            "identically. This case therefore pins the CURRENT contract, and it "
+            "should be revisited if retrieval ever returns per-source "
+            "recommendation polarity."
         ),
         judge_scoring_criteria=(
-            "Score highly if rationale cites low pre-test probability, "
-            "absence of prior non-invasive workup, and the ACC/AHA "
-            "guideline hierarchy. Penalize for auto-approval (clearly "
-            "wrong) or for IN_REVIEW (the guidelines are unambiguous; no "
-            "human review needed for a clear denial)."
+            "Score highly if the system routes to human review citing the "
+            "guideline-conflict flag. The clinical merits point to denial, but "
+            "the pre-flight fires first and a human weighs it -- as in GC-006, "
+            "GC-009 and GC-011. Penalize for autonomous approval, and for a "
+            "denial issued without human review."
         ),
     ),
     # ─────────────────────────────────────────────────────────────────────────
