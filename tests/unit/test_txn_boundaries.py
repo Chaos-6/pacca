@@ -112,6 +112,8 @@ async def test_t1_committed_and_visible_to_independent_connection_before_orchest
             confidence_score=0.97,
             rationale="test",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
             cited_evidence_ids=["e1"],
         )
 
@@ -150,6 +152,8 @@ async def test_no_transaction_open_on_route_session_during_orchestrator_call(eng
             confidence_score=0.97,
             rationale="test",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
             cited_evidence_ids=["e1"],
         )
 
@@ -209,6 +213,8 @@ async def test_no_transaction_open_during_orchestrator_call_on_resume_path(engin
             confidence_score=0.97,
             rationale="test",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
             cited_evidence_ids=["e1"],
         )
 

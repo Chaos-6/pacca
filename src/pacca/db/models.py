@@ -145,6 +145,19 @@ class AuthorizationDecisionModel(Base):
     total_tokens_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
     processing_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Model / prompt provenance (SCHEMA-INV-04, THREAT-04, CHG-02).
+    # Indexed because the questions these columns exist to answer are queries:
+    # "which decisions did model X produce" is what a drift investigation or a
+    # model-change gate asks. Deterministic decisions carry the
+    # DETERMINISTIC_PROVENANCE sentinel rather than NULL, so the column is
+    # NOT NULL with a server default for the backfill of pre-existing rows.
+    model_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="unknown:pre-provenance", index=True
+    )
+    prompt_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="unknown:pre-provenance"
+    )
+
     # Relationships
     request: Mapped[AuthorizationRequestModel] = relationship(
         "AuthorizationRequestModel", back_populates="decision"

@@ -364,6 +364,12 @@ class DecisionRepository:
             was_escalated=decision.status == AuthorizationStatus.IN_REVIEW,
             processing_time_ms=processing_time_ms,
             total_tokens_used=total_tokens,
+            # SCHEMA-INV-04 / CHG-02: the substrate that produced this decision.
+            # Carried from the domain object rather than re-read from settings,
+            # so a runtime override that changed the model mid-flight is recorded
+            # as what actually ran, not as what configuration says now.
+            model_id=decision.model_id,
+            prompt_version=decision.prompt_version,
         )
 
         self.session.add(db_decision)
@@ -389,6 +395,8 @@ class DecisionRepository:
             decision_id=decision.decision_id,
             request_id=request_id,
             outcome=decision.status.value,
+            model_id=decision.model_id,
+            prompt_version=decision.prompt_version,
         )
 
         return db_decision

@@ -45,6 +45,7 @@ from anthropic import (
     RateLimitError,
 )
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 from tenacity import wait_fixed
 
 import pacca.agents.base as base_module
@@ -123,7 +124,7 @@ class TestRetryLogic:
     @pytest.fixture
     def agent(self) -> _ConcreteAgent:
         """Create a test agent with fast retry settings (no real waiting)."""
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         a = _ConcreteAgent(config=cfg)
         # Override settings to use 3 max attempts
         a._settings = MagicMock()
@@ -237,6 +238,57 @@ class TestRetryLogic:
         )
 
     @pytest.mark.asyncio
+    async def test_validation_error_no_retry(self, agent: _ConcreteAgent) -> None:
+        """
+        TERM-04 / CONSIST-02: a schema violation must NOT be retried.
+
+        This test is named in the SDD v3.0 traceability matrix as the verifier
+        for TERM-04, and the row is marked "Mapped" -- but the test did not
+        exist. The behaviour is correct and structurally guaranteed; only the
+        proof was missing.
+
+        The guarantee comes from where the retry decorator sits. ``@retry``
+        wraps ``_call_with_retry``, which owns the HTTP call. The response is
+        validated in ``execute()``, *outside* that wrapper, so a
+        ``ValidationError`` raised by ``model_validate`` propagates on the
+        first failure rather than re-entering the retry loop.
+
+        Why not retrying is the correct behaviour: a retry is only worth
+        spending when the next attempt could plausibly differ. A 429 or a 5xx
+        is transient. A response that does not satisfy the tool schema is a
+        contract failure between the prompt and the model, and re-rolling it
+        buys a second chance at a coin flip while spending real tokens and
+        latency on a clinical request. CONSIST-02 states the rule directly:
+        "schema violations are not retried."
+
+        Here the mock returns a tool_use block whose input is missing the
+        required ``result`` field.
+        """
+        malformed_block = MagicMock()
+        malformed_block.type = "tool_use"
+        malformed_block.input = {"score": 0.9}  # 'result' is required and absent
+
+        malformed_usage = MagicMock()
+        malformed_usage.input_tokens = 100
+        malformed_usage.output_tokens = 10
+
+        malformed_response = MagicMock()
+        malformed_response.content = [malformed_block]
+        malformed_response.usage = malformed_usage
+
+        agent.client.messages.create = AsyncMock(return_value=malformed_response)
+
+        with pytest.raises(PydanticValidationError):
+            await agent.execute("test prompt", _TestOutput)
+
+        assert agent.client.messages.create.call_count == 1, (
+            "TERM-04: a schema violation must not be retried. The API was called "
+            f"{agent.client.messages.create.call_count} times. Retrying a contract "
+            "failure spends tokens and latency on a clinical request for a second "
+            "chance at the same coin flip."
+        )
+
+    @pytest.mark.asyncio
     async def test_auth_error_not_retried(self, agent: _ConcreteAgent) -> None:
         """
         A 401 AuthenticationError must NOT be retried.
@@ -338,7 +390,7 @@ class TestServerErrorRetry:
             "default (3); if that default changes, update the expected "
             "attempt counts below rather than silently drifting."
         )
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         return _ConcreteAgent(config=cfg)
 
     @pytest.mark.asyncio
@@ -661,7 +713,7 @@ class TestRetryRespectsRuntimeOverrides:
     @pytest.fixture
     def agent(self) -> _ConcreteAgent:
         """A real agent with no _settings stub — call-time settings only."""
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         return _ConcreteAgent(config=cfg)
 
     @staticmethod
@@ -787,7 +839,7 @@ class TestOtelSpans:
     @pytest.fixture
     def agent_with_mock_tracer(self) -> _ConcreteAgent:
         """Create a test agent with a mocked OTel tracer."""
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         a = _ConcreteAgent(config=cfg)
         a._settings = MagicMock()
         a._settings.llm_retry_max_attempts = 1
@@ -887,43 +939,82 @@ class TestOtelSpans:
         assert set_attributes.get("llm.total_tokens") == 570
 
     @pytest.mark.asyncio
-    async def test_span_error_recorded_on_failure(
-        self, agent_with_mock_tracer: _ConcreteAgent
-    ) -> None:
+    async def test_span_error_recorded_on_failure(self) -> None:
         """
-        When an agent call fails permanently, the error must be recorded on
-        the span so it shows as a failure in the trace backend.
+        THREAT-03: a failure is visible on the span, and carries no PHI.
 
-        Without this, a failed request looks like a successful span that
-        just didn't return a result — confusing and misleading.
+        This test drives a REAL OpenTelemetry TracerProvider and reads the
+        exported span, rather than asserting against a MagicMock. That
+        distinction is the whole point of the test.
+
+        An earlier version of it mocked the span and asserted that
+        ``record_span_error`` did not call ``record_exception``. It passed
+        while PHI still reached the exported span, because the leak was never
+        in that function: ``start_as_current_span`` defaults to
+        ``record_exception=True, set_status_on_exception=True``, so when the
+        exception propagates out of the ``with`` block the SDK records the full
+        message and a status description of f"{type}: {exc}" itself. A mocked
+        context manager has no such behaviour to reproduce, so the assertion
+        was guarding one function while the leak lived one stack frame out.
+
+        Spans are exported to a third-party backend outside the HIPAA-scoped
+        audit store, so the exception message -- which can carry PHI from a
+        clinical case -- must not appear on them in any field.
         """
-        agent = agent_with_mock_tracer
-        agent.client.messages.create = AsyncMock(
-            side_effect=ValueError("LLM returned unexpected format")
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
         )
 
-        error_recorded: dict[str, Any] = {"called": False, "exc": None}
-        mock_span = MagicMock()
-        mock_span.__enter__ = MagicMock(return_value=mock_span)
-        mock_span.__exit__ = MagicMock(return_value=False)
-        mock_span.set_attribute = MagicMock()
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
 
-        def capture_record_exception(exc: BaseException) -> None:
-            error_recorded["called"] = True
-            error_recorded["exc"] = exc
+        agent = _ConcreteAgent(config=AgentConfig(model="claude-test", max_tokens=100))
+        agent._tracer = provider.get_tracer("test")
+        agent._settings = MagicMock()
+        agent._settings.llm_retry_max_attempts = 1
+        agent._settings.llm_retry_wait_min_seconds = 0.0
+        agent._settings.llm_retry_wait_max_seconds = 0.0
 
-        mock_span.record_exception = capture_record_exception
-        mock_span.set_status = MagicMock()
+        phi_message = "Patient MRN 12345678, dx C50.911 metastatic breast carcinoma"
+        agent.client.messages.create = AsyncMock(side_effect=ValueError(phi_message))
 
-        with (
-            patch.object(agent._tracer, "start_as_current_span", return_value=mock_span),
-            pytest.raises(ValueError),
-        ):
+        with pytest.raises(ValueError):
             await agent.execute("test prompt", _TestOutput)
 
-        assert error_recorded["called"], (
-            "span.record_exception() must be called when the agent fails. "
-            "Without this, errors are invisible in the trace backend."
+        spans = exporter.get_finished_spans()
+        assert spans, "The agent call must produce a span even when it fails."
+        span = spans[0]
+
+        # 1. The failure is visible: status is ERROR and a typed exception event
+        #    is present, so the failure is classifiable in the backend.
+        assert span.status.status_code.name == "ERROR", (
+            f"A permanent agent failure must mark the span ERROR; got {span.status}."
+        )
+        exception_events = [e for e in span.events if e.name == "exception"]
+        assert len(exception_events) == 1, (
+            "Expected exactly one 'exception' event. Two means the SDK is also "
+            "auto-recording, which is the PHI leak this test exists to catch; "
+            f"got {len(exception_events)}."
+        )
+        assert exception_events[0].attributes.get("exception.type") == "ValueError"
+
+        # 2. THREAT-03: no field of the exported span carries the message.
+        #    Serialise the whole span, not a chosen subset -- the previous
+        #    version inspected only add_event and set_status and would have
+        #    missed the message being written to a set_attribute call.
+        serialised = span.to_json()
+        assert phi_message not in serialised, (
+            "THREAT-03: the exception message reached the exported span. Spans "
+            "leave the audit store and the message may carry PHI."
+        )
+        assert "12345678" not in serialised, (
+            "THREAT-03: PHI from the exception message leaked onto the span."
+        )
+        assert "C50.911" not in serialised, (
+            "THREAT-03: a diagnosis code from the exception message leaked onto the span."
         )
 
 

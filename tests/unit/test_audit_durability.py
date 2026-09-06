@@ -318,6 +318,8 @@ class TestAuditFailureIsNonFatal:
             confidence_score=0.9,
             rationale="ok",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
 
         with (
@@ -636,6 +638,8 @@ class TestSubmitRouteEndToEnd:
             confidence_score=0.9,
             rationale="NCCN guidelines support this treatment.",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
 
         with (

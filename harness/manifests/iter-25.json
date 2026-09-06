@@ -1,0 +1,108 @@
+{
+  "iteration": 25,
+  "iteration_tag": "harness-iter-25",
+  "iso_date": "2026-09-06",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-24",
+  "summary": "Records which substrate produced each decision (SCHEMA-INV-04). AuthorizationDecision now carries model_id and prompt_version, persisted in indexed NOT NULL columns, and an agent-tier decision that does not name its model is rejected rather than stored. Three provenance states stay distinguishable: code decided it, a named model decided it, or the row predates capture. The question 'which model decided this case' previously had no answer in the data.",
+  "changes": [
+    {
+      "id": "chg-1",
+      "type": "new",
+      "description": "Add model_id and prompt_version to AuthorizationDecision, with a validator that refuses an agent-tier decision carrying the deterministic sentinel.",
+      "files": [
+        "src/pacca/models/authorization.py",
+        "src/pacca/agents/decision.py",
+        "src/pacca/agents/orchestrator.py"
+      ],
+      "failure_pattern": "A decision is stored, audited and replayed with no record of what produced it. A later question about model behaviour -- a drift investigation, a model-change gate, an incident review -- has no data to answer from and has to reconstruct the answer from prose written afterwards, if anyone wrote any.",
+      "root_cause": "The domain model carried the decision but not its substrate. Pinning a model identifier in configuration is not a record of what ran: configuration states an intent for future calls, while the question a review asks is retrospective and per-decision. docs/DECISIONS.md:136-140 records the exact gap -- a full accuracy evaluation executed on a substituted model (claude-sonnet-4-6, a floating alias), recoverable only from prose typed into a markdown file afterwards, while harness/manifests/iter-14.json still declared the pinned model that had not run.",
+      "evidence": [
+        {
+          "source": "docs/DECISIONS.md:136-140",
+          "note": "An evaluation run on a substituted model, reconstructable afterwards only from human-written prose; the manifest for that iteration still names the model that did not run."
+        },
+        {
+          "source": "src/pacca/models/authorization.py, pre-change AuthorizationDecision field list",
+          "note": "No field named the model or prompt. Every consumer -- audit records, replay, the review queue -- therefore carried the gap forward."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [],
+      "constraint_level": "audit_schema",
+      "why_this_component": "A sentinel on a required field rather than a nullable column, because 'no model was involved' and 'we failed to record which model was involved' are different statements and only the first is safe to infer. Making the field required with a deterministic default means an agent decision cannot be constructed without provenance -- the validator fails at the boundary rather than writing an unanswerable row. Enforcing this in a prompt would make an audit property depend on model compliance.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert the commit, then `alembic downgrade 007_drop_audit_request_id_fk`. The revert must precede the downgrade: reverted code does not write the columns, but code still expecting them against a downgraded schema fails on every decision write.",
+      "baseline": {
+        "claim": "AuthorizationDecision had no model_id or prompt_version field, and authorization_decisions had no corresponding columns, so no decision in the system recorded what produced it.",
+        "verified_by": "Inspect AuthorizationDecision.model_fields and the authorization_decisions table definition at harness-iter-24.",
+        "result": "Neither the domain model nor the table carried either field. 'Which model decided this case' was answerable only by correlating decided_at against configuration history, which does not record substitutions."
+      }
+    },
+    {
+      "id": "chg-2",
+      "type": "new",
+      "description": "Persist provenance in indexed NOT NULL columns (migration 008), backfilling pre-existing rows with a distinct 'unknown:pre-provenance' sentinel rather than NULL or the deterministic sentinel.",
+      "files": [
+        "src/pacca/db/models.py",
+        "src/pacca/db/migrations/versions/008_add_decision_provenance.py",
+        "src/pacca/db/repository.py"
+      ],
+      "failure_pattern": "Provenance exists in the domain object but not in storage, so it survives a request and is lost by the time anyone asks. A drift query over historical decisions silently counts rows whose substrate is unknown as though it were known.",
+      "root_cause": "Storage was the load-bearing layer for every retrospective question and did not carry the field. The backfill value is the substantive decision here, not the column: NULL would force each reader to decide what absence means, and reusing the deterministic sentinel would assert that code produced decisions a model actually produced.",
+      "evidence": [
+        {
+          "source": "alembic upgrade head / downgrade base / upgrade head against a scratch database",
+          "note": "Full cycle applies cleanly; `alembic revision --autogenerate` afterwards emits an empty upgrade(), so the ORM and the migration agree and the migration-drift job has nothing to report."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [],
+      "constraint_level": "audit_schema",
+      "why_this_component": "model_id is indexed because the questions the column exists to answer are queries -- 'which decisions did model X produce' is what a model-change gate and a drift investigation both run. prompt_version is not indexed: it is read alongside a decision, never selected on. Indexing it would cost writes for a query nobody issues.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "`alembic downgrade 007_drop_audit_request_id_fk` drops both columns and the index. Recorded provenance is lost by the downgrade and is not recoverable, so a downgrade after any production writes should export the columns first.",
+      "baseline": {
+        "claim": "authorization_decisions had no provenance columns at harness-iter-24; migration 007 was head.",
+        "verified_by": "`alembic heads` and the authorization_decisions column list at harness-iter-24.",
+        "result": "Head was 007_drop_audit_request_id_fk. The table carried decided_by (a tier) but nothing identifying a model or prompt."
+      }
+    },
+    {
+      "id": "chg-3",
+      "type": "improvement",
+      "description": "Read provenance from the row when reconstructing a decision for an idempotent replay, instead of letting it fall back to the deterministic default.",
+      "files": [
+        "src/pacca/api/routes/authorizations.py",
+        "tests/unit/test_decision_provenance.py"
+      ],
+      "failure_pattern": "A duplicate request_id returns 500 instead of replaying the original decision. The write path records provenance correctly, so the defect is invisible until a replay happens -- and it then presents as an availability bug rather than as the correctness bug it is.",
+      "root_cause": "_decision_from_model rebuilt AuthorizationDecision from the stored row without model_id or prompt_version, so both took the DETERMINISTIC_PROVENANCE default. For an AUTOMATED-tier decision that default is a false statement, and chg-1's validator rejects it -- correctly. The route stringifies the resulting ValidationError into a 500. This is chg-1 catching a real dropped-provenance path, which is the failure the requirement exists to detect, surfacing inside the same iteration that added it.",
+      "evidence": [
+        {
+          "source": "tests/unit/test_duplicate_request_id.py, tests/unit/test_duplicate_request_id_race.py",
+          "note": "5 tests failed with 'SCHEMA-INV-04: decision PA-... was produced by tier AUTOMATED but carries no model_id and no prompt_version'. The captured log for the same test shows the write path had recorded model_id=claude-sonnet-4-5-20250929 prompt_version=v2.7, confirming the loss is on read, not write."
+        },
+        {
+          "source": "tests/unit/test_decision_provenance.py, reverting the two-line read",
+          "note": "Removing the two field reads reproduces the failure in the new tests (2 failed, 11 passed), so the tests pin the fix rather than the surrounding code."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [],
+      "constraint_level": "audit_schema",
+      "why_this_component": "The replay path is the one place a decision is reconstructed rather than produced, so it is the one place provenance can be silently invented. Reading it from the row keeps the three states separable through a replay: a pre-migration row replays as 'unknown:pre-provenance' rather than borrowing whatever model is configured today. Substituting the current model would be the more convenient default and would make the record wrong precisely when it is being consulted.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert the commit. Reverting reintroduces the 500 on any replay of an agent-tier decision, so it should only be done alongside removing chg-1's validator.",
+      "baseline": {
+        "claim": "_decision_from_model constructed AuthorizationDecision without provenance, so a replayed agent decision claimed no model was involved.",
+        "verified_by": "Remove `model_id=model.model_id` and `prompt_version=model.prompt_version` from _decision_from_model and run tests/unit/test_decision_provenance.py.",
+        "result": "2 of 13 fail with the SCHEMA-INV-04 ValueError; restoring the reads returns 13 passed. Full deterministic suite: 1042 passed, 6 skipped."
+      }
+    }
+  ]
+}

@@ -155,6 +155,8 @@ async def test_submit_commits_with_zero_orphaned_audit_rows(pg_session: AsyncSes
         confidence_score=0.98,
         rationale="synthetic — persistence test, not clinical",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
         cited_evidence_ids=["e1"],
     )
     req = AuthorizationRequest(**_sample_request())
@@ -373,6 +375,8 @@ async def _assert_race_outcome_and_third_duplicate_replays(
                 confidence_score=0.97,
                 rationale="test",
                 review_tier_used=ReviewTier.AUTOMATED,
+                model_id="claude-sonnet-4-5-20250929",
+                prompt_version="v2.7",
                 cited_evidence_ids=["e1"],
             )
         )
@@ -444,6 +448,8 @@ async def test_concurrent_duplicate_while_first_in_flight_gets_409_on_postgres(
             confidence_score=0.97,
             rationale="test",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
             cited_evidence_ids=["e1"],
         )
 
@@ -547,6 +553,8 @@ async def test_pre_existing_two_decision_state_returns_defined_answer_on_postgre
             confidence_score=0.97,
             rationale="first decision (earliest)",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         second = AuthorizationDecision(
             decision_id="PA-pgsecond0000000",
@@ -554,6 +562,8 @@ async def test_pre_existing_two_decision_state_returns_defined_answer_on_postgre
             confidence_score=0.5,
             rationale="second decision (anomalous duplicate)",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         await DecisionRepository(session).create(first, request_id=request_id)
         await session.commit()

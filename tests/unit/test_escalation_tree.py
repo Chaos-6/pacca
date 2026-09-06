@@ -90,6 +90,8 @@ def make_decision(
         confidence_score=confidence,
         rationale="Test rationale.",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
 
 

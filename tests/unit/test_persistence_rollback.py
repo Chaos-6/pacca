@@ -35,6 +35,8 @@ def _decision() -> AuthorizationDecision:
         confidence_score=0.98,
         rationale="synthetic rationale",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
 
 
