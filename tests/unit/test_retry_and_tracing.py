@@ -939,74 +939,83 @@ class TestOtelSpans:
         assert set_attributes.get("llm.total_tokens") == 570
 
     @pytest.mark.asyncio
-    async def test_span_error_recorded_on_failure(
-        self, agent_with_mock_tracer: _ConcreteAgent
-    ) -> None:
+    async def test_span_error_recorded_on_failure(self) -> None:
         """
-        When an agent call fails permanently, the failure must be visible on
-        the span -- carrying the exception *type* only.
+        THREAT-03: a failure is visible on the span, and carries no PHI.
 
-        Without any error signal a failed request looks like a successful span
-        that just didn't return a result, which is confusing and misleading.
-        But the span is exported to a third-party trace backend outside the
-        HIPAA-scoped audit store, so THREAT-03 forbids putting the exception
-        message or stack trace on it: an exception raised while handling a
-        clinical case can carry PHI in either.
+        This test drives a REAL OpenTelemetry TracerProvider and reads the
+        exported span, rather than asserting against a MagicMock. That
+        distinction is the whole point of the test.
 
-        This test previously asserted ``span.record_exception()`` was called.
-        That call attaches the full message and stack trace, so it was removed
-        in favour of a typed event. The assertion below is deliberately
-        stronger than the one it replaces: it checks both that the failure is
-        visible *and* that the message did not leak with it. The full error
-        text is still retained in the audit record, which never leaves the
-        audit store.
+        An earlier version of it mocked the span and asserted that
+        ``record_span_error`` did not call ``record_exception``. It passed
+        while PHI still reached the exported span, because the leak was never
+        in that function: ``start_as_current_span`` defaults to
+        ``record_exception=True, set_status_on_exception=True``, so when the
+        exception propagates out of the ``with`` block the SDK records the full
+        message and a status description of f"{type}: {exc}" itself. A mocked
+        context manager has no such behaviour to reproduce, so the assertion
+        was guarding one function while the leak lived one stack frame out.
+
+        Spans are exported to a third-party backend outside the HIPAA-scoped
+        audit store, so the exception message -- which can carry PHI from a
+        clinical case -- must not appear on them in any field.
         """
-        agent = agent_with_mock_tracer
-        secret_message = "Patient MRN 12345678 triggered an unexpected format"
-        agent.client.messages.create = AsyncMock(side_effect=ValueError(secret_message))
-
-        events: list[tuple[str, dict[str, Any]]] = []
-        statuses: list[tuple[Any, ...]] = []
-
-        mock_span = MagicMock()
-        mock_span.__enter__ = MagicMock(return_value=mock_span)
-        mock_span.__exit__ = MagicMock(return_value=False)
-        mock_span.set_attribute = MagicMock()
-        mock_span.add_event = MagicMock(
-            side_effect=lambda name, attrs=None: events.append((name, attrs or {}))
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
         )
-        mock_span.set_status = MagicMock(side_effect=lambda *a: statuses.append(a))
 
-        with (
-            patch.object(agent._tracer, "start_as_current_span", return_value=mock_span),
-            pytest.raises(ValueError),
-        ):
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+        agent = _ConcreteAgent(config=AgentConfig(model="claude-test", max_tokens=100))
+        agent._tracer = provider.get_tracer("test")
+        agent._settings = MagicMock()
+        agent._settings.llm_retry_max_attempts = 1
+        agent._settings.llm_retry_wait_min_seconds = 0.0
+        agent._settings.llm_retry_wait_max_seconds = 0.0
+
+        phi_message = "Patient MRN 12345678, dx C50.911 metastatic breast carcinoma"
+        agent.client.messages.create = AsyncMock(side_effect=ValueError(phi_message))
+
+        with pytest.raises(ValueError):
             await agent.execute("test prompt", _TestOutput)
 
-        # 1. The failure is visible: the span carries a typed exception event.
-        exception_events = [e for e in events if e[0] == "exception"]
-        assert exception_events, (
-            "A permanent agent failure must record an 'exception' event on the span. "
-            "Without it, errors are invisible in the trace backend."
-        )
-        assert exception_events[0][1].get("exception.type") == "ValueError", (
-            "The exception event must name the exception type, so a failure is "
-            f"classifiable in the backend. Got: {exception_events[0][1]!r}"
-        )
+        spans = exporter.get_finished_spans()
+        assert spans, "The agent call must produce a span even when it fails."
+        span = spans[0]
 
-        # 2. The span is marked as failed.
-        assert statuses, "span.set_status() must be called on a permanent failure."
-
-        # 3. THREAT-03: neither the message nor any of its content reaches the span.
-        recorded_text = repr(events) + repr(statuses)
-        assert secret_message not in recorded_text, (
-            "THREAT-03: the exception message must not reach the span. Spans are "
-            "exported outside the audit store and the message may carry PHI."
+        # 1. The failure is visible: status is ERROR and a typed exception event
+        #    is present, so the failure is classifiable in the backend.
+        assert span.status.status_code.name == "ERROR", (
+            f"A permanent agent failure must mark the span ERROR; got {span.status}."
         )
-        assert "12345678" not in recorded_text, (
+        exception_events = [e for e in span.events if e.name == "exception"]
+        assert len(exception_events) == 1, (
+            "Expected exactly one 'exception' event. Two means the SDK is also "
+            "auto-recording, which is the PHI leak this test exists to catch; "
+            f"got {len(exception_events)}."
+        )
+        assert exception_events[0].attributes.get("exception.type") == "ValueError"
+
+        # 2. THREAT-03: no field of the exported span carries the message.
+        #    Serialise the whole span, not a chosen subset -- the previous
+        #    version inspected only add_event and set_status and would have
+        #    missed the message being written to a set_attribute call.
+        serialised = span.to_json()
+        assert phi_message not in serialised, (
+            "THREAT-03: the exception message reached the exported span. Spans "
+            "leave the audit store and the message may carry PHI."
+        )
+        assert "12345678" not in serialised, (
             "THREAT-03: PHI from the exception message leaked onto the span."
         )
-        mock_span.record_exception.assert_not_called()
+        assert "C50.911" not in serialised, (
+            "THREAT-03: a diagnosis code from the exception message leaked onto the span."
+        )
 
 
 # =============================================================================
