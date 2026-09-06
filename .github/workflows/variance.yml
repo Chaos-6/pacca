@@ -1,0 +1,115 @@
+# =============================================================================
+# Evaluation variance measurement — MANUAL ONLY
+#
+# Its own workflow file rather than a job in ci.yml, and that is the point.
+#
+# ci.yml's workflow_dispatch already runs two live-API jobs deliberately: the
+# clinical gate (its "Decide whether to run" step returns true for a manual
+# dispatch) and the held-out accuracy report. Both are useful on demand, so
+# neither should lose that. But it meant a dispatch aimed at *this* measurement
+# also paid for those two -- roughly 45 minutes of billed calls where ~25 was
+# asked for, with the surprise arriving as an invoice rather than an error.
+#
+# Splitting the file makes the dispatch surgical: running this measures
+# variance and nothing else, and ci.yml keeps every capability it had.
+#
+# WHAT IT MEASURES
+#
+#   judge-only    measure_judge_noise.py -- pipeline ONCE per case, judge N
+#                 times. Judge variance with the agent held fixed.
+#   end-to-end    capture_baseline.py --rollouts N -- whole pipeline N times,
+#                 storing per-case distributions.
+#
+# The difference between them is agent variance. That decomposition is what
+# says whether regression_gate.REGRESSION_DROP_THRESHOLD should widen (judge
+# noise) or whether an agent is unstable on a case (agent noise) -- different
+# problems with different fixes, and one end-to-end number cannot separate them.
+#
+# NEVER A GATE. It reports. The baseline it writes is an artifact, not a commit:
+# adopting a baseline is a deliberate act at a known-good commit, and
+# auto-committing one would let a regression baseline itself into legitimacy.
+# =============================================================================
+
+name: Evaluation variance
+
+on:
+  workflow_dispatch:
+    inputs:
+      judge_runs:
+        description: "Judge re-scores per case (>=2; one sample cannot disagree with itself)"
+        required: false
+        default: "5"
+      rollouts:
+        description: "End-to-end pipeline rollouts per case (>=2)"
+        required: false
+        default: "5"
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  variance-report:
+    name: Evaluation variance report (manual, non-blocking)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for API key (opt-in by secret)
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ANTHROPIC_API_KEY not set — variance report is inert until it is added"
+          fi
+
+      - name: Set up Python
+        if: steps.key.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        if: steps.key.outputs.present == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # continue-on-error on both: these report, they do not gate. A failure
+      # here must not read as a code regression.
+      - name: Judge-only noise (pipeline once, judge N times)
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m tests.clinical.measure_judge_noise \
+            --runs "${{ github.event.inputs.judge_runs || 5 }}" \
+            --out judge-noise.json
+
+      - name: End-to-end variance (full pipeline N times)
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m tests.clinical.capture_baseline \
+            --tag "variance-$(git rev-parse --short HEAD)" \
+            --rollouts "${{ github.event.inputs.rollouts || 5 }}" \
+            --out end-to-end-variance.json
+
+      - name: Upload variance measurements
+        if: steps.key.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-variance
+          path: |
+            judge-noise.json
+            end-to-end-variance.json
+          if-no-files-found: warn
+          retention-days: 90
