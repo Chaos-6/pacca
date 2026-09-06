@@ -240,13 +240,12 @@ class AgentConfig(BaseModel):
 
     * The parameter no longer exists. ``anthropic`` removed ``temperature``,
       ``top_p`` and ``top_k`` from ``messages.create`` in the 1.x line, and the
-      method takes no ``**kwargs`` — so passing it is a ``TypeError`` raised in
+      method takes no ``**kwargs`` -- so passing it is a ``TypeError`` raised in
       the SDK before any request is constructed, not a server-side rejection.
     * Determinism was never real anyway. Identical requests at temperature 0
       return different completions, which is why SDD v3.0 removed RES-DSA-04
-      and replaced it with observable consistency contracts (CONSIST-01/02):
-      agreement measured across N runs, rather than a sampling parameter
-      asserted to produce it.
+      and replaced it with observable consistency contracts: agreement measured
+      across N runs, rather than a sampling parameter asserted to produce it.
     """
 
     # Single source of truth: settings.default_model (override via env DEFAULT_MODEL).
