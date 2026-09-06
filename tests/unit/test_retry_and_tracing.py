@@ -45,6 +45,7 @@ from anthropic import (
     RateLimitError,
 )
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 from tenacity import wait_fixed
 
 import pacca.agents.base as base_module
@@ -891,29 +892,39 @@ class TestOtelSpans:
         self, agent_with_mock_tracer: _ConcreteAgent
     ) -> None:
         """
-        When an agent call fails permanently, the error must be recorded on
-        the span so it shows as a failure in the trace backend.
+        When an agent call fails permanently, the failure must be visible on
+        the span -- carrying the exception *type* only.
 
-        Without this, a failed request looks like a successful span that
-        just didn't return a result — confusing and misleading.
+        Without any error signal a failed request looks like a successful span
+        that just didn't return a result, which is confusing and misleading.
+        But the span is exported to a third-party trace backend outside the
+        HIPAA-scoped audit store, so THREAT-03 forbids putting the exception
+        message or stack trace on it: an exception raised while handling a
+        clinical case can carry PHI in either.
+
+        This test previously asserted ``span.record_exception()`` was called.
+        That call attaches the full message and stack trace, so it was removed
+        in favour of a typed event. The assertion below is deliberately
+        stronger than the one it replaces: it checks both that the failure is
+        visible *and* that the message did not leak with it. The full error
+        text is still retained in the audit record, which never leaves the
+        audit store.
         """
         agent = agent_with_mock_tracer
-        agent.client.messages.create = AsyncMock(
-            side_effect=ValueError("LLM returned unexpected format")
-        )
+        secret_message = "Patient MRN 12345678 triggered an unexpected format"
+        agent.client.messages.create = AsyncMock(side_effect=ValueError(secret_message))
 
-        error_recorded: dict[str, Any] = {"called": False, "exc": None}
+        events: list[tuple[str, dict[str, Any]]] = []
+        statuses: list[tuple[Any, ...]] = []
+
         mock_span = MagicMock()
         mock_span.__enter__ = MagicMock(return_value=mock_span)
         mock_span.__exit__ = MagicMock(return_value=False)
         mock_span.set_attribute = MagicMock()
-
-        def capture_record_exception(exc: BaseException) -> None:
-            error_recorded["called"] = True
-            error_recorded["exc"] = exc
-
-        mock_span.record_exception = capture_record_exception
-        mock_span.set_status = MagicMock()
+        mock_span.add_event = MagicMock(
+            side_effect=lambda name, attrs=None: events.append((name, attrs or {}))
+        )
+        mock_span.set_status = MagicMock(side_effect=lambda *a: statuses.append(a))
 
         with (
             patch.object(agent._tracer, "start_as_current_span", return_value=mock_span),
@@ -921,10 +932,30 @@ class TestOtelSpans:
         ):
             await agent.execute("test prompt", _TestOutput)
 
-        assert error_recorded["called"], (
-            "span.record_exception() must be called when the agent fails. "
-            "Without this, errors are invisible in the trace backend."
+        # 1. The failure is visible: the span carries a typed exception event.
+        exception_events = [e for e in events if e[0] == "exception"]
+        assert exception_events, (
+            "A permanent agent failure must record an 'exception' event on the span. "
+            "Without it, errors are invisible in the trace backend."
         )
+        assert exception_events[0][1].get("exception.type") == "ValueError", (
+            "The exception event must name the exception type, so a failure is "
+            f"classifiable in the backend. Got: {exception_events[0][1]!r}"
+        )
+
+        # 2. The span is marked as failed.
+        assert statuses, "span.set_status() must be called on a permanent failure."
+
+        # 3. THREAT-03: neither the message nor any of its content reaches the span.
+        recorded_text = repr(events) + repr(statuses)
+        assert secret_message not in recorded_text, (
+            "THREAT-03: the exception message must not reach the span. Spans are "
+            "exported outside the audit store and the message may carry PHI."
+        )
+        assert "12345678" not in recorded_text, (
+            "THREAT-03: PHI from the exception message leaked onto the span."
+        )
+        mock_span.record_exception.assert_not_called()
 
 
 # =============================================================================

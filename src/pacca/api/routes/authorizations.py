@@ -955,7 +955,13 @@ async def submit_authorization(
             success=False,
             error_message=str(e),
         )
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        # THREAT-03: the caller gets the correlation ID, never the exception text.
+        # An exception raised while handling a clinical case can carry PHI in its
+        # message; the full text is already recorded in the audit store above.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Authorization processing failed. correlation_id={correlation_id}",
+        ) from e
 
 
 @router.post("/feedback")
