@@ -475,6 +475,8 @@ class TestEndpointMatrix:
             confidence_score=0.99,
             rationale="RBAC boundary test — not a clinical assertion",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         with (
             patch(

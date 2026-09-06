@@ -202,6 +202,13 @@ class Orchestrator:
                 actor="DecisionSupportAgent",
                 actor_type="agent",
                 correlation_id=correlation_id,
+                # HIPAA-AUDIT-07 / CHG-02: the substrate is recorded on the
+                # OPEN of the pair as well as the close, so a call that never
+                # completes still says which model it was issued against.
+                details={
+                    "model_id": self.decision_agent.config.model,
+                    "prompt_version": self.decision_agent.prompt_version,
+                },
                 input_summary=(
                     f"Diagnosis: {context.case.primary_diagnosis_code} | "
                     f"Procedure: {context.case.procedure_code}"
@@ -225,6 +232,11 @@ class Orchestrator:
                     "confidence_score": decision.confidence_score,
                     "status": decision.status.value,
                     "review_tier": decision.review_tier_used.value,
+                    # HIPAA-AUDIT-07: read off the decision rather than the
+                    # agent config, so the audit records what actually produced
+                    # this result even if configuration changed mid-flight.
+                    "model_id": decision.model_id,
+                    "prompt_version": decision.prompt_version,
                 },
             )
 

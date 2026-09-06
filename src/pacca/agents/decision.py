@@ -30,7 +30,13 @@ from .prompts.templates import (
 )
 
 
-def _decision_from(draft: DecisionDraft, tier: ReviewTier) -> AuthorizationDecision:
+def _decision_from(
+    draft: DecisionDraft,
+    tier: ReviewTier,
+    *,
+    model_id: str,
+    prompt_version: str,
+) -> AuthorizationDecision:
     """
     Join the model's clinical judgement to the server-owned facts about the run.
 
@@ -38,6 +44,11 @@ def _decision_from(draft: DecisionDraft, tier: ReviewTier) -> AuthorizationDecis
     rationale, cited evidence — and nothing else. ``decision_id`` is minted here
     (via AuthorizationDecision's default_factory) and ``review_tier_used`` is set
     by whichever tier produced the draft. Neither is negotiable by the model.
+
+    ``model_id`` and ``prompt_version`` are server-owned in the same sense
+    (SCHEMA-INV-04 / THREAT-04 / CHG-02): they are read from the agent's own
+    config and prompt registry at the call site, never from the draft, so the
+    model cannot misreport the substrate that produced it.
     """
     return AuthorizationDecision(
         status=draft.status,
@@ -45,6 +56,8 @@ def _decision_from(draft: DecisionDraft, tier: ReviewTier) -> AuthorizationDecis
         rationale=draft.rationale,
         cited_evidence_ids=list(draft.cited_evidence_ids),
         review_tier_used=tier,
+        model_id=model_id,
+        prompt_version=prompt_version,
     )
 
 
@@ -124,7 +137,12 @@ class DecisionAgent(BaseAgent):
             user_input=user_input,
             response_model=DecisionDraft,
         )
-        return _decision_from(draft, ReviewTier.AUTOMATED)
+        return _decision_from(
+            draft,
+            ReviewTier.AUTOMATED,
+            model_id=self.config.model,
+            prompt_version=self.prompt_version,
+        )
 
 
 class MedicalDirectorAgent(BaseAgent):
@@ -211,4 +229,9 @@ class MedicalDirectorAgent(BaseAgent):
             user_input=user_input,
             response_model=DecisionDraft,
         )
-        return _decision_from(draft, ReviewTier.MEDICAL_DIRECTOR_AGENT)
+        return _decision_from(
+            draft,
+            ReviewTier.MEDICAL_DIRECTOR_AGENT,
+            model_id=self.config.model,
+            prompt_version=self.prompt_version,
+        )
