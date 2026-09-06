@@ -191,6 +191,13 @@ class EscalationReason(StrEnum):
     """
 
     RAG_DEGRADED = "rag_degraded"
+    # A diagnosis or procedure code that does not have the shape its coding
+    # system defines. Pre-flight matches codes against curated lists, so a
+    # malformed code is one the lists cannot be trusted to have screened:
+    # "0E75.0" defeated the rare-condition prefix scan simply by carrying a
+    # leading character. Escalating on shape closes that generically rather
+    # than enumerating evasions one at a time.
+    MALFORMED_CODE = "malformed_code"
     """
     ``GuidelineRetriever.query()`` (chg-19) reported a degraded
     ``RetrievalOutcome`` on either of two independent axes:

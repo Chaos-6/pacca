@@ -35,7 +35,9 @@ Teaching note — pure functions vs. database queries:
   most) and every change should be reviewed.
 """
 
+import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from ..models.clinical import ClinicalCase
@@ -261,6 +263,49 @@ def _parse_severity_from_notes(notes: str) -> str | None:
     return None
 
 
+def normalize_code(raw: str) -> str:
+    """
+    Reduce a billing code to the stem the escalation lists are keyed on.
+
+    Pre-flight matched ``code.upper().strip()`` against a frozenset of exact
+    codes. That is defeated by anything a real claim legitimately carries:
+
+        Q2041      -> escalates (experimental CAR-T)
+        Q2041-59   -> did NOT escalate   (a distinct-procedural-service modifier)
+        Q2041 KX   -> did NOT escalate   (a documentation-on-file modifier)
+        Q2041.     -> did NOT escalate   (stray punctuation)
+        U+FF31 2041 -> did NOT escalate  (fullwidth Q, a homoglyph)
+
+    Modifiers are not an attack in themselves — they are ordinary billing —
+    which is what makes the exact match wrong rather than merely bypassable:
+    a correctly-formed real-world claim for an experimental therapy would have
+    slipped the gate. Combined with a understated ``estimated_annual_cost``
+    (see _check_high_cost) this produced an AUTO_APPROVED experimental CAR-T
+    submission with no human review, violating C-HARD-01 and SC-02.
+
+    Normalization is deliberately aggressive and one-directional: NFKC-fold to
+    collapse homoglyphs and fullwidth forms, uppercase, then drop every
+    character that is not A-Z0-9. Widening the match can only escalate MORE
+    cases. Per the rare-condition note in this module, a false positive routes
+    a case to a human and is acceptable; a false negative is a patient-safety
+    event.
+    """
+    folded = unicodedata.normalize("NFKC", raw).upper()
+    return re.sub(r"[^A-Z0-9]", "", folded)
+
+
+def _code_stem(raw: str, length: int = 5) -> str:
+    """
+    The leading ``length`` characters of a normalized code.
+
+    HCPCS Level II codes are one letter plus four digits; CPT codes are five
+    digits. Everything after that is a modifier. Taking the stem is what makes
+    ``Q2041-59`` match ``Q2041`` without also collapsing genuinely different
+    codes into one another.
+    """
+    return normalize_code(raw)[:length]
+
+
 def _evidence_blob(case: ClinicalCase) -> str:
     """Concatenate evidence text for parser fallback. Defined once for reuse."""
     return " ".join(item.description + " " + item.original_text for item in case.evidence)
@@ -441,6 +486,9 @@ class ClinicalRiskDetector:
         prior_denial_codes = prior_denial_codes or []
 
         # Run each check and collect any triggered flags
+        # Shape first: every branch below decides by matching a code against a
+        # curated list, and that reasoning only holds for well-formed codes.
+        self._check_malformed_codes(case, flags)
         self._check_experimental_treatment(case, flags)
         self._check_rare_condition(case, flags)
         self._check_conflicting_guidelines(case, guidelines_context, flags)
@@ -453,6 +501,54 @@ class ClinicalRiskDetector:
         return flags
 
     # ── Branch 4: Experimental treatment ─────────────────────────────────────
+
+    # ICD-10-CM: a letter, two digits, then optional further characters.
+    # Procedure codes span several systems in this corpus: CPT is five digits,
+    # HCPCS Level II is a letter and four digits, and four-digit numeric forms
+    # (e.g. revenue codes) appear legitimately -- GC-043 uses "0124". The shape
+    # is therefore deliberately permissive about length and strict about
+    # composition, which is what actually distinguishes a malformed code:
+    # "0E750" (the rare-condition evasion) fails because it mixes a leading
+    # digit with a letter, not because of its length.
+    _ICD10_SHAPE = re.compile(r"^[A-Z]\d{2}")
+    _PROCEDURE_SHAPE = re.compile(r"^(?:\d{4,5}|[A-Z]\d{4})$")
+
+    def _check_malformed_codes(
+        self,
+        case: ClinicalCase,
+        flags: EscalationFlags,
+    ) -> None:
+        """
+        Escalate when a code does not have the shape its coding system defines.
+
+        Every other pre-flight branch decides by matching a code against a
+        curated list. That reasoning only holds for codes the lists could have
+        screened: a value that is not a well-formed code has not been checked
+        by anything, whatever the match returned. "0E75.0" is a real example —
+        a leading character shifted the string past the rare-condition prefix
+        scan and the case proceeded as though screened.
+
+        Normalization (see normalize_code) closes modifiers and homoglyphs.
+        This closes the rest, generically, by refusing to treat a malformed
+        code as screened. Consistent with the module's stated bias: routing an
+        extra case to a human is acceptable, a missed rare condition is not.
+        """
+        diagnosis = normalize_code(case.primary_diagnosis_code)
+
+        malformed: list[str] = []
+        if not self._ICD10_SHAPE.match(diagnosis):
+            malformed.append(f"diagnosis {case.primary_diagnosis_code!r}")
+        if not self._PROCEDURE_SHAPE.match(_code_stem(case.procedure_code)):
+            malformed.append(f"procedure {case.procedure_code!r}")
+
+        if malformed:
+            flags.add(
+                EscalationReason.MALFORMED_CODE,
+                f"Code does not match its coding system's shape: "
+                f"{', '.join(malformed)}. Pre-flight list matching cannot be "
+                f"relied on for a code it could not have screened — routing to "
+                f"human review.",
+            )
 
     def _check_experimental_treatment(
         self,
@@ -474,13 +570,19 @@ class ClinicalRiskDetector:
           querying the FDA clinical trials registry API. That would be a
           production enhancement, and is the right pattern for Week 5.
         """
-        procedure = case.procedure_code.upper().strip()
+        # Normalized stem, not the raw string: a billing modifier, stray
+        # punctuation or a homoglyph must not defeat the list (see
+        # normalize_code). The raw value is kept for the reviewer-facing detail
+        # so the audit shows what was actually submitted.
+        procedure = _code_stem(case.procedure_code)
+        experimental_stems = {_code_stem(code) for code in EXPERIMENTAL_PROCEDURE_CODES}
 
-        # Strategy 1: exact procedure code match
-        if procedure in EXPERIMENTAL_PROCEDURE_CODES:
+        # Strategy 1: procedure code match on the normalized stem
+        if procedure in experimental_stems:
             flags.add(
                 EscalationReason.EXPERIMENTAL_TREATMENT,
-                f"Procedure code {procedure} is on the experimental treatment list. "
+                f"Procedure code {case.procedure_code} (stem {procedure}) is on the "
+                f"experimental treatment list. "
                 f"No autonomous AI decision appropriate — requires human review.",
             )
             return  # No need to scan keywords if code already matched
@@ -525,13 +627,15 @@ class ClinicalRiskDetector:
           it's a conservative error. A false negative (a rare condition not
           escalated) would be a patient safety issue.
         """
-        diagnosis_code = case.primary_diagnosis_code.upper().strip()
+        # Normalized for the same reason as the procedure code above: a leading
+        # character or a homoglyph defeated startswith() ("0E75.0", ".E75.0").
+        diagnosis_code = normalize_code(case.primary_diagnosis_code)
 
         for prefix in RARE_CONDITION_ICD10_PREFIXES:
-            if diagnosis_code.startswith(prefix):
+            if diagnosis_code.startswith(normalize_code(prefix)):
                 flags.add(
                     EscalationReason.RARE_CONDITION,
-                    f"Diagnosis code {diagnosis_code} matches rare condition prefix "
+                    f"Diagnosis code {case.primary_diagnosis_code} matches rare condition prefix "
                     f"'{prefix}'. Population prevalence < 1:10,000. Clinical guidelines "
                     f"may be sparse or contradictory — requires specialist review.",
                 )
@@ -661,9 +765,17 @@ class ClinicalRiskDetector:
         Escalate to Medical Director when estimated annual cost exceeds
         settings.high_cost_threshold.
 
-        Data source order:
-          1. ClinicalCase.estimated_annual_cost (structured field — preferred)
-          2. Parser fallback against the evidence text (regex)
+        Data sources, combined rather than ordered:
+          1. ClinicalCase.estimated_annual_cost (structured field)
+          2. Parser against the evidence text (regex)
+
+        Both are consulted and the LARGER wins. The structured field used to
+        short-circuit the parser, which meant the submitter chose whether the
+        cost gate ran at all: declaring estimated_annual_cost=0.0 on a case
+        whose notes read "$475,000 annually" skipped the parse and returned
+        without escalating. Cost escalation is a policy control against the
+        submitter's own incentive, so it cannot take the submitter's number on
+        trust when the clinical record says otherwise.
 
         Why this lives in pre-flight: cost-based escalation is a POLICY rule,
         not a CLINICAL one. It must fire regardless of how convincing the
@@ -676,18 +788,41 @@ class ClinicalRiskDetector:
 
         threshold = float(effective_settings().high_cost_threshold)
 
-        cost = case.estimated_annual_cost
-        if cost is None:
-            cost = _parse_cost_from_notes(_evidence_blob(case))
-        if cost is None or cost <= threshold:
+        declared = case.estimated_annual_cost
+        parsed = _parse_cost_from_notes(_evidence_blob(case))
+
+        # A non-finite or negative declared cost is not a number to compare
+        # against a threshold; discard it rather than let it participate.
+        # math.isfinite covers both NaN and infinity: an infinite declared cost
+        # would otherwise win the max() and escalate for the wrong reason, and a
+        # NaN loses every comparison silently.
+        if declared is not None and (not math.isfinite(declared) or declared < 0):
+            declared = None
+
+        candidates = [c for c in (declared, parsed) if c is not None]
+        if not candidates:
+            return
+        cost = max(candidates)
+        if cost <= threshold:
             return
 
-        flags.add(
-            EscalationReason.HIGH_COST,
+        # Record the disagreement where a reviewer will see it. A declared cost
+        # materially below what the notes state is itself worth a human's
+        # attention, independently of the threshold.
+        understated = declared is not None and parsed is not None and parsed > declared
+
+        detail = (
             f"Estimated annual cost ${cost:,.0f} exceeds the configured "
             f"HIGH_COST_THRESHOLD of ${threshold:,.0f}. Cost-based escalation "
-            f"applies regardless of clinical eligibility per policy.",
+            f"applies regardless of clinical eligibility per policy."
         )
+        if understated:
+            detail += (
+                f" Submitted estimated_annual_cost was ${declared:,.0f}, below the "
+                f"${parsed:,.0f} stated in the clinical record; the higher figure "
+                f"was used."
+            )
+        flags.add(EscalationReason.HIGH_COST, detail)
 
     # ── Branch 2: Pediatric complexity (iter-3 chg-1; iter-5 chg-3 score model) ─
 

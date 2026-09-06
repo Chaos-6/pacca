@@ -10,6 +10,14 @@ reimplementing __init__ with public attribute names (`self.guidelines`,
 `self.client`) that the real class never had. Every method it inherited then
 raised AttributeError on `self._guidelines`. The subclass is gone: the retriever
 takes `db_path` directly, so the test uses the supported seam.
+
+The diagnosis codes below are real ICD-10 codes (Z12.2 screening for respiratory
+malignancy, M54.50 low back pain) and must stay that way. They were previously
+free-text placeholders ("Lung", "BackPain"), which the pre-flight shape check
+correctly escalates as malformed: a value that is not a well-formed code has not
+been screened by any of the curated-list branches, whatever those branches
+returned. Substituting a placeholder here does not simplify the fixture, it
+changes which decision path the case takes.
 """
 
 import os
@@ -250,7 +258,7 @@ def test_happy_path_lung_cancer(client):
         "provider_npi": "123",
         "clinical_case": {
             "patient_id": "p1",
-            "primary_diagnosis_code": "Lung",
+            "primary_diagnosis_code": "Z12.2",
             "procedure_code": "71250",
             "evidence": [
                 {
@@ -270,20 +278,40 @@ def test_happy_path_lung_cancer(client):
 
 
 def _thin_spine_case(request_id: str) -> dict:
-    """The weak case: 2 weeks of back pain, no motor-weakness finding documented."""
+    """The weak case: 2 weeks of back pain, no motor-weakness finding documented.
+
+    The evidence text is load-bearing and states the *absence* of conservative
+    therapy explicitly. The seeded guideline for 72148 reads "indicated only
+    after 6 weeks of conservative therapy fails", so a case that merely omits
+    the subject leaves the agent to infer it, and this case sits close enough
+    to the approval boundary that the inference is not stable: an earlier run
+    of this file returned IN_REVIEW twice and AUTO_APPROVED once for three
+    structurally identical submissions. Naming the missing criterion puts the
+    case unambiguously below the bar for the reason the guideline gives.
+
+    It deliberately says nothing about neurological findings.
+    test_learning_loop_spine appends a motor-weakness note at step 3, and that
+    note has to be the only thing that changes between the two submissions --
+    asserting "no motor weakness" here would contradict it rather than be
+    superseded by it.
+    """
     return {
         "request_id": request_id,
         "patient_id": "p2",
         "provider_npi": "123",
         "clinical_case": {
             "patient_id": "p2",
-            "primary_diagnosis_code": "BackPain",
+            "primary_diagnosis_code": "M54.50",
             "procedure_code": "72148",
             "evidence": [
                 {
                     "id": "e2",
                     "source_type": "CLINICAL_NOTE",
-                    "description": "Patient has had back pain for 2 weeks. Requesting MRI.",
+                    "description": (
+                        "Patient reports low back pain for 2 weeks. No conservative "
+                        "therapy has been trialled: no NSAIDs, no physical therapy, "
+                        "no activity modification. Requesting MRI lumbar spine."
+                    ),
                     "original_text": "...",
                     "confidence": 1.0,
                 }
