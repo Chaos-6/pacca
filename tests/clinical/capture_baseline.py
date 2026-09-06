@@ -48,6 +48,69 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+async def run_pipeline_for_case(
+    golden: Any,
+    detector: Any,
+    agent: Any,
+) -> tuple[str, str, float]:
+    """
+    Run ONE golden case through pre-flight + the decision agent.
+
+    Returns the (status, rationale, confidence) tuple that the judge is asked
+    to score. Extracted from run_golden_dataset() so that measure_judge_noise
+    can reuse the exact production path instead of restating it: this loop has
+    to mirror `test_full_pipeline_meets_accuracy_threshold` for captured scores
+    to mean anything, and a second hand-copied version of it would drift from
+    the first the moment either is edited.
+
+    Types are `Any` for the same reason the imports in run_golden_dataset are
+    function-local -- this module stays importable, and unit-testable, without
+    the Anthropic SDK installed.
+    """
+    from pacca.agents.decision import DecisionContext
+    from pacca.models.clinical import ClinicalCase, EvidenceItem
+    from pacca.models.enums import AuthorizationStatus, EvidenceSourceType
+
+    clinical_case = ClinicalCase(
+        patient_id=f"P-EVAL-{golden.case_id}",
+        primary_diagnosis_code=golden.diagnosis_code,
+        procedure_code=golden.procedure_code,
+        evidence=[
+            EvidenceItem(
+                id="e1",
+                source_type=EvidenceSourceType.CLINICAL_NOTE,
+                description=golden.clinical_notes[:200],
+                original_text=golden.clinical_notes,
+                confidence=0.9,
+            )
+        ],
+    )
+
+    flags = detector.evaluate(
+        case=clinical_case,
+        guidelines_context=golden.guidelines_context,
+        prior_denial_codes=golden.prior_denial_codes,
+    )
+
+    if flags.should_pre_escalate:
+        return (
+            AuthorizationStatus.IN_REVIEW.value,
+            (
+                f"Pre-flight escalation triggered. "
+                f"Reasons: {[r.value for r in flags.reasons]}. "
+                f"Details: {flags.details}"
+            ),
+            0.0,
+        )
+
+    try:
+        ctx = DecisionContext(case=clinical_case, relevant_guidelines=golden.guidelines_context)
+        decision = await agent.run(ctx)
+    except Exception as exc:
+        return "ERROR", f"Agent failed: {exc!s}", 0.0
+    return decision.status.value, decision.rationale, decision.confidence_score
+
+
 async def run_golden_dataset() -> list[Any]:
     """
     Run every golden case through the real pipeline + judge; return verdicts.
@@ -56,9 +119,7 @@ async def run_golden_dataset() -> list[Any]:
     purpose (see module docstring).
     """
     from pacca.agents.clinical_risk_detector import ClinicalRiskDetector
-    from pacca.agents.decision import DecisionAgent, DecisionContext
-    from pacca.models.clinical import ClinicalCase, EvidenceItem
-    from pacca.models.enums import AuthorizationStatus, EvidenceSourceType
+    from pacca.agents.decision import DecisionAgent
     from tests.clinical.evaluator import ClinicalEvaluator
     from tests.clinical.golden_cases import GOLDEN_CASES
 
@@ -68,49 +129,7 @@ async def run_golden_dataset() -> list[Any]:
     verdicts: list[Any] = []
 
     for golden in GOLDEN_CASES:
-        clinical_case = ClinicalCase(
-            patient_id=f"P-EVAL-{golden.case_id}",
-            primary_diagnosis_code=golden.diagnosis_code,
-            procedure_code=golden.procedure_code,
-            evidence=[
-                EvidenceItem(
-                    id="e1",
-                    source_type=EvidenceSourceType.CLINICAL_NOTE,
-                    description=golden.clinical_notes[:200],
-                    original_text=golden.clinical_notes,
-                    confidence=0.9,
-                )
-            ],
-        )
-
-        flags = detector.evaluate(
-            case=clinical_case,
-            guidelines_context=golden.guidelines_context,
-            prior_denial_codes=golden.prior_denial_codes,
-        )
-
-        if flags.should_pre_escalate:
-            status = AuthorizationStatus.IN_REVIEW.value
-            rationale = (
-                f"Pre-flight escalation triggered. "
-                f"Reasons: {[r.value for r in flags.reasons]}. "
-                f"Details: {flags.details}"
-            )
-            confidence = 0.0
-        else:
-            try:
-                ctx = DecisionContext(
-                    case=clinical_case,
-                    relevant_guidelines=golden.guidelines_context,
-                )
-                decision = await agent.run(ctx)
-                status = decision.status.value
-                rationale = decision.rationale
-                confidence = decision.confidence_score
-            except Exception as exc:
-                status = "ERROR"
-                rationale = f"Agent failed: {exc!s}"
-                confidence = 0.0
+        status, rationale, confidence = await run_pipeline_for_case(golden, detector, agent)
 
         verdict = await evaluator.evaluate_case(
             case=golden,
