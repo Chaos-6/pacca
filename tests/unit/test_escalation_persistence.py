@@ -111,6 +111,8 @@ def _mock_agents(
                 confidence_score=tier1_confidence,
                 rationale="Tier-1 test rationale.",
                 review_tier_used=ReviewTier.AUTOMATED,
+                model_id="claude-sonnet-4-5-20250929",
+                prompt_version="v2.7",
                 cited_evidence_ids=tier1_cited_evidence_ids or ["e1"],
             )
         ),

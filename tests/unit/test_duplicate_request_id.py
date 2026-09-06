@@ -104,6 +104,8 @@ def _decision() -> AuthorizationDecision:
         confidence_score=0.97,
         rationale="original decision — patient A",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
         cited_evidence_ids=["e1"],
     )
 

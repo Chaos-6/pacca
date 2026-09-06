@@ -222,6 +222,8 @@ class TestAuthorizationDecision:
             confidence_score=0.97,
             rationale="NCCN Category 1 for PD-L1 >= 50% NSCLC.",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         assert decision.decision_id == "DEC-001"
         assert decision.status == AuthorizationStatus.AUTO_APPROVED
@@ -236,6 +238,8 @@ class TestAuthorizationDecision:
             confidence_score=0.72,
             rationale="Insufficient documentation.",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         assert isinstance(decision.confidence_score, float)
         assert 0.0 <= decision.confidence_score <= 1.0
@@ -248,6 +252,8 @@ class TestAuthorizationDecision:
             confidence_score=0.95,
             rationale="Test.",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         assert decision.audit_trail == []
         assert isinstance(decision.audit_trail, list)
@@ -263,6 +269,8 @@ class TestAuthorizationDecision:
             confidence_score=0.92,
             rationale="Test.",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         decision.status = AuthorizationStatus.IN_REVIEW
         assert decision.status == AuthorizationStatus.IN_REVIEW
@@ -278,6 +286,8 @@ class TestAuthorizationDecision:
             confidence_score=0.97,
             rationale="Test.",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         decision.review_tier_used = ReviewTier.MEDICAL_DIRECTOR_AGENT
         assert decision.review_tier_used == ReviewTier.MEDICAL_DIRECTOR_AGENT

@@ -118,6 +118,8 @@ def mock_auto_approved_decision() -> AuthorizationDecision:
         confidence_score=0.97,
         rationale="NCCN guidelines support Pembrolizumab for PD-L1 >= 50% NSCLC.",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
 
 
@@ -130,6 +132,8 @@ def mock_in_review_decision() -> AuthorizationDecision:
         confidence_score=0.72,
         rationale="Insufficient documentation of prior treatment failure.",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
 
 
