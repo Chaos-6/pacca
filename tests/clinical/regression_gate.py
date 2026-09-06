@@ -205,6 +205,39 @@ class RegressionReport:
         return "\n".join(lines)
 
 
+def latest_baseline(baseline_dir: str | Path) -> Path | None:
+    """
+    The highest-numbered `iter-N-baseline.json` in `baseline_dir`, or None.
+
+    Picking the newest baseline is a *reporting* convenience, not a promotion
+    step. Which baseline a gate should ENFORCE against is a deliberate choice
+    tied to a known-good commit, and nothing here makes it: this only answers
+    "what is the most recent thing we recorded", so a report can say what has
+    moved since without a human wiring a path by hand on every run.
+
+    Sorted numerically, not lexically -- "iter-10" must not sort before
+    "iter-6", which is exactly the bug a string sort would introduce the first
+    time the count reaches double digits.
+    """
+    directory = Path(baseline_dir)
+    if not directory.is_dir():
+        return None
+
+    numbered: list[tuple[int, Path]] = []
+    for path in directory.glob("iter-*-baseline.json"):
+        head = path.name.removeprefix("iter-").removesuffix("-baseline.json")
+        # "3-chg1" and similar carry a suffix; the leading integer is the
+        # iteration and is what orders them.
+        leading = head.split("-")[0]
+        if leading.isdigit():
+            numbered.append((int(leading), path))
+
+    if not numbered:
+        return None
+    # Ties (iter-3 vs iter-3-chg1) break by name so the choice is deterministic.
+    return max(numbered, key=lambda pair: (pair[0], pair[1].name))[1]
+
+
 def check_regression(
     current: dict[str, int],
     baseline: dict[str, int],

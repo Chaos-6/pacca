@@ -40,6 +40,7 @@ Teaching note — why the CI gate threshold is 80% and not 100%:
 """
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -79,6 +80,12 @@ from tests.clinical.oncology_breadth_cases import ONCOLOGY_BREADTH_CASES
 from tests.clinical.oncology_depth_cases import ONCOLOGY_DEPTH_CASES
 from tests.clinical.pediatric_cases import PEDIATRIC_CASES
 from tests.clinical.pulmonology_adult_cases import PULMONOLOGY_ADULT_CASES
+from tests.clinical.regression_gate import (
+    check_regression,
+    latest_baseline,
+    load_baseline,
+    scores_from_verdicts,
+)
 from tests.clinical.transplant_cases import TRANSPLANT_CASES
 
 # Aggregate of ALL supplementary case lists — used by the cross-list integrity
@@ -783,6 +790,44 @@ class TestFullClinicalEvaluation:
             for v in report.verdicts:
                 if not v.passed:
                     print(f"  {v.case_id} (score {v.score}): {v.judge_reasoning}")
+
+        # ── Per-case regression report (REPORT ONLY — never fails this test) ──
+        #
+        # regression_gate has existed since iter-2 and, until now, was called by
+        # nothing outside its own unit tests: baselines were captured, its
+        # comparison logic was tested against synthetic scores, and no live run
+        # was ever compared to a baseline. This closes that, deliberately in
+        # warn-before-enforce form -- the same posture docs/EVALUATION.md sets
+        # for the held-out report and the judge-stability harness.
+        #
+        # noise_threshold=1 is what check_regression's docstring prescribes for
+        # production, and a measurement now supports it: run 34050063869 found
+        # max end-to-end spread of exactly 1 across 20 cases x 3 rollouts
+        # (GC-005, GC-010, GC-012), with zero judge-only disagreement. The
+        # tolerance absorbs agent variance, so a one-point move is jitter here.
+        #
+        # It does NOT assert, on purpose. The false-positive rate over the full
+        # 42-case set at merge cadence is unmeasured -- the variance data is 20
+        # cases at n=3 -- and a gate that reddens builds on agent noise costs a
+        # cycle and reviewer trust each time. Read the output for a few
+        # iterations, then decide whether to enforce.
+        baseline_path = latest_baseline(Path(__file__).parent / "baselines")
+        if baseline_path is None:
+            print("\nPer-case regression report: no baseline recorded — skipped.")
+        else:
+            regression = check_regression(
+                scores_from_verdicts(verdicts),
+                load_baseline(baseline_path),
+                noise_threshold=1,
+            )
+            print(f"\nPer-case regression vs {baseline_path.name} (report only):")
+            print(regression.summary())
+            if not regression.passed:
+                print(
+                    "  ^ REPORT ONLY — this does not fail the build. A baseline "
+                    "covering fewer cases than this run reports the remainder as "
+                    "new, which is expected, not a gap."
+                )
 
         # THE CI GATE — this assertion is what makes this a gate, not just a report
         assert report.passed_ci_gate, (
