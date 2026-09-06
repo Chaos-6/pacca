@@ -153,7 +153,9 @@ class RegressionReport:
                        (informational; recorded but does not block).
                        Added iter-3 chg-3 after the iter-2 GC-017 2->4 and
                        iter-3 chg-1 GC-005 5->2 same-state-run swings made
-                       LLM-as-judge variance impossible to ignore.
+                       run-to-run variance impossible to ignore. Recorded
+                       then as LLM-as-judge variance; measurement since
+                       attributes it to the agent (see check_regression).
         improvements:  Cases that rose (informational; never blocks).
         missing:       Baseline case_ids absent from the current run
                        (e.g. a case was dropped/renamed) — treated as a
@@ -203,6 +205,39 @@ class RegressionReport:
         return "\n".join(lines)
 
 
+def latest_baseline(baseline_dir: str | Path) -> Path | None:
+    """
+    The highest-numbered `iter-N-baseline.json` in `baseline_dir`, or None.
+
+    Picking the newest baseline is a *reporting* convenience, not a promotion
+    step. Which baseline a gate should ENFORCE against is a deliberate choice
+    tied to a known-good commit, and nothing here makes it: this only answers
+    "what is the most recent thing we recorded", so a report can say what has
+    moved since without a human wiring a path by hand on every run.
+
+    Sorted numerically, not lexically -- "iter-10" must not sort before
+    "iter-6", which is exactly the bug a string sort would introduce the first
+    time the count reaches double digits.
+    """
+    directory = Path(baseline_dir)
+    if not directory.is_dir():
+        return None
+
+    numbered: list[tuple[int, Path]] = []
+    for path in directory.glob("iter-*-baseline.json"):
+        head = path.name.removeprefix("iter-").removesuffix("-baseline.json")
+        # "3-chg1" and similar carry a suffix; the leading integer is the
+        # iteration and is what orders them.
+        leading = head.split("-")[0]
+        if leading.isdigit():
+            numbered.append((int(leading), path))
+
+    if not numbered:
+        return None
+    # Ties (iter-3 vs iter-3-chg1) break by name so the choice is deterministic.
+    return max(numbered, key=lambda pair: (pair[0], pair[1].name))[1]
+
+
 def check_regression(
     current: dict[str, int],
     baseline: dict[str, int],
@@ -226,12 +261,31 @@ def check_regression(
 
     iter-3 chg-3 — noise_threshold (default 0, strict):
       Production usage should set noise_threshold=1 to suppress the +-1
-      LLM-as-judge variance observed on stable runs (e.g. GC-017's
+      run-to-run variance observed on stable runs (e.g. GC-017's
       2 -> 4 -> 2 swing across three runs at iter-2-final, and GC-005's
       5 -> 2 swing on iter-3 chg-1's baseline-capture run with identical
       agent behavior on re-investigation). Tests use strict default to
       catch any real per-case drop; live runs use the tolerant setting
       to avoid chasing noise.
+
+      That recommendation was made from those two anecdotes. It now has a
+      measurement behind it (2026-09-06, run 34050063869): re-running the
+      full pipeline three times over 20 golden cases moved 3 of them, each
+      by exactly one point -- GC-005 [4,5,5], GC-010 [5,4,5], GC-012
+      [3,4,4]. Max observed spread 1, which is what noise_threshold=1
+      tolerates. The value was right; the justification was anecdotal.
+
+      The same run re-scored one frozen (decision, rationale) tuple three
+      times per case and found ZERO judge disagreement, so the variance
+      this setting absorbs is the AGENT's, not the judge's. That matters
+      for what to do about it: tolerating agent instability is a decision
+      to live with it, not a measurement correction.
+
+      Note the cost of the tolerance. At noise_threshold=1 a genuine 5->4
+      quality slide is jitter, and single-draw comparison cannot tell it
+      from the noise above. Sensitivity is bought with rollouts, not with a
+      tighter threshold: compare medians of N runs and the median is far
+      steadier than one draw, at N times the API cost.
 
       Setting noise_threshold higher than drop_threshold is the caller's
       choice; the most common configuration is drop_threshold=1 and

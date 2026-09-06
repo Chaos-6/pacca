@@ -10,11 +10,17 @@ transmitted `temperature=0.0` and the captured distributions were identical
 pairs -- `[5, 5]`, `[4, 4]` in iter-6-baseline.json -- which reads like
 determinism but is two draws that happened to agree.
 
-Two facts undercut it. `capture_baseline.py`'s own docstring records judge
-swings of GC-017 2->4 and GC-005 5->2, observed *while* temperature=0.0 was
-still being sent. And the parameter is now gone entirely (the SDK removed it),
-so nothing even nominally pins sampling. A one-point gate against a judge whose
-own spread exceeds one point fires on noise.
+`capture_baseline.py`'s docstring records swings of GC-017 2->4 and GC-005
+5->2, observed *while* temperature=0.0 was still being sent, and attributes
+them to the judge. The parameter is now gone entirely (the SDK removed it), so
+nothing even nominally pins sampling.
+
+FIRST RESULT (2026-09-06, run 34050063869), which did not go as expected: at
+20 cases x 3 runs the judge disagreed with itself ZERO times, while re-running
+the whole pipeline moved 3 of 20 by one point each. The variance is the
+agent's. `check_regression`'s noise_threshold=1 recommendation absorbs exactly
+that one point, so the setting is right -- but it is tolerating agent
+instability, not judge noise, and those call for different responses.
 
 `judge_stability.py` was built to answer exactly this and has only ever run
 against a stubbed judge -- its docstring notes "this lane never constructs a
