@@ -231,15 +231,25 @@ class AgentConfig(BaseModel):
     Attributes:
         model:       The Claude model ID to use. Defaults to the value in
                      settings, which can be overridden via environment variable.
-        temperature: Sampling temperature. 0.0 = deterministic (same input →
-                     same output). For clinical decisions we always use 0.0.
         max_tokens:  Maximum response length. 4096 is sufficient for structured
                      clinical decision output.
+
+    Note on sampling. This config previously carried ``temperature: float = 0.0``
+    and passed it to the API, on the reasoning that 0.0 gives deterministic
+    clinical decisions. Both halves are now gone:
+
+    * The parameter no longer exists. ``anthropic`` removed ``temperature``,
+      ``top_p`` and ``top_k`` from ``messages.create`` in the 1.x line, and the
+      method takes no ``**kwargs`` -- so passing it is a ``TypeError`` raised in
+      the SDK before any request is constructed, not a server-side rejection.
+    * Determinism was never real anyway. Identical requests at temperature 0
+      return different completions, which is why SDD v3.0 removed RES-DSA-04
+      and replaced it with observable consistency contracts: agreement measured
+      across N runs, rather than a sampling parameter asserted to produce it.
     """
 
     # Single source of truth: settings.default_model (override via env DEFAULT_MODEL).
     model: str = Field(default_factory=lambda: get_settings().default_model)
-    temperature: float = 0.0
     max_tokens: int = 4096
 
 
@@ -372,7 +382,6 @@ class BaseAgent(ABC):
             span.set_attribute("agent.name", self.name)
             span.set_attribute("llm.model", self.config.model)
             span.set_attribute("llm.max_tokens", self.config.max_tokens)
-            span.set_attribute("llm.temperature", self.config.temperature)
             span.set_attribute("input.length_chars", len(user_input))
 
             call_start = time.time()
@@ -483,7 +492,6 @@ class BaseAgent(ABC):
             return await self.client.messages.create(  # type: ignore[call-overload,unused-ignore]
                 model=self.config.model,
                 max_tokens=self.config.max_tokens,
-                temperature=self.config.temperature,
                 # system_prompt is a fixed per-agent-type prompt (loaded from a
                 # static file/constant per subclass — see decision.py,
                 # evidence_agent.py, etc.), not built fresh with per-request

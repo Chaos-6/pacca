@@ -869,7 +869,6 @@ class ClinicalEvaluator:
             response = await self.client.messages.create(
                 model=self.judge_model,
                 max_tokens=1024,
-                temperature=0.0,  # Deterministic evaluation
                 system=JUDGE_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
