@@ -513,6 +513,11 @@ class TestAuditTrailWiring:
                 confidence_score=0.97,
                 rationale="Criterion 1 MET: documented conservative therapy.",
                 review_tier_used=ReviewTier.AUTOMATED,
+                # SCHEMA-INV-04 (landed in #95 after this test was written): an
+                # agent-tier decision must name the substrate that produced it,
+                # so a fixture standing in for one has to as well.
+                model_id="claude-sonnet-4-5-20250929",
+                prompt_version="v2.7",
             )
         )
         orchestrator.evidence_agent.run = AsyncMock(  # type: ignore[method-assign]
