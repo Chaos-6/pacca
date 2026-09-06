@@ -134,6 +134,8 @@ async def test_medical_director_review_also_mints_server_side() -> None:
         confidence_score=0.93,
         rationale="tier-1 rationale",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
 
     with patch("pacca.agents.base.BaseAgent.execute", new=_fake_execute_factory(payload=payload)):
@@ -154,12 +156,16 @@ def test_authorization_decision_mints_its_own_id_when_not_given() -> None:
         confidence_score=0.1,
         rationale="r",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
     b = AuthorizationDecision(
         status=AuthorizationStatus.IN_REVIEW,
         confidence_score=0.1,
         rationale="r",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
     assert a.decision_id != b.decision_id
 
@@ -172,5 +178,7 @@ def test_explicit_decision_id_is_still_honoured() -> None:
         confidence_score=0.1,
         rationale="r",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
     )
     assert d.decision_id == "PREESC-72148-1750000000"

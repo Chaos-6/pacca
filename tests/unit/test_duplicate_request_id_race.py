@@ -88,6 +88,8 @@ def _decision() -> AuthorizationDecision:
         confidence_score=0.97,
         rationale="test",
         review_tier_used=ReviewTier.AUTOMATED,
+        model_id="claude-sonnet-4-5-20250929",
+        prompt_version="v2.7",
         cited_evidence_ids=["e1"],
     )
 
@@ -204,6 +206,8 @@ async def test_pre_existing_two_decision_state_returns_defined_answer_not_500(db
             confidence_score=0.97,
             rationale="first decision (earliest)",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         second_decision = AuthorizationDecision(
             decision_id="PA-second00000000",
@@ -211,6 +215,8 @@ async def test_pre_existing_two_decision_state_returns_defined_answer_not_500(db
             confidence_score=0.5,
             rationale="second decision (anomalous duplicate)",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
         )
         await DecisionRepository(session).create(first_decision, request_id="AUTH-ANOMALY-1")
         await session.commit()

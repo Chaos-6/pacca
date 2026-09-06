@@ -1,15 +1,21 @@
 from datetime import datetime
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .clinical import ClinicalCase
 from .enums import AuthorizationStatus, ReviewTier
+
+# Provenance sentinel for decisions produced by deterministic code rather than a
+# model: pre-flight escalations, scope-guard refusals, timeouts, idempotent
+# replays. See AuthorizationDecision.model_id (SCHEMA-INV-04).
+DETERMINISTIC_PROVENANCE = "none:deterministic"
 
 # iter-5 chg-3: explicit __all__ so mypy strict mode treats ReviewTier as
 # a deliberate re-export. decision.py imports ReviewTier from this module
 # rather than from .enums directly, which is the project convention.
 __all__ = [
+    "DETERMINISTIC_PROVENANCE",
     "AuditLogEntry",
     "AuthorizationDecision",
     "AuthorizationRequest",
@@ -81,6 +87,53 @@ class AuthorizationDecision(BaseModel):
     # submission EvidenceItem or forces human review. Defaulted (not required) so
     # hand-constructed decisions (pre-flight escalations, tests) still validate.
     cited_evidence_ids: list[str] = Field(default_factory=list)
+
+    # ── Model / prompt provenance (SCHEMA-INV-04, THREAT-04, CHG-02) ──────────
+    # Which substrate produced this decision. Recorded because the optimal
+    # harness is model-specific and a vendor can change the behaviour behind a
+    # pinned identifier: without this, "the model changed" is unanswerable
+    # after the fact. docs/DECISIONS.md:136-140 records exactly that situation —
+    # an evaluation run on a substituted model, reconstructable only from prose
+    # a human typed afterwards.
+    #
+    # Deterministic decisions (pre-flight escalations, scope-guard refusals,
+    # timeouts, idempotent replays) are produced by code, not a model, and carry
+    # the DETERMINISTIC_PROVENANCE sentinel rather than a null. A sentinel is
+    # used instead of nullable so that "no model was involved" is an assertion
+    # the row makes, not an absence a reader has to interpret — and so a real
+    # agent decision cannot slip through unrecorded, which _require_agent_provenance
+    # below enforces.
+    model_id: str = Field(default=DETERMINISTIC_PROVENANCE)
+    prompt_version: str = Field(default=DETERMINISTIC_PROVENANCE)
+
+    @model_validator(mode="after")
+    def _require_agent_provenance(self) -> "AuthorizationDecision":
+        """
+        SCHEMA-INV-04: an agent-produced decision must name its substrate.
+
+        The sentinel is correct for a decision code produced on its own. It is
+        never correct for one a model produced, so an agent tier carrying the
+        sentinel means the provenance wiring was dropped somewhere between the
+        API call and here — the exact failure this requirement exists to catch.
+        """
+        agent_tiers = (ReviewTier.AUTOMATED, ReviewTier.MEDICAL_DIRECTOR_AGENT)
+        if self.review_tier_used in agent_tiers:
+            missing = [
+                name
+                for name, value in (
+                    ("model_id", self.model_id),
+                    ("prompt_version", self.prompt_version),
+                )
+                if not value or value == DETERMINISTIC_PROVENANCE
+            ]
+            if missing:
+                raise ValueError(
+                    f"SCHEMA-INV-04: decision {self.decision_id} was produced by "
+                    f"tier {self.review_tier_used.value} but carries no "
+                    f"{' and no '.join(missing)}. An agent decision must record the "
+                    "model identifier and prompt version that produced it."
+                )
+        return self
 
 
 class AuthorizationRequest(BaseModel):

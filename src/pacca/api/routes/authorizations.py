@@ -373,6 +373,15 @@ def _decision_from_model(model: AuthorizationDecisionModel) -> AuthorizationDeci
     the free-text rationale), so a replayed decision always reports an empty
     list — the same honest-NULL posture the rest of this module uses for
     fields the storage layer does not carry.
+
+    Provenance is read from the row rather than defaulted. The domain model
+    defaults model_id/prompt_version to DETERMINISTIC_PROVENANCE, which is the
+    right default for a decision code produced on its own but a false statement
+    about a replayed agent decision: it would claim no model was involved in a
+    case a model actually decided, and SCHEMA-INV-04 rejects exactly that. Rows
+    written before migration 008 carry the "unknown:pre-provenance" server
+    default, which replays as itself — a decision whose substrate genuinely is
+    not recoverable says so, rather than borrowing whatever model is current.
     """
     return AuthorizationDecision(
         decision_id=model.decision_id,
@@ -381,6 +390,8 @@ def _decision_from_model(model: AuthorizationDecisionModel) -> AuthorizationDeci
         rationale=(model.rationale_data or {}).get("text", ""),
         review_tier_used=ReviewTier(model.decided_by),
         timestamp=model.decided_at,
+        model_id=model.model_id,
+        prompt_version=model.prompt_version,
     )
 
 
@@ -855,6 +866,12 @@ async def submit_authorization(
                 "confidence_score": decision.confidence_score,
                 "review_tier": decision.review_tier_used.value,
                 "decision_id": decision.decision_id,
+                # HIPAA-AUDIT-07 / CHG-02: the terminal audit record for the run
+                # names the substrate. This is the record a compliance officer
+                # pulls, so it must answer "which model decided this" without a
+                # join to the decisions table.
+                "model_id": decision.model_id,
+                "prompt_version": decision.prompt_version,
             },
         )
 

@@ -64,3 +64,4 @@ pacca.db
 pacca_db/
 src/pacca/api/pacca_db/
 .DS_Store
+.venv

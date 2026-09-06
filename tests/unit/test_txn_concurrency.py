@@ -125,6 +125,8 @@ async def _run_concurrent_pair(db_url: str, monkeypatch) -> dict:
             confidence_score=0.97,
             rationale="test",
             review_tier_used=ReviewTier.AUTOMATED,
+            model_id="claude-sonnet-4-5-20250929",
+            prompt_version="v2.7",
             cited_evidence_ids=["e1"],
         )
 
