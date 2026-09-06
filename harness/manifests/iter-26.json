@@ -1,0 +1,51 @@
+{
+  "iteration": 26,
+  "iteration_tag": "harness-iter-26",
+  "iso_date": "2026-09-06",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-25",
+  "summary": "Tier 2 can no longer be talked out of a denial by its own confidence. The Medical Director branch discarded the agent's status and recomputed it from the confidence score alone, so a denial held with high conviction was rewritten into an autonomous approval while the same denial held with less conviction went to a human. Tier 2 now applies Tier 1's routing rule, which requires both high confidence and an AUTO_APPROVED status before granting autonomy.",
+  "changes": [
+    {
+      "id": "chg-1",
+      "type": "improvement",
+      "description": "Route the Tier-2 Medical Director outcome through select_confidence_branch instead of a confidence-only threshold, so the agent's determination decides the outcome and confidence only gates whether an approval may be autonomous.",
+      "files": [
+        "src/pacca/agents/orchestrator.py",
+        "tests/unit/test_tier2_denial_is_final.py"
+      ],
+      "failure_pattern": "The Medical Director Agent denies a case and is confident about it, and the system issues an autonomous approval. The same denial held with less conviction routes to a human, so lowering the agent's certainty made the system safer.",
+      "root_cause": "_run_medical_director assigned status from confidence alone: >= auto_approve_confidence_threshold set AUTO_APPROVED, anything else set IN_REVIEW. That reads confidence_score as 'confidence the request should be approved'. The agent produces it as 'confidence in the determination it just made' -- a different quantity that agrees with the first only when the determination happens to be an approval. On a denial the two invert. Tier 1 never had this defect: select_confidence_branch requires confidence >= threshold AND status == AUTO_APPROVED. The rule was restated at Tier 2 instead of reused, and the restatement dropped the status conjunct.",
+      "evidence": [
+        {
+          "source": "tests/unit/test_tier2_denial_is_final.py against the pre-fix orchestrator",
+          "note": "8 of 16 tests fail. A DENIED decision at confidence 0.95, 0.97, 0.99 and 1.0 each returns AUTO_APPROVED. INFORMATION_NEEDED and PENDING at 0.99 also return AUTO_APPROVED -- high confidence in 'I need more information' was read as support for approving."
+        },
+        {
+          "source": "src/pacca/agents/orchestrator.py, select_confidence_branch (Tier 1)",
+          "note": "Tier 1's rule includes the status conjunct the Tier-2 branch omitted, so the two tiers disagreed about what a confident denial means."
+        },
+        {
+          "source": "docs/DECISIONS.md:388, docs/EVALUATION.md:507",
+          "note": "GC-035 is a corpus case that denies at 0.96 with a cited basis and an appeal pathway, establishing that a confident denial is a real outcome this system produces and not a hypothetical."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [
+        "GC-035",
+        "GC-005"
+      ],
+      "constraint_level": "escalation_branch",
+      "why_this_component": "The defect is in the orchestrator's policy application, not in the agent's clinical reasoning -- the agent reached the right determination and the branch overwrote it. Reusing select_confidence_branch rather than adding a second correct rule means the two tiers cannot drift apart again, which is how this arose. A prompt-level instruction could not have helped: the agent already denied, and its status was discarded afterwards.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert the commit. Reverting restores the confidence-only assignment and reopens autonomous approval of denied cases, so it should only be done alongside an alternative fix.",
+      "baseline": {
+        "claim": "The Tier-2 branch assigned status from confidence alone, so a Medical Director decision of DENIED at or above the auto-approve threshold was returned as AUTO_APPROVED, and any non-approval status at high confidence was likewise returned as AUTO_APPROVED.",
+        "verified_by": "Run tests/unit/test_tier2_denial_is_final.py against the orchestrator at harness-iter-25, with the Medical Director agent mocked to return a chosen (status, confidence) pair.",
+        "result": "8 failed, 5 passed. DENIED at 0.95/0.97/0.99/1.0 -> AUTO_APPROVED; DENIED at 0.55 -> IN_REVIEW; IN_REVIEW, INFORMATION_NEEDED and PENDING at 0.99 -> AUTO_APPROVED. After the fix: 16 passed. Full deterministic suite 1058 passed, 6 skipped, confirming nothing else depended on the old behaviour."
+      }
+    }
+  ]
+}
