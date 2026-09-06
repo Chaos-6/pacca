@@ -509,7 +509,33 @@ class Orchestrator:
                 },
             )
 
-        if md_decision.confidence_score >= effective_settings().auto_approve_confidence_threshold:
+        # The agent's determination decides the outcome; confidence only gates
+        # whether an approval may be granted without a human. The two are
+        # different quantities and they come apart on a denial: this branch
+        # previously read confidence alone, so a Medical Director that denied a
+        # case *and was sure of it* had the denial rewritten into an autonomous
+        # approval, while the same denial held with less conviction went to a
+        # human. Doubt was the only thing routing these cases safely, and the
+        # inversion was worst where the stakes are highest -- every case here is
+        # one Tier 1 already found ambiguous.
+        #
+        # select_confidence_branch is Tier 1's rule, reused rather than restated:
+        # auto-approve requires high confidence AND an AUTO_APPROVED status.
+        # Anything else goes to a human. Preserving DENIED here instead would
+        # make Tier 2 more autonomous than Tier 1, which is backwards. The
+        # denial is not discarded -- its rationale rides on the decision and the
+        # agent_medical_director_completed record above captures the status the
+        # agent returned -- but the adverse determination is issued by a person.
+        settings = effective_settings()
+        if (
+            select_confidence_branch(
+                md_decision.confidence_score,
+                md_decision.status,
+                settings.auto_approve_confidence_threshold,
+                settings.escalation_confidence_threshold,
+            )
+            == "auto_approve"
+        ):
             md_decision.status = AuthorizationStatus.AUTO_APPROVED
         else:
             md_decision.status = AuthorizationStatus.IN_REVIEW
