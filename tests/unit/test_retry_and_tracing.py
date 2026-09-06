@@ -238,6 +238,57 @@ class TestRetryLogic:
         )
 
     @pytest.mark.asyncio
+    async def test_validation_error_no_retry(self, agent: _ConcreteAgent) -> None:
+        """
+        TERM-04 / CONSIST-02: a schema violation must NOT be retried.
+
+        This test is named in the SDD v3.0 traceability matrix as the verifier
+        for TERM-04, and the row is marked "Mapped" -- but the test did not
+        exist. The behaviour is correct and structurally guaranteed; only the
+        proof was missing.
+
+        The guarantee comes from where the retry decorator sits. ``@retry``
+        wraps ``_call_with_retry``, which owns the HTTP call. The response is
+        validated in ``execute()``, *outside* that wrapper, so a
+        ``ValidationError`` raised by ``model_validate`` propagates on the
+        first failure rather than re-entering the retry loop.
+
+        Why not retrying is the correct behaviour: a retry is only worth
+        spending when the next attempt could plausibly differ. A 429 or a 5xx
+        is transient. A response that does not satisfy the tool schema is a
+        contract failure between the prompt and the model, and re-rolling it
+        buys a second chance at a coin flip while spending real tokens and
+        latency on a clinical request. CONSIST-02 states the rule directly:
+        "schema violations are not retried."
+
+        Here the mock returns a tool_use block whose input is missing the
+        required ``result`` field.
+        """
+        malformed_block = MagicMock()
+        malformed_block.type = "tool_use"
+        malformed_block.input = {"score": 0.9}  # 'result' is required and absent
+
+        malformed_usage = MagicMock()
+        malformed_usage.input_tokens = 100
+        malformed_usage.output_tokens = 10
+
+        malformed_response = MagicMock()
+        malformed_response.content = [malformed_block]
+        malformed_response.usage = malformed_usage
+
+        agent.client.messages.create = AsyncMock(return_value=malformed_response)
+
+        with pytest.raises(PydanticValidationError):
+            await agent.execute("test prompt", _TestOutput)
+
+        assert agent.client.messages.create.call_count == 1, (
+            "TERM-04: a schema violation must not be retried. The API was called "
+            f"{agent.client.messages.create.call_count} times. Retrying a contract "
+            "failure spends tokens and latency on a clinical request for a second "
+            "chance at the same coin flip."
+        )
+
+    @pytest.mark.asyncio
     async def test_auth_error_not_retried(self, agent: _ConcreteAgent) -> None:
         """
         A 401 AuthenticationError must NOT be retried.
