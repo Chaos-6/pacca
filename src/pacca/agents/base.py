@@ -367,7 +367,18 @@ class BaseAgent(ABC):
         # Open a span covering the entire agent call including retries.
         # The span name format "agent.<AgentName>" is consistent across all
         # agents, making traces filterable and comparable.
-        with self._tracer.start_as_current_span(f"agent.{self.name}") as span:
+        # record_exception/set_status_on_exception are OTel defaults and both
+        # default to True. When the exception propagates out of this block the
+        # SDK records it itself -- the full message as an "exception" event and
+        # a status description of f"{type}: {exc}". That is a second PHI channel
+        # onto an exported span, independent of record_span_error, and it is the
+        # one that actually leaked: suppressing it in the helper alone left the
+        # SDK writing the message anyway (THREAT-03).
+        with self._tracer.start_as_current_span(
+            f"agent.{self.name}",
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             span.set_attribute("agent.name", self.name)
             span.set_attribute("llm.model", self.config.model)
             span.set_attribute("llm.max_tokens", self.config.max_tokens)

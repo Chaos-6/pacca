@@ -251,6 +251,14 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "::notice::clinical-gate: change touches agent/rag code"; exit 0
           fi
+          # The pinned model identifier lives in config/settings.py, which is not under
+          # agents/ or rag/. Editing it changes every agent call's substrate while
+          # matching none of the filters above -- the exact hole the iter-14 model
+          # substitution went through (docs/DECISIONS.md). Gate on it explicitly.
+          if git diff --name-only "$base"...HEAD | grep -qE '^src/pacca/config/settings\.py$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::clinical-gate: change touches the pinned model identifier"; exit 0
+          fi
           if git log --format='%s' "$base"...HEAD | grep -qE '^chg-'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "::notice::clinical-gate: change carries a chg- (behavioral) commit"; exit 0

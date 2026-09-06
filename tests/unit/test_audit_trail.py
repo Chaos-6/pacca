@@ -471,6 +471,139 @@ class TestAuditTrailWiring:
         )
 
     @pytest.mark.asyncio
+    async def test_start_complete_pairs(self) -> None:
+        """
+        HIPAA-AUDIT-03: every agent invocation writes a matched
+        started/completed pair of audit records.
+
+        This test is named in the SDD v3.0 traceability matrix as the verifier
+        for HIPAA-AUDIT-03 and the row is marked "Mapped", but the test did not
+        exist -- the behaviour conformed while the matrix row pointed at
+        nothing. Writing it turns an asserted mapping into a checked one.
+
+        Why pairs matter rather than a single record: a lone "started" with no
+        "completed" is how a silently dropped or hung agent call looks in the
+        audit trail, and 45 CFR 164.312(b) audit controls are only useful if an
+        incomplete action is distinguishable from one that never began. The
+        pair also carries the duration that makes a stalled call visible.
+
+        The orchestrator is driven directly here. The route-level audit tests in
+        this module patch ``process_decision``, which is where these two records
+        are written -- so they cannot observe this property by construction.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from pacca.agents.decision import DecisionContext
+        from pacca.agents.orchestrator import Orchestrator
+        from pacca.models import (
+            ClassificationOutput,
+            ClinicalCase,
+            EvidenceItem,
+            EvidenceOutput,
+            UrgencyLevel,
+        )
+        from pacca.models.authorization import AuthorizationDecision
+        from pacca.models.enums import AuthorizationStatus, ReviewTier
+
+        orchestrator = Orchestrator()
+        orchestrator.decision_agent.run = AsyncMock(  # type: ignore[method-assign]
+            return_value=AuthorizationDecision(
+                decision_id="DEC-AUDIT-PAIRS",
+                status=AuthorizationStatus.AUTO_APPROVED,
+                confidence_score=0.97,
+                rationale="Criterion 1 MET: documented conservative therapy.",
+                review_tier_used=ReviewTier.AUTOMATED,
+                # SCHEMA-INV-04 (landed in #95 after this test was written): an
+                # agent-tier decision must name the substrate that produced it,
+                # so a fixture standing in for one has to as well.
+                model_id="claude-sonnet-4-5-20250929",
+                prompt_version="v2.7",
+            )
+        )
+        orchestrator.evidence_agent.run = AsyncMock(  # type: ignore[method-assign]
+            return_value=EvidenceOutput(
+                clinical_narrative="", key_findings=[], evidence_gaps=[], confidence_score=0.9
+            )
+        )
+        orchestrator.classification_agent.run = AsyncMock(  # type: ignore[method-assign]
+            return_value=ClassificationOutput(
+                complexity=1,
+                complexity_factors=[],
+                primary_specialty="general",
+                urgency=UrgencyLevel.ROUTINE,
+                routing_rationale="",
+                confidence_score=0.9,
+            )
+        )
+
+        audit_calls: list[dict] = []
+
+        async def capture_log(**kwargs):
+            audit_calls.append(kwargs)
+            return MagicMock()
+
+        audit = MagicMock()
+        audit.log = capture_log
+
+        context = DecisionContext(
+            case=ClinicalCase(
+                patient_id="PT-AUDIT-PAIRS",
+                primary_diagnosis_code="M54.5",
+                procedure_code="72148",
+                evidence=[
+                    EvidenceItem(
+                        id="EV-1",
+                        source_type="CLINICAL_NOTE",
+                        description="Conservative therapy documented",
+                        original_text="Six weeks of physical therapy completed.",
+                        confidence=0.9,
+                    )
+                ],
+                estimated_annual_cost=1200.0,
+                patient_age=45,
+            ),
+            relevant_guidelines="Criterion 1: conservative therapy for six weeks.",
+        )
+
+        await orchestrator.process_decision(context, audit=audit, correlation_id="CORR-AUDIT-PAIRS")
+
+        started = [c for c in audit_calls if c.get("action") == "agent_decision_started"]
+        completed = [c for c in audit_calls if c.get("action") == "agent_decision_completed"]
+
+        assert started, (
+            "HIPAA-AUDIT-03: no agent_decision_started record was written. "
+            "Every agent invocation must open with one."
+        )
+        assert len(started) == len(completed), (
+            "HIPAA-AUDIT-03: unmatched agent audit records -- "
+            f"{len(started)} started, {len(completed)} completed. An unmatched "
+            "'started' is indistinguishable from a dropped or hung agent call."
+        )
+
+        # Each pair must name the same actor, so a reader can attribute the
+        # completion to the agent that opened it rather than inferring by order.
+        assert [c.get("actor") for c in started] == [c.get("actor") for c in completed], (
+            "HIPAA-AUDIT-03: started/completed actors do not correspond: "
+            f"{[c.get('actor') for c in started]} vs {[c.get('actor') for c in completed]}"
+        )
+
+        for record in started + completed:
+            assert record.get("actor_type") == "agent", (
+                "HIPAA-AUDIT-03: agent audit records must carry actor_type='agent'; "
+                f"found {record.get('actor_type')!r}"
+            )
+            assert record.get("correlation_id") == "CORR-AUDIT-PAIRS", (
+                "HIPAA-AUDIT-02: agent records must carry the request correlation ID."
+            )
+
+        # The completion carries the duration; that is what makes a stalled call
+        # visible in the trail rather than merely a missing record.
+        for record in completed:
+            assert record.get("duration_ms") is not None, (
+                "HIPAA-AUDIT-03: agent_decision_completed must record duration_ms."
+            )
+
+    @pytest.mark.asyncio
     async def test_failure_writes_failure_audit_record(self, sample_request):
         """
         If the AI pipeline fails, a failure audit record must be written.

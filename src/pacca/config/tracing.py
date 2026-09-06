@@ -154,7 +154,7 @@ def record_span_error(span: Span, error: Exception) -> None:
 
     This is a convenience wrapper around OTel's exception recording API.
     Calling this ensures the span shows as an error in the trace backend,
-    with the full exception type, message, and stack trace attached.
+    identified by exception type only -- see the PHI note below.
 
     Usage:
         with tracer.start_as_current_span("llm_call") as span:
@@ -164,12 +164,20 @@ def record_span_error(span: Span, error: Exception) -> None:
                 record_span_error(span, e)
                 raise
 
+    THREAT-03 (PHI containment): only the exception *type* is recorded. Spans are
+    exported to a third-party trace backend outside the audit store, and an exception
+    raised while handling a clinical case can carry PHI in its message and stack
+    trace. ``record_exception`` attaches both, so it is deliberately not called here.
+    The full error text is retained in the audit record, which never leaves the
+    HIPAA-scoped store.
+
     Args:
         span:  The active span to record the error on
         error: The exception that occurred
     """
-    span.record_exception(error)
-    span.set_status(StatusCode.ERROR, str(error))
+    error_type = type(error).__name__
+    span.add_event("exception", {"exception.type": error_type})
+    span.set_status(StatusCode.ERROR, error_type)
 
 
 def get_current_trace_id() -> str | None:
