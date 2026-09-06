@@ -14,6 +14,15 @@ on:
     # Nightly clinical-gate run for main (11:00 UTC). Other jobs are cheap.
     - cron: "0 11 * * *"
   workflow_dispatch:
+    inputs:
+      judge_runs:
+        description: "variance-report: judge re-scores per case (>=2)"
+        required: false
+        default: "5"
+      rollouts:
+        description: "variance-report: end-to-end pipeline rollouts per case (>=2)"
+        required: false
+        default: "5"
 
 env:
   PYTHON_VERSION: "3.12"
@@ -357,6 +366,99 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: make test-holdout
+
+  # ---------------------------------------------------------------------------
+  # Evaluation variance report — MANUAL ONLY
+  #
+  # regression_gate.REGRESSION_DROP_THRESHOLD is 1: any one-point per-case drop
+  # against a stored baseline counts as a regression. That number has never been
+  # justified against a measurement. It was set when the SDK still transmitted
+  # temperature=0.0 and the stored distributions were identical pairs, which
+  # reads like determinism but is two draws that agreed -- and capture_baseline's
+  # own docstring records GC-017 swinging 2->4 and GC-005 5->2 while that
+  # parameter was still being sent. The parameter is now gone entirely.
+  #
+  # This job produces the two numbers needed to set the threshold honestly:
+  #
+  #   judge-only    measure_judge_noise.py -- pipeline once, judge N times
+  #   end-to-end    capture_baseline.py --rollouts N -- whole pipeline N times
+  #
+  # The difference between them is agent variance. That decomposition decides
+  # whether a threshold should be widened (judge noise) or whether an agent is
+  # unstable on a case (agent noise) -- different problems, different fixes.
+  #
+  # MANUAL ONLY, and never a gate. It is expensive (N x the clinical gate) and
+  # it answers a question asked when calibrating, not on every push. The
+  # baseline it writes is an ARTIFACT, not a commit: adopting a baseline is a
+  # deliberate act at a known-good commit, and auto-committing one would let a
+  # regression baseline itself into legitimacy.
+  # ---------------------------------------------------------------------------
+  variance-report:
+    name: Evaluation variance report (manual, non-blocking)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for API key (opt-in by secret)
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ANTHROPIC_API_KEY not set — variance report is inert until it is added"
+          fi
+
+      - name: Set up Python
+        if: steps.key.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        if: steps.key.outputs.present == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # continue-on-error on both: these report, they do not gate. A failure
+      # here must not read as a code regression.
+      - name: Judge-only noise (pipeline once, judge N times)
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m tests.clinical.measure_judge_noise \
+            --runs "${{ github.event.inputs.judge_runs || 5 }}" \
+            --out judge-noise.json
+
+      - name: End-to-end variance (full pipeline N times)
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -m tests.clinical.capture_baseline \
+            --tag "variance-$(git rev-parse --short HEAD)" \
+            --rollouts "${{ github.event.inputs.rollouts || 5 }}" \
+            --out end-to-end-variance.json
+
+      - name: Upload variance measurements
+        if: steps.key.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-variance
+          path: |
+            judge-noise.json
+            end-to-end-variance.json
+          if-no-files-found: warn
+          retention-days: 90
 
   test-postgres:
     name: Postgres integration (SQLite-masked bugs — B2/B3)

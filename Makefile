@@ -21,7 +21,10 @@
 #   make install
 # =============================================================================
 
-.PHONY: install db-upgrade test test-cov test-all test-clinical test-holdout test-judge-stability test-postgres lint typecheck clean help \
+RUNS ?= 5
+ROLLOUTS ?= 5
+
+.PHONY: install db-upgrade test test-cov test-all test-clinical test-holdout test-judge-stability measure-variance test-postgres lint typecheck clean help \
         sme-author sme-author-test sme-author-status sme-author-help \
         sme-author-web sme-author-web-build sme-author-web-e2e
 
@@ -108,6 +111,21 @@ test-judge-stability:
 	# already runs inside `make test`; this target exists only so it is also
 	# reachable in isolation by name.
 	pytest tests/unit/test_judge_stability_harness.py -v
+
+measure-variance:
+	@echo "Measuring evaluation variance (requires ANTHROPIC_API_KEY, ~N x the clinical gate)..."
+	@echo "REPORTS ONLY -- not a gate. Produces the evidence for setting"
+	@echo "regression_gate.REGRESSION_DROP_THRESHOLD, which is currently 1 with"
+	@echo "no measurement behind it."
+	@if [ -z "$$ANTHROPIC_API_KEY" ]; then \
+		echo "ERROR: ANTHROPIC_API_KEY is not set. Export it before measuring variance."; \
+		exit 1; \
+	fi
+	@echo "--- judge-only: pipeline once, judge $(RUNS) times per case"
+	python -m tests.clinical.measure_judge_noise --runs $(RUNS) --out judge-noise.json
+	@echo "--- end-to-end: full pipeline $(ROLLOUTS) times per case"
+	python -m tests.clinical.capture_baseline --tag "variance-local" \
+		--rollouts $(ROLLOUTS) --out end-to-end-variance.json
 
 test-postgres:
 	@echo "Real-Postgres integration tests (catches SQLite-masked bugs like B2/B3)..."

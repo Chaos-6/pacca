@@ -28,7 +28,14 @@ via `make test-judge-stability`. `run_stability_check()` itself is
 evaluator-agnostic: pass it a real `ClinicalEvaluator` (live Anthropic
 client) for an actual judge-noise measurement, or a stubbed one (as the
 deterministic test does) to exercise the harness's own arithmetic with zero
-network calls. This lane (chg-25) never constructs a live client.
+network calls.
+
+This module still constructs no client of its own. The live caller it was
+written for is `measure_judge_noise.py`, added later: for a long stretch the
+harness existed with no live runner at all, so the judge-noise number it was
+built to produce was never actually produced, and
+`regression_gate.REGRESSION_DROP_THRESHOLD` stayed at 1 with nothing measured
+behind it.
 """
 
 from __future__ import annotations
