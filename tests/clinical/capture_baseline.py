@@ -17,8 +17,23 @@ case runs N times and the saved file includes:
   - distributions: per-case list of all N scores (visible variance)
 
 Use --rollouts 2 for production baselines once a cycle has observed any
-judge non-determinism. The iter-2 GC-017 2->4 swing + iter-3 chg-1 GC-005
-5->2 swing make 2 the recommended minimum.
+run-to-run non-determinism. The iter-2 GC-017 2->4 swing + iter-3 chg-1
+GC-005 5->2 swing make 2 the recommended minimum.
+
+Attribution note (measured 2026-09-06, run 34050063869). Those swings were
+recorded as LLM-as-judge variance. A direct measurement does not support
+that reading. Re-scoring one frozen (decision, rationale) tuple three times
+per case produced ZERO disagreement across all 20 cases -- including GC-017
+and GC-012 -- while re-running the whole pipeline three times moved 3 of 20
+(GC-005 [4,5,5], GC-010 [5,4,5], GC-012 [3,4,4]). Judge variance 0,
+end-to-end variance 1, so the movement is the AGENT, not the judge.
+
+Three draws cannot prove the judge deterministic -- a true disagreement rate
+near 15% would still plausibly show zero at n=3 -- so this does not overturn
+the historical record, and the two observations may simply differ. What it
+does establish is an asymmetry: at identical sample size agent variance
+appeared and judge variance did not. Rollouts remain the right instrument
+either way; they capture whichever it is.
 
 WHY A SCRIPT, NOT A FIXTURE
 ---------------------------
