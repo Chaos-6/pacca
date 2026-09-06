@@ -1,0 +1,114 @@
+{
+  "iteration": 24,
+  "iteration_tag": "harness-iter-24",
+  "iso_date": "2026-09-06",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-23",
+  "summary": "Closes a pre-flight escalation bypass found by adversarial review. Chaining a billing modifier on the procedure code with an understated estimated_annual_cost cleared all seven pre-flight branches for an experimental CAR-T submission, which then auto-approved at 0.99 confidence. Codes are now normalised before list matching, the cost gate takes the larger of declared and parsed, and a malformed code escalates rather than being treated as screened.",
+  "changes": [
+    {
+      "id": "chg-1",
+      "type": "improvement",
+      "description": "Normalise procedure and diagnosis codes before matching them against the experimental and rare-condition lists, and match the code stem rather than the raw string.",
+      "files": [
+        "src/pacca/agents/clinical_risk_detector.py"
+      ],
+      "failure_pattern": "A submission whose codes carry ordinary billing decoration evades a curated-list pre-flight branch. The branch reports no trigger, so the case proceeds to autonomous decision as though it had been screened.",
+      "root_cause": "_check_experimental_treatment tested exact frozenset membership on case.procedure_code.upper().strip(), and _check_rare_condition used startswith on the same lightly-cleaned string. Neither modifiers (Q2041-59, Q2041 KX), stray punctuation, nor Unicode homoglyphs (fullwidth Q) are removed by upper().strip(), so each produced a string the list could not match. Modifiers are how these codes are legitimately billed, so the defect is reachable by a correctly-formed real claim, not only by a crafted one.",
+      "evidence": [
+        {
+          "source": "adversarial review, ClinicalRiskDetector.evaluate direct invocation",
+          "note": "procedure_code='Q2041-59' returns reasons=['high_cost'] where 'Q2041' returns ['experimental_treatment','high_cost'] on an otherwise identical case."
+        },
+        {
+          "source": "adversarial review, end-to-end with mocked model client",
+          "note": "procedure_code='Q2041-59' with estimated_annual_cost=0.0 cleared pre-flight entirely and returned status=AUTO_APPROVED tier=AUTOMATED conf=0.99 for experimental CAR-T."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [
+        "GC-043"
+      ],
+      "constraint_level": "escalation_branch",
+      "why_this_component": "The failure is in the deterministic gate itself, not in what the model concluded afterwards. A prompt-level instruction cannot restore a branch that did not fire, and the spec is explicit that pre-flight must decide before any model call. Normalisation belongs at the matching site so every branch that matches a code inherits it.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert the commit. Reverting restores the exact-match behaviour and reopens the bypass, so it should only be done alongside an alternative fix.",
+      "baseline": {
+        "claim": "Pre-flight matched procedure and diagnosis codes against its curated lists using only .upper().strip(), so a billing modifier, stray punctuation or a homoglyph produced a non-match and the branch did not fire.",
+        "verified_by": "Construct a ClinicalCase for experimental CAR-T and call ClinicalRiskDetector().evaluate() with procedure_code set to 'Q2041' and then to 'Q2041-59', comparing flags.reasons.",
+        "result": "'Q2041' -> ['experimental_treatment', 'high_cost']; 'Q2041-59' -> ['high_cost'] only. The experimental branch did not fire on the modified code."
+      }
+    },
+    {
+      "id": "chg-2",
+      "type": "improvement",
+      "description": "The high-cost branch now takes the larger of the declared estimated_annual_cost and the cost parsed from the clinical record, instead of letting the declared field short-circuit the parse.",
+      "files": [
+        "src/pacca/agents/clinical_risk_detector.py"
+      ],
+      "failure_pattern": "The submitter switches off the cost escalation by declaring a low estimated_annual_cost, while the true cost remains visible in the clinical notes.",
+      "root_cause": "_check_high_cost read case.estimated_annual_cost first and only called _parse_cost_from_notes when that field was None. estimated_annual_cost is caller-supplied, so a declared 0.0 skipped the parse and returned without escalating. Cost escalation is a policy control that exists to act against the submitter's own incentive, which is precisely the party whose number was being trusted.",
+      "evidence": [
+        {
+          "source": "adversarial review, ClinicalRiskDetector.evaluate direct invocation",
+          "note": "Notes reading '$475,000 annually' escalate on high_cost when estimated_annual_cost is absent; setting estimated_annual_cost=0.0 on the identical case suppresses the branch."
+        },
+        {
+          "source": "src/pacca/agents/clinical_risk_detector.py, _check_high_cost docstring",
+          "note": "The iter-2 GC-010 finding already established that cost rules must fire regardless of clinical merit; the same reasoning applies to the declared figure."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [],
+      "constraint_level": "escalation_branch",
+      "why_this_component": "Same reasoning as chg-1: this is a deterministic policy gate, and the fix is to stop trusting an input rather than to instruct the model differently. Taking max() rather than reordering preference keeps both sources live, so neither an absent field nor an absent figure in the notes reopens the gap.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert the commit.",
+      "baseline": {
+        "claim": "The declared estimated_annual_cost short-circuited the notes parser: when the field was not None the parser never ran, so a declared value below the threshold ended the check regardless of what the clinical record stated.",
+        "verified_by": "Call ClinicalRiskDetector().evaluate() on a case whose evidence text contains '$475,000 annually', once with estimated_annual_cost=None and once with estimated_annual_cost=0.0.",
+        "result": "None -> ['high_cost'] fired; 0.0 -> no reasons. The parse was skipped."
+      }
+    },
+    {
+      "id": "chg-3",
+      "type": "new",
+      "description": "Adds a malformed-code pre-flight branch and the MALFORMED_CODE escalation reason. A diagnosis or procedure code that does not have the shape its coding system defines routes to human review rather than proceeding as screened.",
+      "files": [
+        "src/pacca/agents/clinical_risk_detector.py",
+        "src/pacca/models/enums.py",
+        "tests/unit/test_preflight_evasion.py",
+        "tests/test_level5_flow.py"
+      ],
+      "failure_pattern": "A code that is not well-formed passes every curated-list branch, because no list can match it, and the absence of a match is read as the absence of risk.",
+      "root_cause": "Every pre-flight branch decides by matching a code against a list. That inference is only valid for codes the lists could have screened. Normalisation (chg-1) closes decoration of otherwise valid codes, but a value like '0E75.0' is not a valid ICD-10 code at all: the leading character shifts the string past the rare-condition prefix scan and nothing else examines it. The gate needed a shape check, not another special case.",
+      "evidence": [
+        {
+          "source": "adversarial review, ClinicalRiskDetector.evaluate direct invocation",
+          "note": "diagnosis_code='0E75.0' did not fire rare_condition where 'E75.0' did."
+        },
+        {
+          "source": "CI clinical gate on this PR, tests/test_level5_flow.py",
+          "note": "The shape rule escalated all three level-5 flow cases: test_happy_path_lung_cancer returned IN_REVIEW where it asserts AUTO_APPROVED. Root cause was the fixtures, not the gate -- they submitted primary_diagnosis_code='Lung' and 'BackPain', free-text placeholders rather than codes in any system. Reproduced directly: 'Lung'/'71250' -> ['malformed_code']; 'Z12.2'/'71250' -> no reasons. Fixtures corrected to real ICD-10 (Z12.2, M54.50). A sweep of all 108 evaluated corpus cases finds zero flagged malformed, and that sweep is now pinned as a test rather than left as a one-off check."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [
+        "GC-043"
+      ],
+      "constraint_level": "escalation_branch",
+      "why_this_component": "Adding an eighth deterministic branch is the same mechanism the existing seven use and inherits the no-LLM-call property for free: should_pre_escalate is len(reasons) > 0, so a new reason short-circuits before any model call with no orchestrator change. Handling this in a prompt would make a safety property depend on model compliance, which the specification explicitly rejects.",
+      "phi_impact": "none",
+      "audit_relevant": true,
+      "rollback_plan": "git revert the commit. The MALFORMED_CODE enum member is additive; persisted rows carrying it remain readable after a revert, but the reason will no longer be produced.",
+      "baseline": {
+        "claim": "No pre-flight branch examined code shape. A diagnosis code of '0E75.0' produced no escalation reason at all, because the rare-condition prefix scan uses startswith and every other branch matches a different field.",
+        "verified_by": "Call ClinicalRiskDetector().evaluate() with primary_diagnosis_code='0E75.0' against 'E75.0' on an otherwise routine case.",
+        "result": "'E75.0' -> ['rare_condition']; '0E75.0' -> no reasons. GC-043 ('0124') was the one corpus case the first draft of the shape rule would have escalated, which is why the procedure shape admits four-digit numeric codes. The gate's own risk is over-escalation, so TestShapeGateIsInvisibleToTheCorpus now runs every evaluated case through evaluate() and fails if any is flagged MALFORMED_CODE; narrowing _PROCEDURE_SHAPE to ^\\d{5}$ makes it fail on 79 of 108, confirming it discriminates."
+      }
+    }
+  ]
+}
