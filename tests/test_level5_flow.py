@@ -10,6 +10,14 @@ reimplementing __init__ with public attribute names (`self.guidelines`,
 `self.client`) that the real class never had. Every method it inherited then
 raised AttributeError on `self._guidelines`. The subclass is gone: the retriever
 takes `db_path` directly, so the test uses the supported seam.
+
+The diagnosis codes below are real ICD-10 codes (Z12.2 screening for respiratory
+malignancy, M54.50 low back pain) and must stay that way. They were previously
+free-text placeholders ("Lung", "BackPain"), which the pre-flight shape check
+correctly escalates as malformed: a value that is not a well-formed code has not
+been screened by any of the curated-list branches, whatever those branches
+returned. Substituting a placeholder here does not simplify the fixture, it
+changes which decision path the case takes.
 """
 
 import os
@@ -250,7 +258,7 @@ def test_happy_path_lung_cancer(client):
         "provider_npi": "123",
         "clinical_case": {
             "patient_id": "p1",
-            "primary_diagnosis_code": "Lung",
+            "primary_diagnosis_code": "Z12.2",
             "procedure_code": "71250",
             "evidence": [
                 {
@@ -277,7 +285,7 @@ def _thin_spine_case(request_id: str) -> dict:
         "provider_npi": "123",
         "clinical_case": {
             "patient_id": "p2",
-            "primary_diagnosis_code": "BackPain",
+            "primary_diagnosis_code": "M54.50",
             "procedure_code": "72148",
             "evidence": [
                 {

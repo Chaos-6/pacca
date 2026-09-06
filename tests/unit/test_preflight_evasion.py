@@ -189,3 +189,62 @@ class TestNormalizeCode:
     )
     def test_normalization(self, raw: str, expected: str) -> None:
         assert normalize_code(raw) == expected
+
+
+class TestShapeGateIsInvisibleToTheCorpus:
+    """
+    The shape gate's own risk is the mirror of the hole it closes.
+
+    Escalating a malformed code is safe by construction — an extra human
+    review. Escalating a *well-formed* one is not: it would push valid traffic
+    into review and, because the clinical accuracy gate scores terminal
+    outcomes, would read as a reasoning regression rather than as the gate
+    misfiring. The single routine case above is one point; this is the whole
+    evaluated corpus, so the blast radius cannot grow silently.
+
+    This test caught a real one. `tests/test_level5_flow.py` submitted
+    `primary_diagnosis_code="Lung"` and `"BackPain"` — free-text placeholders
+    rather than codes — and the gate correctly escalated all three of its
+    cases. The fixtures were wrong, not the gate, but nothing pinned the
+    distinction until this test existed.
+    """
+
+    def test_no_evaluated_case_is_flagged_malformed(self) -> None:
+        from tests.clinical.holdout import _ALL_CASE_LISTS
+
+        detector = ClinicalRiskDetector()
+        offenders: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+
+        for case_list in _ALL_CASE_LISTS:
+            for golden in case_list:
+                if golden.case_id in seen:
+                    continue
+                seen.add(golden.case_id)
+                flags = detector.evaluate(
+                    ClinicalCase(
+                        patient_id=golden.case_id,
+                        primary_diagnosis_code=golden.diagnosis_code,
+                        procedure_code=golden.procedure_code,
+                        evidence=[
+                            EvidenceItem(
+                                id="e1",
+                                source_type="CLINICAL_NOTE",
+                                description=golden.clinical_notes,
+                                original_text=golden.clinical_notes,
+                                confidence=1.0,
+                            )
+                        ],
+                    )
+                )
+                if EscalationReason.MALFORMED_CODE in flags.details:
+                    offenders.append((golden.case_id, golden.diagnosis_code, golden.procedure_code))
+
+        assert seen, "corpus sweep collected no cases — the import wiring is broken"
+        assert not offenders, (
+            f"{len(offenders)} of {len(seen)} evaluated cases were flagged "
+            f"MALFORMED_CODE by the shape gate: {offenders}. These are the "
+            "corpus's own codes, so either a real coding system was excluded "
+            "from the shape or a case carries a placeholder instead of a code. "
+            "Widen the shape only for the former."
+        )

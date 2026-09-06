@@ -80,7 +80,8 @@
       "files": [
         "src/pacca/agents/clinical_risk_detector.py",
         "src/pacca/models/enums.py",
-        "tests/unit/test_preflight_evasion.py"
+        "tests/unit/test_preflight_evasion.py",
+        "tests/test_level5_flow.py"
       ],
       "failure_pattern": "A code that is not well-formed passes every curated-list branch, because no list can match it, and the absence of a match is read as the absence of risk.",
       "root_cause": "Every pre-flight branch decides by matching a code against a list. That inference is only valid for codes the lists could have screened. Normalisation (chg-1) closes decoration of otherwise valid codes, but a value like '0E75.0' is not a valid ICD-10 code at all: the leading character shifts the string past the rare-condition prefix scan and nothing else examines it. The gate needed a shape check, not another special case.",
@@ -88,6 +89,10 @@
         {
           "source": "adversarial review, ClinicalRiskDetector.evaluate direct invocation",
           "note": "diagnosis_code='0E75.0' did not fire rare_condition where 'E75.0' did."
+        },
+        {
+          "source": "CI clinical gate on this PR, tests/test_level5_flow.py",
+          "note": "The shape rule escalated all three level-5 flow cases: test_happy_path_lung_cancer returned IN_REVIEW where it asserts AUTO_APPROVED. Root cause was the fixtures, not the gate -- they submitted primary_diagnosis_code='Lung' and 'BackPain', free-text placeholders rather than codes in any system. Reproduced directly: 'Lung'/'71250' -> ['malformed_code']; 'Z12.2'/'71250' -> no reasons. Fixtures corrected to real ICD-10 (Z12.2, M54.50). A sweep of all 108 evaluated corpus cases finds zero flagged malformed, and that sweep is now pinned as a test rather than left as a one-off check."
         }
       ],
       "predicted_fixes": [],
@@ -102,7 +107,7 @@
       "baseline": {
         "claim": "No pre-flight branch examined code shape. A diagnosis code of '0E75.0' produced no escalation reason at all, because the rare-condition prefix scan uses startswith and every other branch matches a different field.",
         "verified_by": "Call ClinicalRiskDetector().evaluate() with primary_diagnosis_code='0E75.0' against 'E75.0' on an otherwise routine case.",
-        "result": "'E75.0' -> ['rare_condition']; '0E75.0' -> no reasons. GC-043 ('0124') was the one corpus case the first draft of the shape rule would have escalated, which is why the procedure shape admits four-digit numeric codes."
+        "result": "'E75.0' -> ['rare_condition']; '0E75.0' -> no reasons. GC-043 ('0124') was the one corpus case the first draft of the shape rule would have escalated, which is why the procedure shape admits four-digit numeric codes. The gate's own risk is over-escalation, so TestShapeGateIsInvisibleToTheCorpus now runs every evaluated case through evaluate() and fails if any is flagged MALFORMED_CODE; narrowing _PROCEDURE_SHAPE to ^\\d{5}$ makes it fail on 79 of 108, confirming it discriminates."
       }
     }
   ]
