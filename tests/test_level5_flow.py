@@ -278,7 +278,23 @@ def test_happy_path_lung_cancer(client):
 
 
 def _thin_spine_case(request_id: str) -> dict:
-    """The weak case: 2 weeks of back pain, no motor-weakness finding documented."""
+    """The weak case: 2 weeks of back pain, no motor-weakness finding documented.
+
+    The evidence text is load-bearing and states the *absence* of conservative
+    therapy explicitly. The seeded guideline for 72148 reads "indicated only
+    after 6 weeks of conservative therapy fails", so a case that merely omits
+    the subject leaves the agent to infer it, and this case sits close enough
+    to the approval boundary that the inference is not stable: an earlier run
+    of this file returned IN_REVIEW twice and AUTO_APPROVED once for three
+    structurally identical submissions. Naming the missing criterion puts the
+    case unambiguously below the bar for the reason the guideline gives.
+
+    It deliberately says nothing about neurological findings.
+    test_learning_loop_spine appends a motor-weakness note at step 3, and that
+    note has to be the only thing that changes between the two submissions --
+    asserting "no motor weakness" here would contradict it rather than be
+    superseded by it.
+    """
     return {
         "request_id": request_id,
         "patient_id": "p2",
@@ -291,7 +307,11 @@ def _thin_spine_case(request_id: str) -> dict:
                 {
                     "id": "e2",
                     "source_type": "CLINICAL_NOTE",
-                    "description": "Patient has had back pain for 2 weeks. Requesting MRI.",
+                    "description": (
+                        "Patient reports low back pain for 2 weeks. No conservative "
+                        "therapy has been trialled: no NSAIDs, no physical therapy, "
+                        "no activity modification. Requesting MRI lumbar spine."
+                    ),
                     "original_text": "...",
                     "confidence": 1.0,
                 }
