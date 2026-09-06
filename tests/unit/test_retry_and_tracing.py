@@ -123,7 +123,7 @@ class TestRetryLogic:
     @pytest.fixture
     def agent(self) -> _ConcreteAgent:
         """Create a test agent with fast retry settings (no real waiting)."""
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         a = _ConcreteAgent(config=cfg)
         # Override settings to use 3 max attempts
         a._settings = MagicMock()
@@ -338,7 +338,7 @@ class TestServerErrorRetry:
             "default (3); if that default changes, update the expected "
             "attempt counts below rather than silently drifting."
         )
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         return _ConcreteAgent(config=cfg)
 
     @pytest.mark.asyncio
@@ -661,7 +661,7 @@ class TestRetryRespectsRuntimeOverrides:
     @pytest.fixture
     def agent(self) -> _ConcreteAgent:
         """A real agent with no _settings stub — call-time settings only."""
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         return _ConcreteAgent(config=cfg)
 
     @staticmethod
@@ -787,7 +787,7 @@ class TestOtelSpans:
     @pytest.fixture
     def agent_with_mock_tracer(self) -> _ConcreteAgent:
         """Create a test agent with a mocked OTel tracer."""
-        cfg = AgentConfig(model="claude-test", temperature=0.0, max_tokens=100)
+        cfg = AgentConfig(model="claude-test", max_tokens=100)
         a = _ConcreteAgent(config=cfg)
         a._settings = MagicMock()
         a._settings.llm_retry_max_attempts = 1

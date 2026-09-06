@@ -48,7 +48,7 @@ dependencies = [
     "redis>=5.2.0",
 
     # LLM Integration
-    "anthropic>=0.40.0",
+    "anthropic>=1.4.0,<2",
 
     # Vector Store (local)
     "chromadb>=0.5.0",
