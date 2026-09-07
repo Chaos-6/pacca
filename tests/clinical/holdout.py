@@ -129,6 +129,35 @@ from .transplant_cases import TRANSPLANT_CASES
 # Every case list across tests/clinical/*_cases.py. Add a new entry here
 # whenever a new case file lands — `all_dataset_case_ids()` and the
 # partition-completeness guard test both depend on this being exhaustive.
+# ─────────────────────────────────────────────────────────────────────────
+# The in-sample evaluation set — ONE definition, three consumers.
+#
+# This is the concatenation the clinical accuracy gate runs
+# (test_clinical_accuracy.py::test_full_pipeline_meets_accuracy_threshold).
+# It lives here because three places need it and a hand-copy in each is three
+# things that drift: the gate itself, the coverage census in
+# test_dataset_integrity.py, and capture_baseline.py, whose captured scores are
+# meaningless unless they describe exactly the cases the gate measures.
+#
+# It is NOT every authored case. 108 cases exist across _ALL_CASE_LISTS; 32 are
+# held out; this is the 42 the gate evaluates. The gap is deliberate for the
+# holdout and accidental for the rest — the remaining authored cases are simply
+# not on the gate's list, which is worth knowing when reading a coverage number.
+#
+# test_dataset_integrity.py::test_in_sample_composition_has_not_drifted parses
+# the real concatenation out of the accuracy test and compares it to this, so
+# adding a list there without adding it here fails rather than silently
+# under-reporting.
+IN_SAMPLE_CASES: list[GoldenCase] = (
+    GOLDEN_CASES
+    + NEAR_MISS_CASES
+    + PEDIATRIC_CASES
+    + EXPANSION_CASES
+    + ADULT_COMPLEXITY_CASES
+    + DENIAL_CASES
+)
+
+
 _ALL_CASE_LISTS: tuple[list[GoldenCase], ...] = (
     GOLDEN_CASES,
     NEAR_MISS_CASES,
