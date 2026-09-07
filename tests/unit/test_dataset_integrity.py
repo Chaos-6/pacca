@@ -51,13 +51,7 @@ from typing import Any
 # `_ALL_CASE_LISTS` is private but is the single place that enumerates every
 # case file. Re-listing the imports here would create exactly the drift this
 # file exists to detect.
-from tests.clinical.adult_complexity_cases import ADULT_COMPLEXITY_CASES
-from tests.clinical.denial_cases import DENIAL_CASES
-from tests.clinical.expansion_cases import EXPANSION_CASES
-from tests.clinical.golden_cases import GOLDEN_CASES
-from tests.clinical.holdout import _ALL_CASE_LISTS, held_out_cases
-from tests.clinical.near_miss_cases import NEAR_MISS_CASES
-from tests.clinical.pediatric_cases import PEDIATRIC_CASES
+from tests.clinical.holdout import _ALL_CASE_LISTS, IN_SAMPLE_CASES, held_out_cases
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ACCURACY_TEST = _REPO_ROOT / "tests" / "clinical" / "test_clinical_accuracy.py"
@@ -73,14 +67,11 @@ _IN_SAMPLE_LIST_NAMES = (
     "ADULT_COMPLEXITY_CASES",
     "DENIAL_CASES",  # chg-28
 )
-_IN_SAMPLE_RUN = (
-    GOLDEN_CASES
-    + NEAR_MISS_CASES
-    + PEDIATRIC_CASES
-    + EXPANSION_CASES
-    + ADULT_COMPLEXITY_CASES
-    + DENIAL_CASES
-)
+# Was a hand-copy of the concatenation. It is now the shared definition, so
+# capture_baseline, the gate and this census cannot disagree about what
+# "in-sample" means. test_in_sample_composition_has_not_drifted still parses
+# the accuracy test to prove the shared definition tracks the real gate.
+_IN_SAMPLE_RUN = IN_SAMPLE_CASES
 
 
 def _distinct_cases() -> list[Any]:

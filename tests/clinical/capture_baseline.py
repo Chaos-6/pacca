@@ -128,22 +128,28 @@ async def run_pipeline_for_case(
 
 async def run_golden_dataset() -> list[Any]:
     """
-    Run every golden case through the real pipeline + judge; return verdicts.
+    Run every in-sample case through the real pipeline + judge; return verdicts.
 
-    Faithful to the live CI test. Heavy imports are local to this function on
-    purpose (see module docstring).
+    Faithful to the live CI test, and that fidelity is the whole point: a
+    captured score is only comparable to a gate run if it describes the same
+    cases. This iterated GOLDEN_CASES (20) while the gate evaluates
+    IN_SAMPLE_CASES (42), so 22 of the gate's cases had no baseline and every
+    baseline ever captured covered less than half of what it was compared
+    against. Both now read one definition (holdout.IN_SAMPLE_CASES).
+
+    Heavy imports are local to this function on purpose (see module docstring).
     """
     from pacca.agents.clinical_risk_detector import ClinicalRiskDetector
     from pacca.agents.decision import DecisionAgent
     from tests.clinical.evaluator import ClinicalEvaluator
-    from tests.clinical.golden_cases import GOLDEN_CASES
+    from tests.clinical.holdout import IN_SAMPLE_CASES
 
     detector = ClinicalRiskDetector()
     agent = DecisionAgent()
     evaluator = ClinicalEvaluator()
     verdicts: list[Any] = []
 
-    for golden in GOLDEN_CASES:
+    for golden in IN_SAMPLE_CASES:
         status, rationale, confidence = await run_pipeline_for_case(golden, detector, agent)
 
         verdict = await evaluator.evaluate_case(

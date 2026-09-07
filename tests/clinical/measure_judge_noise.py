@@ -64,13 +64,15 @@ async def measure(runs: int, limit: int | None) -> dict[str, Any]:
     from pacca.agents.decision import DecisionAgent
     from tests.clinical.capture_baseline import run_pipeline_for_case
     from tests.clinical.evaluator import ClinicalEvaluator
-    from tests.clinical.golden_cases import GOLDEN_CASES
+    from tests.clinical.holdout import IN_SAMPLE_CASES
 
     detector = ClinicalRiskDetector()
     agent = DecisionAgent()
     evaluator = ClinicalEvaluator()
 
-    cases = GOLDEN_CASES[:limit] if limit else GOLDEN_CASES
+    # The same set capture_baseline uses. Subtracting judge variance from
+    # end-to-end variance is only meaningful if both measured the same cases.
+    cases = IN_SAMPLE_CASES[:limit] if limit else IN_SAMPLE_CASES
     results = []
 
     for golden in cases:
