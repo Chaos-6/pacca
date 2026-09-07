@@ -20,19 +20,25 @@ Use --rollouts 2 for production baselines once a cycle has observed any
 run-to-run non-determinism. The iter-2 GC-017 2->4 swing + iter-3 chg-1
 GC-005 5->2 swing make 2 the recommended minimum.
 
-Attribution note (measured 2026-09-06, run 34050063869). Those swings were
-recorded as LLM-as-judge variance. A direct measurement does not support
-that reading. Re-scoring one frozen (decision, rationale) tuple three times
-per case produced ZERO disagreement across all 20 cases -- including GC-017
-and GC-012 -- while re-running the whole pipeline three times moved 3 of 20
-(GC-005 [4,5,5], GC-010 [5,4,5], GC-012 [3,4,4]). Judge variance 0,
-end-to-end variance 1, so the movement is the AGENT, not the judge.
+Attribution note, twice revised. Those swings were first recorded as
+LLM-as-judge variance. A measurement at 20 cases x 3 rollouts (2026-09-06,
+run 34050063869) found ZERO judge disagreement against 3 of 20 cases moving
+end-to-end, and was read as: the movement is the AGENT, not the judge.
 
-Three draws cannot prove the judge deterministic -- a true disagreement rate
-near 15% would still plausibly show zero at n=3 -- so this does not overturn
-the historical record, and the two observations may simply differ. What it
-does establish is an asymmetry: at identical sample size agent variance
-appeared and judge variance did not. Rollouts remain the right instrument
+Run 34070093157 (2026-09-07) retires that reading. It is the first capture
+over the 42 cases the gate actually scores. Judge-only: 7.1% disagreement,
+7.1% band-crossing, max spread 2. End-to-end: 6 of 42 moved, max spread 3,
+GC-021 scoring [5, 5, 5, 2, 5]. Both the judge and the agent vary, and both
+vary more than the 20-case sample suggested.
+
+The caveat written into the first note named its own failure: three draws
+cannot prove a judge deterministic. Neither can twenty cases chosen without
+regard to what the gate scores. Those 20 were whichever ones capture_baseline
+happened to iterate, and they are the stable ones -- so the sample that
+understated coverage understated variance by the same act.
+
+Rollouts remain the right instrument either way. What the baseline stores is
+the median of N draws, and that is far steadier than any single draw. Rollouts remain the right instrument
 either way; they capture whichever it is.
 
 WHY A SCRIPT, NOT A FIXTURE

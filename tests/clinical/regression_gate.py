@@ -268,18 +268,33 @@ def check_regression(
       catch any real per-case drop; live runs use the tolerant setting
       to avoid chasing noise.
 
-      That recommendation was made from those two anecdotes. It now has a
-      measurement behind it (2026-09-06, run 34050063869): re-running the
-      full pipeline three times over 20 golden cases moved 3 of them, each
-      by exactly one point -- GC-005 [4,5,5], GC-010 [5,4,5], GC-012
-      [3,4,4]. Max observed spread 1, which is what noise_threshold=1
-      tolerates. The value was right; the justification was anecdotal.
+      That recommendation was made from those two anecdotes. A first
+      measurement (2026-09-06, run 34050063869) appeared to confirm it:
+      over 20 golden cases at 3 rollouts, 3 moved by exactly one point --
+      GC-005 [4,5,5], GC-010 [5,4,5], GC-012 [3,4,4] -- max spread 1, with
+      ZERO judge-only disagreement. It was reported as "the variance is the
+      agent's, and noise_threshold=1 absorbs exactly that".
 
-      The same run re-scored one frozen (decision, rationale) tuple three
-      times per case and found ZERO judge disagreement, so the variance
-      this setting absorbs is the AGENT's, not the judge's. That matters
-      for what to do about it: tolerating agent instability is a decision
-      to live with it, not a measurement correction.
+      That does not survive the full evaluated set. Run 34070093157
+      (2026-09-07, 42 cases x 5 rollouts -- the 42 the accuracy gate
+      actually scores) found max end-to-end spread 3, GC-021 scoring
+      [5,5,5,2,5]; and the judge, re-scoring frozen text, disagreed with
+      itself on 7.1% of cases at a max judge-only spread of 2. Both
+      components are larger than the first sample showed, and the judge is
+      not deterministic.
+
+      The 20 were not a smaller version of the 42. They were the easier
+      half: capture_baseline iterated GOLDEN_CASES while the gate scored a
+      superset, so every variance figure ever quoted described the subset
+      that moves least. Fixing that coverage did not only add cases to the
+      baseline -- it revised the variance estimate upward.
+
+      Read against this, noise_threshold=1 is NOT justified. It sits at or
+      below the judge's own max spread, which is exactly the condition under
+      which a drop cannot be told from the judge rescoring identical text.
+      It remains the configured value only because the gate is report-only;
+      enforcing would need a larger threshold, medians over rollouts, or
+      both.
 
       Note the cost of the tolerance. At noise_threshold=1 a genuine 5->4
       quality slide is jitter, and single-draw comparison cannot tell it

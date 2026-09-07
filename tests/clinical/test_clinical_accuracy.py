@@ -800,17 +800,25 @@ class TestFullClinicalEvaluation:
         # warn-before-enforce form -- the same posture docs/EVALUATION.md sets
         # for the held-out report and the judge-stability harness.
         #
-        # noise_threshold=1 is what check_regression's docstring prescribes for
-        # production, and a measurement now supports it: run 34050063869 found
-        # max end-to-end spread of exactly 1 across 20 cases x 3 rollouts
-        # (GC-005, GC-010, GC-012), with zero judge-only disagreement. The
-        # tolerance absorbs agent variance, so a one-point move is jitter here.
+        # noise_threshold=1 is what check_regression's docstring prescribes
+        # for production. The measurement once cited in support of it does not
+        # survive a wider sample. Run 34050063869 (20 cases x 3 rollouts) found
+        # max end-to-end spread 1 and zero judge-only disagreement. Run
+        # 34070093157 (42 cases x 5 rollouts -- the full set scored here) found
+        # max end-to-end spread 3, GC-021 scoring [5, 5, 5, 2, 5], and
+        # judge-only disagreement on 7.1% of cases at a max spread of 2.
         #
-        # It does NOT assert, on purpose. The false-positive rate over the full
-        # 42-case set at merge cadence is unmeasured -- the variance data is 20
-        # cases at n=3 -- and a gate that reddens builds on agent noise costs a
-        # cycle and reviewer trust each time. Read the output for a few
-        # iterations, then decide whether to enforce.
+        # So 1 does not absorb the observed variance, and by measure_judge_noise
+        # 's own rule -- a threshold at or below the max judge spread cannot
+        # separate a regression from the judge rescoring identical text -- a
+        # threshold of 1 now sits below it. Three of 42 cases crossed the pass
+        # mark between rollouts on identical inputs.
+        #
+        # It does NOT assert, and the wider measurement is what makes that the
+        # right call rather than a merely cautious one: enforcing at 1 would
+        # redden builds on GC-021 from noise alone. Read the output for a few
+        # iterations, then decide whether to enforce and at what threshold --
+        # which is now known to be larger than 1.
         baseline_path = latest_baseline(Path(__file__).parent / "baselines")
         if baseline_path is None:
             print("\nPer-case regression report: no baseline recorded — skipped.")
@@ -824,9 +832,11 @@ class TestFullClinicalEvaluation:
             print(regression.summary())
             if not regression.passed:
                 print(
-                    "  ^ REPORT ONLY — this does not fail the build. A baseline "
-                    "covering fewer cases than this run reports the remainder as "
-                    "new, which is expected, not a gap."
+                    "  ^ REPORT ONLY — this does not fail the build. A "
+                    "baseline covering fewer cases than this run reports the "
+                    "remainder as new. iter-27 covers all of them, so a "
+                    "non-empty new_cases bucket now means the corpus grew and "
+                    "wants a fresh capture — not that the shortfall is routine."
                 )
 
         # THE CI GATE — this assertion is what makes this a gate, not just a report

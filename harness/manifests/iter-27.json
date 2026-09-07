@@ -1,0 +1,81 @@
+{
+  "iteration": 27,
+  "iteration_tag": "harness-iter-27",
+  "iso_date": "2026-09-07",
+  "author": "David Reed",
+  "base_model": "claude-sonnet-4-5-20250929",
+  "previous_iteration_tag": "harness-iter-26",
+  "summary": "The first baseline captured over the cases the clinical gate actually scores, and the measurement retires the variance attribution the repo carried. At 42 cases the judge is not deterministic (7.1% self-disagreement on frozen text, max spread 2) and end-to-end spread reaches 3, where the 20-case sample showed zero and 1. The 20 were not a smaller version of the 42; they were the stable ones.",
+  "changes": [
+    {
+      "id": "chg-1",
+      "type": "new",
+      "description": "Adopt tests/clinical/baselines/iter-27-baseline.json as the per-case regression reference: 42 cases, median of 5 end-to-end rollouts each, captured on main at c1e150d by run 34070093157. latest_baseline() selects it over iter-6, so the report-only gate wired at iter-26 now compares against a baseline covering every case it scores.",
+      "files": [
+        "tests/clinical/baselines/iter-27-baseline.json"
+      ],
+      "failure_pattern": "The per-case regression gate ran against iter-6-baseline.json, which covers 20 cases. The gate scores 42. The 22 without an entry were reported as new_cases -- a bucket that reads as a routine note about recently-added cases -- so two thirds of the gate carried no per-case regression protection and nothing failed to say so.",
+      "root_cause": "No baseline had entered the repository since the initial import, while manifests advanced from iter-6 to iter-26. capture_baseline iterated GOLDEN_CASES rather than the set the gate evaluates, so even a fresh capture would have reproduced the shortfall; that was fixed first (#100) precisely so this adoption would not write the gap into the repo as an adopted reference point.",
+      "evidence": [
+        {
+          "source": "GitHub Actions run 34070093157, step 'End-to-end variance', on main at c1e150d",
+          "note": "Wrote baseline (42 cases, 5 rollouts). Per-case medians and full distributions transcribed from the aggregate block; the case set was checked for identity against holdout.IN_SAMPLE_CASES and every median recomputed from its distribution before the file was written."
+        },
+        {
+          "source": "tests/clinical/regression_gate.py latest_baseline()",
+          "note": "Numeric sort selects iter-27 over iter-6; verified against a temporary directory containing both before the file was committed."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [
+        "GC-021",
+        "GC-024",
+        "GC-022"
+      ],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "The defect is in what the evaluation harness measures against, not in any agent's reasoning. No prompt, tool surface or escalation rule changes here; the same pipeline is scored against a reference that now covers it. A baseline is the one artifact where being incomplete is invisible by construction -- an absent case produces no failure, only a smaller comparison.",
+      "phi_impact": "none",
+      "audit_relevant": false,
+      "rollback_plan": "git revert, or delete tests/clinical/baselines/iter-27-baseline.json. latest_baseline() then falls back to iter-6 and the 22-case shortfall returns. Nothing reads the file except the report-only block, so reverting cannot fail a build."
+    },
+    {
+      "id": "chg-2",
+      "type": "improvement",
+      "description": "Correct the evaluation-variance attribution in regression_gate.py, capture_baseline.py, measure_judge_noise.py and test_clinical_accuracy.py. Each asserted, on the strength of a 20-case run, that judge variance is zero and that the observed movement is the agent's; the 42-case measurement contradicts both halves. Also corrects the report-only gate's own note, which told the reader that a baseline covering fewer cases than the run is 'expected, not a gap'.",
+      "files": [
+        "tests/clinical/regression_gate.py",
+        "tests/clinical/capture_baseline.py",
+        "tests/clinical/measure_judge_noise.py",
+        "tests/clinical/test_clinical_accuracy.py"
+      ],
+      "failure_pattern": "A measurement taken over a convenience sample was written into four files as a settled fact about the system, and then cited as the justification for a threshold. Anyone reading the repository would conclude the judge is deterministic and that noise_threshold=1 is measured rather than assumed.",
+      "root_cause": "The 20 cases measured were whichever ones capture_baseline happened to iterate, not a sample chosen against the gate. They are also the stable ones. Sampling the easy subset produced a variance estimate that looked clean, and the cleanliness was then reported as a property of the judge. The first note even stated the correct caveat -- that three draws cannot prove a judge deterministic -- and the conclusion was drawn anyway.",
+      "evidence": [
+        {
+          "source": "GitHub Actions run 34070093157, step 'Judge-only noise', 42 cases x 2 runs",
+          "note": "disagreement rate 7.1%, band-crossing rate 7.1%, fabrication disagreement 0.0%, max judge-only spread 2 points. The prior claim was ZERO disagreement."
+        },
+        {
+          "source": "GitHub Actions run 34070093157, step 'End-to-end variance', 42 cases x 5 rollouts",
+          "note": "6 of 42 cases moved; max spread 3, not 1. GC-021 [5,5,5,2,5], GC-024 [3,2,4,2,3]. Three cases (GC-021, GC-022, GC-024) crossed the pass mark between rollouts on identical inputs."
+        },
+        {
+          "source": "tests/clinical/measure_judge_noise.py render()",
+          "note": "Its own stated rule -- a threshold at or below the max judge spread cannot separate a regression from the judge rescoring identical text -- now condemns noise_threshold=1, since the max judge spread is 2."
+        }
+      ],
+      "predicted_fixes": [],
+      "risk_cases": [],
+      "constraint_level": "evaluation_harness",
+      "why_this_component": "These are the harness's own claims about its own reliability, and they are load-bearing: the threshold recommendation rests on them. Correcting them changes no executed behaviour, which is exactly why it needs a manifest entry rather than passing as a docs tidy -- the next person to decide whether to enforce the gate reads these comments.",
+      "phi_impact": "none",
+      "audit_relevant": false,
+      "rollback_plan": "git revert. Reverting restores comments that a measurement in this repository's own CI contradicts, so it should not be done without a superseding measurement.",
+      "baseline": {
+        "claim": "regression_gate.py, capture_baseline.py, measure_judge_noise.py and test_clinical_accuracy.py each stated that the LLM judge showed ZERO self-disagreement, that maximum end-to-end spread was exactly 1 point, and therefore that run-to-run movement is attributable to the agent and is absorbed by noise_threshold=1.",
+        "verified_by": "git show c1e150d:tests/clinical/regression_gate.py (and the other three paths) shows the pre-change text. The contradicting measurement is GitHub Actions run 34070093157 on main at c1e150d: workflow variance.yml with judge_runs=2, rollouts=5, which runs measure_judge_noise and capture_baseline over holdout.IN_SAMPLE_CASES.",
+        "result": "Judge-only, 42 cases x 2 runs: 7.1% disagreement, 7.1% band-crossing, max judge-only spread 2 points -- not zero. End-to-end, 42 cases x 5 rollouts: 6 of 42 cases moved, max spread 3 -- not 1 -- with GC-021 scoring [5,5,5,2,5] and 3 cases crossing the pass mark. Both components of the decomposition are larger than the 20-case sample reported, and the judge is not deterministic."
+      }
+    }
+  ]
+}

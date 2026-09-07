@@ -17,10 +17,19 @@ nothing even nominally pins sampling.
 
 FIRST RESULT (2026-09-06, run 34050063869), which did not go as expected: at
 20 cases x 3 runs the judge disagreed with itself ZERO times, while re-running
-the whole pipeline moved 3 of 20 by one point each. The variance is the
-agent's. `check_regression`'s noise_threshold=1 recommendation absorbs exactly
-that one point, so the setting is right -- but it is tolerating agent
-instability, not judge noise, and those call for different responses.
+the whole pipeline moved 3 of 20 by one point each. That was reported as "the
+variance is the agent's".
+
+SECOND RESULT (2026-09-07, run 34070093157), which retires the first: at 42
+cases x 2 runs -- the full set the accuracy gate scores, which this module was
+not covering until the capture-coverage fix -- the judge disagreed with itself
+on 7.1% of cases, crossed the pass mark on 7.1%, and reached a max judge-only
+spread of 2 points. End-to-end at 42 x 5 reached a spread of 3.
+
+The judge is not deterministic. The first result measured 20 cases that happen
+to be stable and reported their stability as the judge's. Two draws that agree
+are not determinism -- the same error this docstring notes two paragraphs up
+about iter-6-baseline.json's [5, 5] pairs, made again one level higher.
 
 `judge_stability.py` was built to answer exactly this and has only ever run
 against a stubbed judge -- its docstring notes "this lane never constructs a
